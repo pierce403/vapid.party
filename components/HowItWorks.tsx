@@ -95,6 +95,62 @@ export default function HowItWorks() {
     worker: serviceWorkerCode,
   };
 
+  type TokenType = 'comment' | 'string' | 'keyword' | 'number' | 'boolean' | 'plain';
+
+  const tokenMatchers: { type: TokenType; regex: RegExp }[] = [
+    { type: 'comment', regex: /(\/\/.*$)/gm },
+    { type: 'string', regex: /(["'`])(?:\\.|(?!\1).)*\1/g },
+    {
+      type: 'keyword',
+      regex:
+        /\b(await|break|case|catch|class|const|continue|default|delete|do|else|export|extends|finally|for|function|if|import|in|instanceof|let|new|return|super|switch|this|throw|try|typeof|var|void|while|with|yield)\b/g,
+    },
+    { type: 'boolean', regex: /\b(true|false|null|undefined)\b/g },
+    { type: 'number', regex: /\b\d+(?:\.\d+)?\b/g },
+  ];
+
+  const tokenizeLine = (line: string) => {
+    type Token = { text: string; type: TokenType };
+    let tokens: Token[] = [{ text: line, type: 'plain' }];
+
+    const applyRegex = (currentTokens: Token[], matcher: (typeof tokenMatchers)[number]) => {
+      const nextTokens: Token[] = [];
+
+      currentTokens.forEach((token) => {
+        if (token.type !== 'plain') {
+          nextTokens.push(token);
+          return;
+        }
+
+        const { regex, type } = matcher;
+        regex.lastIndex = 0;
+        let lastIndex = 0;
+        for (const match of token.text.matchAll(regex)) {
+          const matchIndex = match.index ?? 0;
+          if (matchIndex > lastIndex) {
+            nextTokens.push({ text: token.text.slice(lastIndex, matchIndex), type: 'plain' });
+          }
+          nextTokens.push({ text: match[0], type });
+          lastIndex = matchIndex + match[0].length;
+        }
+
+        if (lastIndex < token.text.length) {
+          nextTokens.push({ text: token.text.slice(lastIndex), type: 'plain' });
+        }
+      });
+
+      return nextTokens;
+    };
+
+    tokenMatchers.forEach((matcher) => {
+      tokens = applyRegex(tokens, matcher);
+    });
+
+    return tokens;
+  };
+
+  const lines = code[activeTab].split('\n');
+
   return (
     <section id="how-it-works" className="py-24 px-6 bg-midnight-900/30">
       <div className="max-w-5xl mx-auto">
@@ -157,8 +213,20 @@ export default function HowItWorks() {
             ))}
           </div>
           <div className="code-block overflow-x-auto">
-            <pre className="text-vapor-300 whitespace-pre-wrap break-words">
-              <code>{code[activeTab]}</code>
+            <pre className="text-vapor-300 text-sm">
+              {lines.map((line, i) => (
+                <div key={i} className="whitespace-pre">
+                  {tokenizeLine(line).map((token, key) => (
+                    <span
+                      key={key}
+                      className={token.type !== 'plain' ? `token ${token.type}` : undefined}
+                    >
+                      {token.text}
+                    </span>
+                  ))}
+                  {i < lines.length - 1 ? '\n' : ''}
+                </div>
+              ))}
             </pre>
           </div>
           <button
