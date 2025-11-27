@@ -62,6 +62,23 @@
            font-mono text-sm;
   }
 
+  .code-block .token.keyword {
+    @apply text-vapor-200;
+  }
+
+  .code-block .token.string {
+    @apply text-amber-200;
+  }
+
+  .code-block .token.number,
+  .code-block .token.boolean {
+    @apply text-vapor-400;
+  }
+
+  .code-block .token.comment {
+    @apply text-midnight-500;
+  }
+
   .glow-text {
     @apply bg-gradient-to-r from-vapor-400 via-vapor-300 to-vapor-500 
            bg-clip-text text-transparent;
