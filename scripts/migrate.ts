@@ -8,7 +8,20 @@
  * It's safe to run multiple times (uses CREATE IF NOT EXISTS).
  */
 
-import { sql } from '@vercel/postgres';
+import postgres from 'postgres';
+
+const connectionString = process.env.POSTGRES_URL || process.env.DATABASE_URL || '';
+
+if (!connectionString) {
+  console.error('❌ No database connection string found.');
+  console.error('   Set POSTGRES_URL or DATABASE_URL environment variable.');
+  process.exit(1);
+}
+
+const sql = postgres(connectionString, {
+  ssl: 'require',
+  max: 1,
+});
 
 async function migrate() {
   console.log('🚀 Starting database migration...\n');
@@ -120,8 +133,8 @@ async function migrate() {
     process.exit(1);
   }
 
+  await sql.end();
   process.exit(0);
 }
 
 migrate();
-

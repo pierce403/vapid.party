@@ -1,9 +1,18 @@
-import { sql } from '@vercel/postgres';
+import postgres from 'postgres';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import webPush from 'web-push';
 import type { App, AppMetadata, RateLimitConfig, Subscription } from './types';
 import logger from './logger';
+
+// Initialize postgres client
+const connectionString = process.env.POSTGRES_URL || process.env.DATABASE_URL || '';
+const sql = postgres(connectionString, {
+  ssl: 'require',
+  max: 10,
+  idle_timeout: 20,
+  connect_timeout: 10,
+});
 
 // ============================================================================
 // Database Initialization
@@ -148,16 +157,16 @@ export async function createApp(
   const id = uuidv4();
   const apiKey = generateApiKey();
   const vapidKeys = generateVapidKeys();
-  const metadataJson = JSON.stringify(metadata || {});
+  const metadataJson = metadata || {};
 
   const result = await sql`
     INSERT INTO apps (id, name, owner_wallet, api_key, vapid_public_key, vapid_private_key, metadata)
-    VALUES (${id}, ${name}, ${ownerWallet.toLowerCase()}, ${apiKey}, ${vapidKeys.publicKey}, ${vapidKeys.privateKey}, ${metadataJson}::jsonb)
+    VALUES (${id}, ${name}, ${ownerWallet.toLowerCase()}, ${apiKey}, ${vapidKeys.publicKey}, ${vapidKeys.privateKey}, ${sql.json(metadataJson)})
     RETURNING *
   `;
 
   logger.info('Created new app', { appId: id, ownerWallet: ownerWallet.toLowerCase() });
-  return mapRowToApp(result.rows[0]);
+  return mapRowToApp(result[0]);
 }
 
 export async function getAppById(id: string): Promise<App | null> {
@@ -165,8 +174,8 @@ export async function getAppById(id: string): Promise<App | null> {
     SELECT * FROM apps WHERE id = ${id}
   `;
   
-  if (result.rows.length === 0) return null;
-  return mapRowToApp(result.rows[0]);
+  if (result.length === 0) return null;
+  return mapRowToApp(result[0]);
 }
 
 export async function getAppByApiKey(apiKey: string): Promise<App | null> {
@@ -174,8 +183,8 @@ export async function getAppByApiKey(apiKey: string): Promise<App | null> {
     SELECT * FROM apps WHERE api_key = ${apiKey}
   `;
   
-  if (result.rows.length === 0) return null;
-  return mapRowToApp(result.rows[0]);
+  if (result.length === 0) return null;
+  return mapRowToApp(result[0]);
 }
 
 export async function getAppsByOwner(ownerWallet: string): Promise<App[]> {
@@ -185,52 +194,36 @@ export async function getAppsByOwner(ownerWallet: string): Promise<App[]> {
     ORDER BY created_at DESC
   `;
   
-  return result.rows.map(mapRowToApp);
+  return result.map(mapRowToApp);
 }
 
 export async function updateApp(
   id: string,
   updates: { name?: string; metadata?: AppMetadata; rateLimit?: RateLimitConfig }
 ): Promise<App | null> {
-  const setClauses: string[] = ['updated_at = NOW()'];
-  const values: (string | null)[] = [];
-
-  if (updates.name !== undefined) {
-    values.push(updates.name);
-    setClauses.push(`name = $${values.length}`);
-  }
-  if (updates.metadata !== undefined) {
-    values.push(JSON.stringify(updates.metadata));
-    setClauses.push(`metadata = $${values.length}::jsonb`);
-  }
-  if (updates.rateLimit !== undefined) {
-    values.push(JSON.stringify(updates.rateLimit));
-    setClauses.push(`rate_limit = $${values.length}::jsonb`);
-  }
-
-  // For simplicity, using parameterized approach
   const result = await sql`
     UPDATE apps 
     SET 
       name = COALESCE(${updates.name ?? null}, name),
-      metadata = COALESCE(${updates.metadata ? JSON.stringify(updates.metadata) : null}::jsonb, metadata),
-      rate_limit = COALESCE(${updates.rateLimit ? JSON.stringify(updates.rateLimit) : null}::jsonb, rate_limit),
+      metadata = COALESCE(${updates.metadata ? sql.json(updates.metadata) : null}, metadata),
+      rate_limit = COALESCE(${updates.rateLimit ? sql.json(updates.rateLimit) : null}, rate_limit),
       updated_at = NOW()
     WHERE id = ${id}
     RETURNING *
   `;
 
-  if (result.rows.length === 0) return null;
+  if (result.length === 0) return null;
   logger.info('Updated app', { appId: id });
-  return mapRowToApp(result.rows[0]);
+  return mapRowToApp(result[0]);
 }
 
 export async function deleteApp(id: string): Promise<boolean> {
   const result = await sql`
     DELETE FROM apps WHERE id = ${id}
+    RETURNING id
   `;
   
-  if (result.rowCount && result.rowCount > 0) {
+  if (result.length > 0) {
     logger.info('Deleted app', { appId: id });
     return true;
   }
@@ -247,9 +240,9 @@ export async function regenerateApiKey(id: string): Promise<string | null> {
     RETURNING api_key
   `;
 
-  if (result.rows.length === 0) return null;
+  if (result.length === 0) return null;
   logger.info('Regenerated API key', { appId: id });
-  return result.rows[0].api_key as string;
+  return result[0].api_key as string;
 }
 
 // ============================================================================
@@ -270,14 +263,14 @@ export async function createSubscription(
 ): Promise<Subscription> {
   const id = uuidv4();
   const expiresAt = options?.expirationTime
-    ? new Date(options.expirationTime)
+    ? new Date(options.expirationTime).toISOString()
     : null;
-  const metadataJson = JSON.stringify(options?.metadata || {});
+  const metadataJson = options?.metadata || {};
 
   // Use upsert to handle duplicate endpoints
   const result = await sql`
     INSERT INTO subscriptions (id, app_id, endpoint, p256dh, auth, user_id, channel_id, metadata, expires_at)
-    VALUES (${id}, ${appId}, ${endpoint}, ${p256dh}, ${auth}, ${options?.userId ?? null}, ${options?.channelId ?? null}, ${metadataJson}::jsonb, ${expiresAt?.toISOString() ?? null})
+    VALUES (${id}, ${appId}, ${endpoint}, ${p256dh}, ${auth}, ${options?.userId ?? null}, ${options?.channelId ?? null}, ${sql.json(metadataJson)}, ${expiresAt})
     ON CONFLICT (app_id, endpoint) 
     DO UPDATE SET 
       p256dh = EXCLUDED.p256dh,
@@ -289,8 +282,8 @@ export async function createSubscription(
     RETURNING *
   `;
 
-  logger.info('Created/updated subscription', { subscriptionId: result.rows[0].id, appId });
-  return mapRowToSubscription(result.rows[0]);
+  logger.info('Created/updated subscription', { subscriptionId: result[0].id, appId });
+  return mapRowToSubscription(result[0]);
 }
 
 export async function getSubscriptionById(id: string): Promise<Subscription | null> {
@@ -298,8 +291,8 @@ export async function getSubscriptionById(id: string): Promise<Subscription | nu
     SELECT * FROM subscriptions WHERE id = ${id}
   `;
   
-  if (result.rows.length === 0) return null;
-  return mapRowToSubscription(result.rows[0]);
+  if (result.length === 0) return null;
+  return mapRowToSubscription(result[0]);
 }
 
 export async function getSubscriptionsByApp(
@@ -311,6 +304,9 @@ export async function getSubscriptionsByApp(
     offset?: number;
   }
 ): Promise<Subscription[]> {
+  const limit = options?.limit || 1000;
+  const offset = options?.offset || 0;
+  
   let result;
   
   if (options?.userId && options?.channelId) {
@@ -321,8 +317,8 @@ export async function getSubscriptionsByApp(
         AND channel_id = ${options.channelId}
         AND (expires_at IS NULL OR expires_at > NOW())
       ORDER BY created_at DESC
-      LIMIT ${options.limit || 1000}
-      OFFSET ${options.offset || 0}
+      LIMIT ${limit}
+      OFFSET ${offset}
     `;
   } else if (options?.userId) {
     result = await sql`
@@ -331,8 +327,8 @@ export async function getSubscriptionsByApp(
         AND user_id = ${options.userId}
         AND (expires_at IS NULL OR expires_at > NOW())
       ORDER BY created_at DESC
-      LIMIT ${options.limit || 1000}
-      OFFSET ${options.offset || 0}
+      LIMIT ${limit}
+      OFFSET ${offset}
     `;
   } else if (options?.channelId) {
     result = await sql`
@@ -341,8 +337,8 @@ export async function getSubscriptionsByApp(
         AND channel_id = ${options.channelId}
         AND (expires_at IS NULL OR expires_at > NOW())
       ORDER BY created_at DESC
-      LIMIT ${options.limit || 1000}
-      OFFSET ${options.offset || 0}
+      LIMIT ${limit}
+      OFFSET ${offset}
     `;
   } else {
     result = await sql`
@@ -350,33 +346,31 @@ export async function getSubscriptionsByApp(
       WHERE app_id = ${appId}
         AND (expires_at IS NULL OR expires_at > NOW())
       ORDER BY created_at DESC
-      LIMIT ${options?.limit || 1000}
-      OFFSET ${options?.offset || 0}
+      LIMIT ${limit}
+      OFFSET ${offset}
     `;
   }
 
-  return result.rows.map(mapRowToSubscription);
+  return result.map(mapRowToSubscription);
 }
 
 export async function getSubscriptionsByIds(ids: string[]): Promise<Subscription[]> {
   if (ids.length === 0) return [];
   
-  // For Vercel Postgres, we need to construct the array properly
-  const placeholders = ids.map((_, i) => `$${i + 1}`).join(', ');
-  const result = await sql.query(
-    `SELECT * FROM subscriptions WHERE id IN (${placeholders})`,
-    ids
-  );
+  const result = await sql`
+    SELECT * FROM subscriptions WHERE id = ANY(${ids})
+  `;
   
-  return result.rows.map(mapRowToSubscription);
+  return result.map(mapRowToSubscription);
 }
 
 export async function deleteSubscription(id: string): Promise<boolean> {
   const result = await sql`
     DELETE FROM subscriptions WHERE id = ${id}
+    RETURNING id
   `;
   
-  if (result.rowCount && result.rowCount > 0) {
+  if (result.length > 0) {
     logger.info('Deleted subscription', { subscriptionId: id });
     return true;
   }
@@ -386,9 +380,10 @@ export async function deleteSubscription(id: string): Promise<boolean> {
 export async function deleteSubscriptionByEndpoint(appId: string, endpoint: string): Promise<boolean> {
   const result = await sql`
     DELETE FROM subscriptions WHERE app_id = ${appId} AND endpoint = ${endpoint}
+    RETURNING id
   `;
   
-  if (result.rowCount && result.rowCount > 0) {
+  if (result.length > 0) {
     logger.info('Deleted subscription by endpoint', { appId, endpoint });
     return true;
   }
@@ -400,7 +395,7 @@ export async function countSubscriptionsByApp(appId: string): Promise<number> {
     SELECT COUNT(*) as count FROM subscriptions WHERE app_id = ${appId}
   `;
   
-  return parseInt(result.rows[0].count as string, 10);
+  return parseInt(result[0].count as string, 10);
 }
 
 // ============================================================================
@@ -424,7 +419,7 @@ export async function checkAndIncrementRateLimit(
     RETURNING count
   `;
 
-  const current = result.rows[0].count as number;
+  const current = result[0].count as number;
   const allowed = current <= limit;
 
   if (!allowed) {
@@ -439,4 +434,3 @@ export async function cleanupOldRateLimitLogs(): Promise<void> {
     DELETE FROM rate_limit_logs WHERE window_start < NOW() - INTERVAL '1 day'
   `;
 }
-
