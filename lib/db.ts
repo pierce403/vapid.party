@@ -161,7 +161,7 @@ export async function createApp(
 
   const result = await sql`
     INSERT INTO apps (id, name, owner_wallet, api_key, vapid_public_key, vapid_private_key, metadata)
-    VALUES (${id}, ${name}, ${ownerWallet.toLowerCase()}, ${apiKey}, ${vapidKeys.publicKey}, ${vapidKeys.privateKey}, ${sql.json(metadataJson as JSONValue)})
+    VALUES (${id}, ${name}, ${ownerWallet.toLowerCase()}, ${apiKey}, ${vapidKeys.publicKey}, ${vapidKeys.privateKey}, ${sql.json(metadataJson as unknown as JSONValue)})
     RETURNING *
   `;
 
@@ -205,8 +205,8 @@ export async function updateApp(
     UPDATE apps 
     SET 
       name = COALESCE(${updates.name ?? null}, name),
-      metadata = COALESCE(${updates.metadata ? sql.json(updates.metadata as JSONValue) : null}, metadata),
-      rate_limit = COALESCE(${updates.rateLimit ? sql.json(updates.rateLimit as JSONValue) : null}, rate_limit),
+      metadata = COALESCE(${updates.metadata ? sql.json(updates.metadata as unknown as JSONValue) : null}, metadata),
+      rate_limit = COALESCE(${updates.rateLimit ? sql.json(updates.rateLimit as unknown as JSONValue) : null}, rate_limit),
       updated_at = NOW()
     WHERE id = ${id}
     RETURNING *
@@ -270,7 +270,7 @@ export async function createSubscription(
   // Use upsert to handle duplicate endpoints
   const result = await sql`
     INSERT INTO subscriptions (id, app_id, endpoint, p256dh, auth, user_id, channel_id, metadata, expires_at)
-    VALUES (${id}, ${appId}, ${endpoint}, ${p256dh}, ${auth}, ${options?.userId ?? null}, ${options?.channelId ?? null}, ${sql.json(metadataJson as JSONValue)}, ${expiresAt})
+    VALUES (${id}, ${appId}, ${endpoint}, ${p256dh}, ${auth}, ${options?.userId ?? null}, ${options?.channelId ?? null}, ${sql.json(metadataJson as unknown as JSONValue)}, ${expiresAt})
     ON CONFLICT (app_id, endpoint) 
     DO UPDATE SET 
       p256dh = EXCLUDED.p256dh,
