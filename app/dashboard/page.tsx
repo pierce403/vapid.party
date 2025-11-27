@@ -20,11 +20,11 @@ interface App {
   name: string;
   apiKey: string;
   vapidPublicKey: string;
-  metadata: {
+  metadata?: {
     description?: string;
     website?: string;
   };
-  rateLimit: {
+  rateLimit?: {
     maxNotificationsPerMinute: number;
     maxNotificationsPerDay: number;
     maxSubscriptions: number;
@@ -348,19 +348,19 @@ export default function Dashboard() {
                 <div className="mt-4 pt-4 border-t border-midnight-800 grid grid-cols-3 gap-4 text-center">
                   <div>
                     <div className="text-lg font-semibold text-vapor-400">
-                      {app.rateLimit.maxNotificationsPerMinute}
+                      {app.rateLimit?.maxNotificationsPerMinute ?? 60}
                     </div>
                     <div className="text-xs text-midnight-500">per minute</div>
                   </div>
                   <div>
                     <div className="text-lg font-semibold text-vapor-400">
-                      {(app.rateLimit.maxNotificationsPerDay / 1000).toFixed(0)}K
+                      {((app.rateLimit?.maxNotificationsPerDay ?? 10000) / 1000).toFixed(0)}K
                     </div>
                     <div className="text-xs text-midnight-500">per day</div>
                   </div>
                   <div>
                     <div className="text-lg font-semibold text-vapor-400">
-                      {(app.rateLimit.maxSubscriptions / 1000).toFixed(0)}K
+                      {((app.rateLimit?.maxSubscriptions ?? 10000) / 1000).toFixed(0)}K
                     </div>
                     <div className="text-xs text-midnight-500">subscribers</div>
                   </div>
