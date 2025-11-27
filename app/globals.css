@@ -1,0 +1,150 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: var(--font-outfit), system-ui, sans-serif;
+  --font-mono: var(--font-fira-code), ui-monospace, monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-midnight-950 text-white antialiased;
+    font-feature-settings: 'rlig' 1, 'calt' 1;
+  }
+
+  ::selection {
+    @apply bg-vapor-500/30;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center px-6 py-3 rounded-xl font-semibold
+           bg-gradient-to-r from-vapor-500 to-vapor-400 text-midnight-950
+           hover:from-vapor-400 hover:to-vapor-300
+           transition-all duration-200 ease-out
+           shadow-lg shadow-vapor-500/25 hover:shadow-vapor-400/40
+           active:scale-[0.98];
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center px-6 py-3 rounded-xl font-semibold
+           bg-midnight-800/50 text-white border border-midnight-700
+           hover:bg-midnight-700/50 hover:border-midnight-600
+           transition-all duration-200 ease-out
+           active:scale-[0.98];
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center px-4 py-2 rounded-lg font-medium
+           text-vapor-400 hover:text-vapor-300 hover:bg-midnight-800/50
+           transition-all duration-200 ease-out;
+  }
+
+  .card {
+    @apply bg-midnight-900/50 backdrop-blur-xl rounded-2xl 
+           border border-midnight-800/50 p-6
+           shadow-xl shadow-black/20;
+  }
+
+  .input {
+    @apply w-full px-4 py-3 rounded-xl
+           bg-midnight-800/50 border border-midnight-700
+           text-white placeholder-midnight-500
+           focus:outline-none focus:ring-2 focus:ring-vapor-500/50 focus:border-vapor-500
+           transition-all duration-200;
+  }
+
+  .code-block {
+    @apply bg-midnight-950 rounded-xl p-4 overflow-x-auto
+           border border-midnight-800
+           font-mono text-sm;
+  }
+
+  .glow-text {
+    @apply bg-gradient-to-r from-vapor-400 via-vapor-300 to-vapor-500 
+           bg-clip-text text-transparent;
+  }
+}
+
+/* Noise texture overlay */
+.noise::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.03;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 400 400' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+  z-index: 1000;
+}
+
+/* Grid overlay */
+.grid-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-image: 
+    linear-gradient(rgba(20, 184, 152, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(20, 184, 152, 0.03) 1px, transparent 1px);
+  background-size: 60px 60px;
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* Gradient blob animation */
+.gradient-blob {
+  position: fixed;
+  width: 600px;
+  height: 600px;
+  border-radius: 50%;
+  filter: blur(120px);
+  opacity: 0.12;
+  pointer-events: none;
+  z-index: -2;
+}
+
+.blob-1 {
+  background: radial-gradient(circle, #14b898 0%, #0d947c 50%, transparent 70%);
+  top: -200px;
+  right: -200px;
+  animation: float 20s ease-in-out infinite;
+}
+
+.blob-2 {
+  background: radial-gradient(circle, #456cae 0%, #345492 50%, transparent 70%);
+  bottom: -200px;
+  left: -200px;
+  animation: float 25s ease-in-out infinite reverse;
+}
+
+@keyframes float {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  25% { transform: translate(50px, 50px) rotate(5deg); }
+  50% { transform: translate(0, 100px) rotate(0deg); }
+  75% { transform: translate(-50px, 50px) rotate(-5deg); }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-midnight-900;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-midnight-700 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-midnight-600;
+}
+

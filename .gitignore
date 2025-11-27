@@ -1,22 +1,27 @@
 # Dependencies
 node_modules/
+.pnp
+.pnp.js
 
-# Build output
+# Build outputs
+.next/
+out/
 dist/
+build/
 
-# Environment files
+# Testing
+coverage/
+
+# Environment
 .env
 .env.local
-.env.*.local
-
-# Database
-*.db
-*.sqlite
-data/
+.env.development.local
+.env.test.local
+.env.production.local
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
 
@@ -24,17 +29,25 @@ data/
 .DS_Store
 Thumbs.db
 
-# Logs
-logs/
-*.log
+# Debug
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Test coverage
-coverage/
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
 
 # Vercel
-.vercel/
+.vercel
 
-# Temporary files
-tmp/
-temp/
+# Local data
+data/
+*.db
+*.sqlite
+
+# Misc
+*.log
+
+# Playwright MCP
+.playwright-mcp/
