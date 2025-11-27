@@ -23,7 +23,7 @@ export default function Footer() {
               Terms
             </a>
             <a 
-              href="https://github.com/vapid-party" 
+              href="https://github.com/pierce403/vapid.party" 
               target="_blank" 
               rel="noopener noreferrer"
               className="hover:text-vapor-400 transition-colors"

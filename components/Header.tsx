@@ -39,7 +39,7 @@ export default function Header() {
             </a>
           )}
           <a 
-            href="https://github.com/vapid-party" 
+            href="https://github.com/pierce403/vapid.party" 
             target="_blank" 
             rel="noopener noreferrer"
             className="btn-ghost"
