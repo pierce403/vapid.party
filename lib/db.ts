@@ -14,11 +14,15 @@ const sql = postgres(connectionString, {
   connect_timeout: 10,
 });
 
+// Track if database has been initialized this session
+let dbInitialized = false;
+let dbInitPromise: Promise<void> | null = null;
+
 // ============================================================================
 // Database Initialization
 // ============================================================================
 
-export async function initializeDatabase(): Promise<void> {
+async function runMigrations(): Promise<void> {
   try {
     // Apps table with per-app VAPID keys
     await sql`
@@ -99,6 +103,22 @@ export async function initializeDatabase(): Promise<void> {
   }
 }
 
+// Ensure database is initialized (call before any DB operation)
+export async function ensureDatabase(): Promise<void> {
+  if (dbInitialized) return;
+  
+  if (!dbInitPromise) {
+    dbInitPromise = runMigrations().then(() => {
+      dbInitialized = true;
+    });
+  }
+  
+  await dbInitPromise;
+}
+
+// Legacy export for compatibility
+export const initializeDatabase = ensureDatabase;
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -154,6 +174,7 @@ export async function createApp(
   name: string,
   metadata?: AppMetadata
 ): Promise<App> {
+  await ensureDatabase();
   const id = uuidv4();
   const apiKey = generateApiKey();
   const vapidKeys = generateVapidKeys();
@@ -170,6 +191,7 @@ export async function createApp(
 }
 
 export async function getAppById(id: string): Promise<App | null> {
+  await ensureDatabase();
   const result = await sql`
     SELECT * FROM apps WHERE id = ${id}
   `;
@@ -179,6 +201,7 @@ export async function getAppById(id: string): Promise<App | null> {
 }
 
 export async function getAppByApiKey(apiKey: string): Promise<App | null> {
+  await ensureDatabase();
   const result = await sql`
     SELECT * FROM apps WHERE api_key = ${apiKey}
   `;
@@ -188,6 +211,7 @@ export async function getAppByApiKey(apiKey: string): Promise<App | null> {
 }
 
 export async function getAppsByOwner(ownerWallet: string): Promise<App[]> {
+  await ensureDatabase();
   const result = await sql`
     SELECT * FROM apps 
     WHERE owner_wallet = ${ownerWallet.toLowerCase()}
@@ -201,6 +225,7 @@ export async function updateApp(
   id: string,
   updates: { name?: string; metadata?: AppMetadata; rateLimit?: RateLimitConfig }
 ): Promise<App | null> {
+  await ensureDatabase();
   const result = await sql`
     UPDATE apps 
     SET 
@@ -218,6 +243,7 @@ export async function updateApp(
 }
 
 export async function deleteApp(id: string): Promise<boolean> {
+  await ensureDatabase();
   const result = await sql`
     DELETE FROM apps WHERE id = ${id}
     RETURNING id
@@ -231,6 +257,7 @@ export async function deleteApp(id: string): Promise<boolean> {
 }
 
 export async function regenerateApiKey(id: string): Promise<string | null> {
+  await ensureDatabase();
   const newApiKey = generateApiKey();
   
   const result = await sql`
@@ -261,6 +288,7 @@ export async function createSubscription(
     expirationTime?: number | null;
   }
 ): Promise<Subscription> {
+  await ensureDatabase();
   const id = uuidv4();
   const expiresAt = options?.expirationTime
     ? new Date(options.expirationTime).toISOString()
@@ -287,6 +315,7 @@ export async function createSubscription(
 }
 
 export async function getSubscriptionById(id: string): Promise<Subscription | null> {
+  await ensureDatabase();
   const result = await sql`
     SELECT * FROM subscriptions WHERE id = ${id}
   `;
@@ -304,6 +333,7 @@ export async function getSubscriptionsByApp(
     offset?: number;
   }
 ): Promise<Subscription[]> {
+  await ensureDatabase();
   const limit = options?.limit || 1000;
   const offset = options?.offset || 0;
   
@@ -356,6 +386,7 @@ export async function getSubscriptionsByApp(
 
 export async function getSubscriptionsByIds(ids: string[]): Promise<Subscription[]> {
   if (ids.length === 0) return [];
+  await ensureDatabase();
   
   const result = await sql`
     SELECT * FROM subscriptions WHERE id = ANY(${ids})
@@ -365,6 +396,7 @@ export async function getSubscriptionsByIds(ids: string[]): Promise<Subscription
 }
 
 export async function deleteSubscription(id: string): Promise<boolean> {
+  await ensureDatabase();
   const result = await sql`
     DELETE FROM subscriptions WHERE id = ${id}
     RETURNING id
@@ -378,6 +410,7 @@ export async function deleteSubscription(id: string): Promise<boolean> {
 }
 
 export async function deleteSubscriptionByEndpoint(appId: string, endpoint: string): Promise<boolean> {
+  await ensureDatabase();
   const result = await sql`
     DELETE FROM subscriptions WHERE app_id = ${appId} AND endpoint = ${endpoint}
     RETURNING id
@@ -391,6 +424,7 @@ export async function deleteSubscriptionByEndpoint(appId: string, endpoint: stri
 }
 
 export async function countSubscriptionsByApp(appId: string): Promise<number> {
+  await ensureDatabase();
   const result = await sql`
     SELECT COUNT(*) as count FROM subscriptions WHERE app_id = ${appId}
   `;
@@ -408,6 +442,7 @@ export async function checkAndIncrementRateLimit(
   limit: number,
   windowMs: number = 60000
 ): Promise<{ allowed: boolean; current: number; limit: number }> {
+  await ensureDatabase();
   const windowStart = new Date(Math.floor(Date.now() / windowMs) * windowMs);
   
   // Upsert and get current count
@@ -430,6 +465,7 @@ export async function checkAndIncrementRateLimit(
 }
 
 export async function cleanupOldRateLimitLogs(): Promise<void> {
+  await ensureDatabase();
   await sql`
     DELETE FROM rate_limit_logs WHERE window_start < NOW() - INTERVAL '1 day'
   `;
