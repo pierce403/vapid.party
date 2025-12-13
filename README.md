@@ -263,10 +263,8 @@ async function sendNotification(apiKey, userId, message) {
 
 ## Rate Limits
 
-Default limits per app:
-- **60** notifications per minute
-- **10,000** notifications per day
-- **10,000** subscriptions
+Rate limiting is enforced per app to protect against abuse. Limits are returned
+in the `rateLimit` field on the Apps API responses.
 
 ## Project Structure
 

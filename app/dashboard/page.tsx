@@ -45,6 +45,13 @@ export default function Dashboard() {
   const [deletingApp, setDeletingApp] = useState<string | null>(null);
   const [regeneratingKey, setRegeneratingKey] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
+  const [sendingTestPush, setSendingTestPush] = useState(false);
+  const [testPushResult, setTestPushResult] = useState<{
+    sent: number;
+    failed: number;
+    total: number;
+  } | null>(null);
+  const [testPushError, setTestPushError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!account) {
@@ -166,6 +173,47 @@ export default function Dashboard() {
       console.error('Failed to regenerate API key:', error);
     } finally {
       setRegeneratingKey(null);
+    }
+  };
+
+  const sendTestPush = async (app: App) => {
+    setSendingTestPush(true);
+    setTestPushError(null);
+    setTestPushResult(null);
+
+    try {
+      const response = await fetch('/api/send', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': app.apiKey,
+        },
+        body: JSON.stringify({
+          payload: {
+            title: 'Test notification',
+            body: `Sent from the vapid.party dashboard (${new Date().toLocaleString()})`,
+            url: window.location.origin,
+          },
+        }),
+      });
+
+      const data = await response.json().catch(() => null);
+
+      if (!response.ok || !data?.success) {
+        throw new Error(data?.error || `Request failed (${response.status})`);
+      }
+
+      setTestPushResult({
+        sent: data.data.sent,
+        failed: data.data.failed,
+        total: data.data.total,
+      });
+    } catch (error) {
+      setTestPushError(
+        error instanceof Error ? error.message : 'Failed to send test push'
+      );
+    } finally {
+      setSendingTestPush(false);
     }
   };
 
@@ -344,27 +392,6 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* Rate Limits */}
-                <div className="mt-4 pt-4 border-t border-midnight-800 grid grid-cols-3 gap-4 text-center">
-                  <div>
-                    <div className="text-lg font-semibold text-vapor-400">
-                      {app.rateLimit?.maxNotificationsPerMinute ?? 60}
-                    </div>
-                    <div className="text-xs text-midnight-500">per minute</div>
-                  </div>
-                  <div>
-                    <div className="text-lg font-semibold text-vapor-400">
-                      {((app.rateLimit?.maxNotificationsPerDay ?? 10000) / 1000).toFixed(0)}K
-                    </div>
-                    <div className="text-xs text-midnight-500">per day</div>
-                  </div>
-                  <div>
-                    <div className="text-lg font-semibold text-vapor-400">
-                      {((app.rateLimit?.maxSubscriptions ?? 10000) / 1000).toFixed(0)}K
-                    </div>
-                    <div className="text-xs text-midnight-500">subscribers</div>
-                  </div>
-                </div>
               </div>
             ))}
           </div>
@@ -505,6 +532,38 @@ await fetch('https://vapid.party/api/send', {
               >
                 {copiedKey === 'modal-vapid' ? 'Copied!' : 'Copy VAPID Key'}
               </button>
+            </div>
+
+            {/* Test Push */}
+            <div className="mb-6">
+              <h3 className="font-semibold mb-2">Test Push</h3>
+              <p className="text-sm text-midnight-400 mb-3">
+                Sends a test notification to <strong>all</strong> current
+                subscriptions for this app.
+              </p>
+              <button
+                onClick={() => sendTestPush(selectedApp)}
+                className="btn-primary w-full"
+                disabled={sendingTestPush}
+              >
+                {sendingTestPush ? (
+                  <div className="animate-spin w-5 h-5 border-2 border-midnight-950 border-t-transparent rounded-full" />
+                ) : (
+                  'Send Test Push to Everyone'
+                )}
+              </button>
+              {testPushResult && (
+                <div className="mt-3 text-sm text-midnight-400">
+                  Sent {testPushResult.sent} / {testPushResult.total}
+                  {testPushResult.failed > 0
+                    ? ` (${testPushResult.failed} failed)`
+                    : ''}
+                  {testPushResult.total === 0 ? ' — no subscribers yet' : ''}
+                </div>
+              )}
+              {testPushError && (
+                <div className="mt-3 text-sm text-red-400">{testPushError}</div>
+              )}
             </div>
 
             {/* Danger Zone */}

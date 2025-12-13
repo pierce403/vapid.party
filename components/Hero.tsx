@@ -54,16 +54,16 @@ export default function Hero() {
         {/* Stats */}
         <div className="grid grid-cols-3 gap-8 max-w-lg mx-auto">
           <div className="text-center">
-            <div className="text-3xl font-bold text-vapor-400">Free</div>
-            <div className="text-sm text-midnight-500">To Start</div>
+            <div className="text-3xl font-bold text-vapor-400">Per‑App</div>
+            <div className="text-sm text-midnight-500">VAPID Keys</div>
           </div>
           <div className="text-center">
-            <div className="text-3xl font-bold text-vapor-400">10K</div>
-            <div className="text-sm text-midnight-500">Daily Pushes</div>
+            <div className="text-3xl font-bold text-vapor-400">User/Channel</div>
+            <div className="text-sm text-midnight-500">Targeting</div>
           </div>
           <div className="text-center">
-            <div className="text-3xl font-bold text-vapor-400">∞</div>
-            <div className="text-sm text-midnight-500">Subscribers</div>
+            <div className="text-3xl font-bold text-vapor-400">Vercel</div>
+            <div className="text-sm text-midnight-500">Postgres Ready</div>
           </div>
         </div>
       </div>
@@ -77,4 +77,3 @@ export default function Hero() {
     </section>
   );
 }
-
