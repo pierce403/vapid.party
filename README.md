@@ -50,11 +50,32 @@ Visit [http://localhost:3000](http://localhost:3000)
 
 ## API Reference
 
+Machine-readable docs:
+- OpenAPI schema: `/openapi.yaml`
+- LLM guide: `/llms.txt`
+
 ### Authentication
 
 All endpoints require authentication:
 - **Wallet Auth**: For managing your apps (via `Authorization: Bearer <token>` header)
 - **API Key Auth**: For subscribing users and sending notifications (via `X-API-Key` header)
+
+### Validation Errors
+
+Validation failures return **HTTP 422** with structured details:
+
+```json
+{
+  "success": false,
+  "error": "Validation failed",
+  "code": "VALIDATION_ERROR",
+  "details": {
+      "issues": [
+      { "fieldPath": "payload.icon", "message": "Must be an absolute URL or a path starting with /", "value": "icon.png" }
+    ]
+  }
+}
+```
 
 ### Endpoints
 
@@ -102,6 +123,11 @@ curl -X POST https://vapid.party/api/subscribe \
 
 #### POST /api/send
 Send push notifications (requires API key).
+
+Targeting rules:
+- If `subscriptionIds` is provided, only those subscriptions are targeted (and `userId` / `channelId` are ignored).
+- Otherwise, `userId` and/or `channelId` filter recipients.
+- If no targeting fields are provided, the message is broadcast to all subscriptions for the app.
 
 ```bash
 curl -X POST https://vapid.party/api/send \
@@ -160,8 +186,10 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   
-  if (event.notification.data?.url) {
-    event.waitUntil(clients.openWindow(event.notification.data.url));
+  const url = event.notification.data?.url;
+  if (url) {
+    const target = new URL(url, self.location.origin);
+    event.waitUntil(clients.openWindow(target.toString()));
   }
 });
 ```

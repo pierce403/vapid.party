@@ -73,10 +73,10 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   
-  if (event.notification.data?.url) {
-    event.waitUntil(
-      clients.openWindow(event.notification.data.url)
-    );
+  const url = event.notification.data?.url;
+  if (url) {
+    const target = new URL(url, self.location.origin);
+    event.waitUntil(clients.openWindow(target.toString()));
   }
 });`;
 
@@ -243,4 +243,3 @@ export default function HowItWorks() {
     </section>
   );
 }
-

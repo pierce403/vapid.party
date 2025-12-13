@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import {
-  jsonResponse,
   errorResponse,
   authenticateApiKey,
   corsHeaders,
   corsResponse,
   parseJsonBody,
+  zodValidationErrorResponse,
 } from '@/lib/api-utils';
 import { createSubscription, countSubscriptionsByApp } from '@/lib/db';
 import { SubscribeSchema, ErrorCodes } from '@/lib/types';
@@ -50,11 +50,7 @@ export async function POST(request: NextRequest) {
 
     const parseResult = SubscribeSchema.safeParse(body);
     if (!parseResult.success) {
-      return errorResponse(
-        parseResult.error.errors[0]?.message || 'Validation failed',
-        ErrorCodes.VALIDATION_ERROR,
-        400
-      );
+      return zodValidationErrorResponse(parseResult.error, body, 422);
     }
 
     const { endpoint, keys, userId, channelId, metadata, expirationTime } =
@@ -108,4 +104,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-

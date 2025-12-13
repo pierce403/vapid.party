@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import {
-  jsonResponse,
   errorResponse,
   verifyWalletAuth,
   corsHeaders,
   corsResponse,
   parseJsonBody,
+  zodValidationErrorResponse,
 } from '@/lib/api-utils';
 import { createApp, getAppsByOwner } from '@/lib/db';
 import { RegisterAppSchema, ErrorCodes } from '@/lib/types';
@@ -53,11 +53,7 @@ export async function POST(request: NextRequest) {
 
     const parseResult = RegisterAppSchema.safeParse(body);
     if (!parseResult.success) {
-      return errorResponse(
-        parseResult.error.errors[0]?.message || 'Validation failed',
-        ErrorCodes.VALIDATION_ERROR,
-        400
-      );
+      return zodValidationErrorResponse(parseResult.error, body, 422);
     }
 
     const { name, metadata } = parseResult.data;
@@ -100,4 +96,3 @@ export async function POST(request: NextRequest) {
     );
   }
 }
-

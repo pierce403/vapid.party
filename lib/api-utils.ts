@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import type { ZodError } from 'zod';
 import { getAppByApiKey, getAppsByOwner } from './db';
 import type { App, ApiResponse, ErrorCode } from './types';
 import { ErrorCodes } from './types';
@@ -8,19 +9,78 @@ import logger, { logApiRequest, logAuthFailure } from './logger';
 // Response Helpers
 // ============================================================================
 
+function withCors<T extends NextResponse>(response: T): T {
+  Object.entries(corsHeaders()).forEach(([key, value]) => {
+    response.headers.set(key, value);
+  });
+  return response;
+}
+
 export function jsonResponse<T>(
   data: T,
   status: number = 200
 ): NextResponse<ApiResponse<T>> {
-  return NextResponse.json({ success: true, data }, { status });
+  return withCors(NextResponse.json({ success: true, data }, { status }));
 }
 
 export function errorResponse(
   error: string,
   code: ErrorCode,
-  status: number
+  status: number,
+  details?: unknown
 ): NextResponse<ApiResponse> {
-  return NextResponse.json({ success: false, error, code }, { status });
+  return withCors(
+    NextResponse.json({ success: false, error, code, details }, { status })
+  );
+}
+
+function getValueAtPath(input: unknown, path: Array<string | number>): unknown {
+  let current: unknown = input;
+  for (const segment of path) {
+    if (current === null || current === undefined) return undefined;
+
+    if (typeof segment === 'number') {
+      if (!Array.isArray(current)) return undefined;
+      current = current[segment];
+      continue;
+    }
+
+    if (typeof current !== 'object') return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function formatFieldPath(path: Array<string | number>): string {
+  let out = '';
+  for (const segment of path) {
+    if (typeof segment === 'number') {
+      out += `[${segment}]`;
+      continue;
+    }
+    out += out ? `.${segment}` : segment;
+  }
+  return out;
+}
+
+export function zodValidationErrorResponse(
+  error: ZodError,
+  input: unknown,
+  status: number = 422
+): NextResponse<ApiResponse> {
+  const issues = error.errors.map((issue) => ({
+    fieldPath: formatFieldPath(issue.path),
+    message: issue.message,
+    code: issue.code,
+    value: getValueAtPath(input, issue.path),
+  }));
+
+  return errorResponse(
+    'Validation failed',
+    ErrorCodes.VALIDATION_ERROR,
+    status,
+    { issues }
+  );
 }
 
 // ============================================================================
@@ -177,9 +237,5 @@ export function corsHeaders(): HeadersInit {
 }
 
 export function corsResponse(): NextResponse {
-  return new NextResponse(null, {
-    status: 204,
-    headers: corsHeaders(),
-  });
+  return withCors(new NextResponse(null, { status: 204 }));
 }
-

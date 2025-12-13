@@ -10,6 +10,19 @@ import logger, { logNotificationSent, logRateLimitExceeded } from './logger';
 
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@vapid.party';
 
+function normalizeBase64UrlMaybe(input: string): string {
+  const compact = input.replace(/\s+/g, '');
+  if (!compact) return input;
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return input;
+
+  const asBase64 = compact.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = asBase64 + '='.repeat((4 - (asBase64.length % 4)) % 4);
+  const bytes = Buffer.from(padded, 'base64');
+  if (bytes.length === 0) return input;
+
+  return bytes.toString('base64url');
+}
+
 export interface SendResult {
   subscriptionId: string;
   success: boolean;
@@ -39,8 +52,8 @@ async function sendToSubscription(
   const pushSubscription: PushSubscription = {
     endpoint: subscription.endpoint,
     keys: {
-      p256dh: subscription.p256dh,
-      auth: subscription.auth,
+      p256dh: normalizeBase64UrlMaybe(subscription.p256dh),
+      auth: normalizeBase64UrlMaybe(subscription.auth),
     },
   };
 
@@ -171,7 +184,10 @@ export async function sendDirectNotification(
 
   const pushSubscription: PushSubscription = {
     endpoint,
-    keys: { p256dh, auth },
+    keys: {
+      p256dh: normalizeBase64UrlMaybe(p256dh),
+      auth: normalizeBase64UrlMaybe(auth),
+    },
   };
 
   try {
@@ -196,4 +212,3 @@ export async function sendDirectNotification(
     };
   }
 }
-

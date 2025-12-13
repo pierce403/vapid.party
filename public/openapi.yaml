@@ -1,0 +1,751 @@
+openapi: 3.1.0
+info:
+  title: vapid.party API
+  version: 1.0.0
+  description: |
+    Web Push notification relay with per-app VAPID keys.
+
+    All responses are wrapped in a `{ success, data }` envelope on success, and
+    `{ success: false, error, code, details? }` on error.
+servers:
+  - url: https://vapid.party
+  - url: http://localhost:3000
+tags:
+  - name: Health
+  - name: Apps
+  - name: Push
+paths:
+  /api/health:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /api/register-app:
+    post:
+      tags: [Apps]
+      summary: Register a new app (creates per-app VAPID keys)
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterAppRequest"
+            examples:
+              minimal:
+                value:
+                  name: My App
+              withMetadata:
+                value:
+                  name: My App
+                  metadata:
+                    description: Sends push notifications
+                    website: https://example.com
+                    iconUrl: https://example.com/icon.png
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterAppResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+  /api/apps:
+    get:
+      tags: [Apps]
+      summary: List apps for the authenticated wallet
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListAppsResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /api/apps/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [Apps]
+      summary: Get an app by id
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GetAppResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    put:
+      tags: [Apps]
+      summary: Update an app (name / metadata)
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAppRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateAppResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      tags: [Apps]
+      summary: Delete an app
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteAppResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /api/apps/{id}/regenerate-key:
+    post:
+      tags: [Apps]
+      summary: Regenerate an app API key
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegenerateKeyResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /api/vapid/public-key:
+    get:
+      tags: [Push]
+      summary: Get the app's VAPID public key (for PushManager.subscribe)
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VapidPublicKeyResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /api/subscribe:
+    post:
+      tags: [Push]
+      summary: Create or update a push subscription for an app
+      description: |
+        Subscriptions are scoped to an app (API key). A given `endpoint` is unique per app.
+
+        Optional `userId` and `channelId` tags are stored with the subscription and can be used for targeting.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscribeRequest"
+            examples:
+              basic:
+                value:
+                  endpoint: https://fcm.googleapis.com/fcm/send/...
+                  keys:
+                    p256dh: BEdw...
+                    auth: 6kG...
+              withUserAndChannel:
+                value:
+                  endpoint: https://fcm.googleapis.com/fcm/send/...
+                  keys:
+                    p256dh: BEdw...
+                    auth: 6kG...
+                  userId: user_123
+                  channelId: announcements
+                  metadata:
+                    device: chrome
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscribeResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /api/send:
+    post:
+      tags: [Push]
+      summary: Send a push notification
+      description: |
+        Targeting rules:
+        - If `subscriptionIds` is provided, the request targets only those subscriptions (and ignores `userId` / `channelId`).
+        - Otherwise, if `userId` and/or `channelId` is provided, the request targets matching subscriptions.
+        - If no targeting fields are provided, the request broadcasts to all subscriptions for the app.
+
+        `payload.url`, `payload.icon`, `payload.badge`, and `payload.image` accept either an absolute URL or a `/path`.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendRequest"
+            examples:
+              broadcast:
+                value:
+                  payload:
+                    title: Hello!
+                    body: This is a notification
+                    icon: /icon.png
+                    url: /inbox
+              toUser:
+                value:
+                  payload:
+                    title: Hey
+                    body: You have a new message
+                  userId: user_123
+              toChannel:
+                value:
+                  payload:
+                    title: Announcement
+                    body: This goes to a channel
+                  channelId: announcements
+              toSpecificSubscriptions:
+                value:
+                  payload:
+                    title: Direct
+                    body: Only specific subscriptions
+                  subscriptionIds:
+                    - 11111111-1111-1111-1111-111111111111
+                    - 22222222-2222-2222-2222-222222222222
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendResponse"
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValidationErrorResponse"
+        "429":
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [success, error, code]
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: string
+        code:
+          type: string
+        details:
+          description: Optional machine-readable details
+          nullable: true
+    ValidationIssue:
+      type: object
+      required: [fieldPath, message]
+      properties:
+        fieldPath:
+          type: string
+          description: Dot/bracket path to the invalid field
+          example: payload.icon
+        message:
+          type: string
+        code:
+          type: string
+          nullable: true
+        value:
+          description: The invalid value (best-effort)
+    ValidationErrorResponse:
+      allOf:
+        - $ref: "#/components/schemas/ErrorResponse"
+        - type: object
+          properties:
+            code:
+              const: VALIDATION_ERROR
+            details:
+              type: object
+              required: [issues]
+              properties:
+                issues:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/ValidationIssue"
+    HealthResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [status, timestamp, version]
+          properties:
+            status:
+              type: string
+              const: healthy
+            timestamp:
+              type: string
+              format: date-time
+            version:
+              type: string
+    RegisterAppRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        metadata:
+          type: object
+          properties:
+            description:
+              type: string
+              maxLength: 1000
+            website:
+              type: string
+              format: uri
+            iconUrl:
+              type: string
+              format: uri
+          additionalProperties: false
+      additionalProperties: false
+    RegisterAppResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [id, name, apiKey, vapidPublicKey, createdAt]
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+            apiKey:
+              type: string
+              description: App API key (send/subscribe auth)
+              example: vp_0123456789abcdef...
+            vapidPublicKey:
+              type: string
+              description: Base64url-encoded VAPID public key
+            createdAt:
+              type: string
+              format: date-time
+    App:
+      type: object
+      required: [id, name, apiKey, vapidPublicKey, metadata, rateLimit, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        apiKey:
+          type: string
+        vapidPublicKey:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        rateLimit:
+          type: object
+          properties:
+            maxNotificationsPerMinute:
+              type: integer
+              minimum: 0
+            maxNotificationsPerDay:
+              type: integer
+              minimum: 0
+            maxSubscriptions:
+              type: integer
+              minimum: 0
+          additionalProperties: false
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    ListAppsResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/App"
+    GetAppResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          $ref: "#/components/schemas/App"
+    UpdateAppRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+    UpdateAppResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [id, name, metadata, updatedAt]
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+            metadata:
+              type: object
+              additionalProperties: true
+            updatedAt:
+              type: string
+              format: date-time
+    DeleteAppResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [deleted]
+          properties:
+            deleted:
+              type: boolean
+              const: true
+    RegenerateKeyResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [apiKey]
+          properties:
+            apiKey:
+              type: string
+    VapidPublicKeyResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [publicKey]
+          properties:
+            publicKey:
+              type: string
+              description: Base64url VAPID public key for PushManager.subscribe
+    SubscribeRequest:
+      type: object
+      required: [endpoint, keys]
+      properties:
+        endpoint:
+          type: string
+          format: uri
+        keys:
+          type: object
+          required: [p256dh, auth]
+          properties:
+            p256dh:
+              type: string
+              description: base64url (or base64) encoded p256dh key
+            auth:
+              type: string
+              description: base64url (or base64) encoded auth secret
+          additionalProperties: false
+        userId:
+          type: string
+          description: Optional tag for targeting (user-scoped)
+        channelId:
+          type: string
+          description: Optional tag for targeting (channel-scoped)
+        metadata:
+          type: object
+          additionalProperties: true
+        expirationTime:
+          type: number
+          nullable: true
+      additionalProperties: false
+    SubscribeResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [id, endpoint, createdAt]
+          properties:
+            id:
+              type: string
+              format: uuid
+            endpoint:
+              type: string
+              format: uri
+            createdAt:
+              type: string
+              format: date-time
+    UriReference:
+      type: string
+      format: uri-reference
+      description: Absolute URL or `/path`
+    SendPayload:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        body:
+          type: string
+          maxLength: 1000
+        icon:
+          $ref: "#/components/schemas/UriReference"
+        badge:
+          $ref: "#/components/schemas/UriReference"
+        image:
+          $ref: "#/components/schemas/UriReference"
+        url:
+          $ref: "#/components/schemas/UriReference"
+        data:
+          type: object
+          additionalProperties: true
+        actions:
+          type: array
+          items:
+            type: object
+            required: [action, title]
+            properties:
+              action:
+                type: string
+              title:
+                type: string
+              icon:
+                $ref: "#/components/schemas/UriReference"
+            additionalProperties: false
+        tag:
+          type: string
+        requireInteraction:
+          type: boolean
+        silent:
+          type: boolean
+      additionalProperties: false
+    SendRequest:
+      type: object
+      required: [payload]
+      properties:
+        payload:
+          $ref: "#/components/schemas/SendPayload"
+        userId:
+          type: string
+        channelId:
+          type: string
+        subscriptionIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+      additionalProperties: false
+    SendResponse:
+      type: object
+      required: [success, data]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+          required: [sent, failed, total]
+          properties:
+            sent:
+              type: integer
+              minimum: 0
+            failed:
+              type: integer
+              minimum: 0
+            total:
+              type: integer
+              minimum: 0
+            failures:
+              type: array
+              items:
+                type: object
+                required: [subscriptionId, error]
+                properties:
+                  subscriptionId:
+                    type: string
+                    format: uuid
+                  error:
+                    type: string
+                additionalProperties: false

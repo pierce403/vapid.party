@@ -434,10 +434,22 @@ export default function Dashboard() {
             <div className="mb-6">
               <h3 className="font-semibold mb-3">Quick Start</h3>
               <div className="code-block">
-                <pre className="text-sm text-vapor-300 whitespace-pre-wrap">{`// Subscribe a user
+                <pre className="text-sm text-vapor-300 whitespace-pre-wrap">{`// Helper to convert a base64url VAPID public key to a Uint8Array
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
+
+// Subscribe a user
 const subscription = await registration.pushManager.subscribe({
   userVisibleOnly: true,
-  applicationServerKey: '${selectedApp.vapidPublicKey}'
+  applicationServerKey: urlBase64ToUint8Array('${selectedApp.vapidPublicKey}')
 });
 
 await fetch('https://vapid.party/api/subscribe', {
@@ -449,8 +461,8 @@ await fetch('https://vapid.party/api/subscribe', {
   body: JSON.stringify({
     endpoint: subscription.endpoint,
     keys: {
-      p256dh: /* base64 encoded */,
-      auth: /* base64 encoded */
+      p256dh: /* base64url (or base64) encoded */,
+      auth: /* base64url (or base64) encoded */
     }
   })
 });
@@ -533,4 +545,3 @@ await fetch('https://vapid.party/api/send', {
     </main>
   );
 }
-

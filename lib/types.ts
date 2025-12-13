@@ -51,6 +51,70 @@ export interface RateLimitLog {
 }
 
 // ============================================================================
+// Validation Helpers
+// ============================================================================
+
+function normalizeBase64Url(input: string): string | null {
+  const compact = input.replace(/\s+/g, '');
+  if (!compact) return null;
+
+  // Accept both base64 and base64url alphabets (optionally padded).
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return null;
+
+  const asBase64 = compact.replace(/-/g, '+').replace(/_/g, '/');
+  const padded =
+    asBase64 + '='.repeat((4 - (asBase64.length % 4)) % 4);
+
+  const bytes = Buffer.from(padded, 'base64');
+  if (bytes.length === 0) return null;
+
+  return bytes.toString('base64url');
+}
+
+const Base64OrBase64UrlString = z
+  .string()
+  .min(1)
+  .transform((value, ctx) => {
+    const normalized = normalizeBase64Url(value);
+    if (!normalized) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Invalid base64/base64url string',
+      });
+      return z.NEVER;
+    }
+    return normalized;
+  });
+
+const P256dhKey = Base64OrBase64UrlString.superRefine((value, ctx) => {
+  const byteLength = Buffer.from(value, 'base64url').length;
+  if (byteLength !== 65) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'keys.p256dh must decode to 65 bytes',
+    });
+  }
+});
+
+const AuthKey = Base64OrBase64UrlString.superRefine((value, ctx) => {
+  const byteLength = Buffer.from(value, 'base64url').length;
+  if (byteLength < 16) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'keys.auth must decode to at least 16 bytes',
+    });
+  }
+});
+
+const AbsoluteUrl = z.string().url();
+const AbsoluteUrlOrPath = z.union([
+  AbsoluteUrl,
+  z.string().refine((value) => value.startsWith('/'), {
+    message: 'Must be an absolute URL or a path starting with /',
+  }),
+]);
+
+// ============================================================================
 // API Request/Response Types
 // ============================================================================
 
@@ -78,8 +142,8 @@ export interface RegisterAppResponse {
 export const SubscribeSchema = z.object({
   endpoint: z.string().url(),
   keys: z.object({
-    p256dh: z.string().min(1),
-    auth: z.string().min(1),
+    p256dh: P256dhKey,
+    auth: AuthKey,
   }),
   userId: z.string().max(255).optional(),
   channelId: z.string().max(255).optional(),
@@ -100,10 +164,10 @@ export const SendNotificationSchema = z.object({
   payload: z.object({
     title: z.string().min(1).max(255),
     body: z.string().max(1000).optional(),
-    icon: z.string().url().optional(),
-    badge: z.string().url().optional(),
-    image: z.string().url().optional(),
-    url: z.string().url().optional(),
+    icon: AbsoluteUrlOrPath.optional(),
+    badge: AbsoluteUrlOrPath.optional(),
+    image: AbsoluteUrlOrPath.optional(),
+    url: AbsoluteUrlOrPath.optional(),
     data: z.record(z.unknown()).optional(),
     actions: z.array(z.object({
       action: z.string(),
@@ -138,6 +202,7 @@ export interface ApiResponse<T = unknown> {
   data?: T;
   error?: string;
   code?: string;
+  details?: unknown;
 }
 
 // Auth Types
@@ -166,4 +231,3 @@ export const ErrorCodes = {
 } as const;
 
 export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes];
-
