@@ -16,10 +16,12 @@ Implemented in this repo:
 - Public Converge XMTP registration contract.
 
 Not complete until verified live:
-- Cloudflare resources provisioned in the production account.
-- `vapid.party` custom domain routed to the Worker.
 - Worker-only XMTP stream or Container daemon proven in production.
 - Real Converge end-to-end push delivery test.
+
+Live API endpoints:
+- `https://vapid.party`
+- `https://vapid-party.bcrt43.workers.dev`
 
 ## Local Workflow
 

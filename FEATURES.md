@@ -15,15 +15,15 @@ Properties:
 - Static assets from `public/` are available through the Worker assets binding.
 - `npm run dev` starts Wrangler for local Worker development.
 - `npm run build` produces a Wrangler dry-run bundle instead of a Vercel build.
-- Production Worker is deployed at `https://vapid-party.bcrt43.workers.dev`.
-- `vapid.party` custom-domain attachment is blocked because the zone is not in this Cloudflare account.
+- Production Worker is deployed at `https://vapid-party.bcrt43.workers.dev` and `https://vapid.party`.
+- `vapid.party` is an active Cloudflare zone and the Worker custom domain is attached.
 
 Test Criteria:
 - [x] `npm run lint`
 - [x] `npm test`
 - [x] `npm run build`
 - [x] Worker upload/deployment succeeds against the production Cloudflare account.
-- [ ] `wrangler deploy` succeeds with the `vapid.party` custom domain after the Cloudflare zone exists.
+- [x] `wrangler deploy` succeeds with the `vapid.party` custom domain after the Cloudflare zone exists.
 
 ## D1 Persistence
 
@@ -192,8 +192,9 @@ Properties:
 - Cloudflare deployment requires account authentication and real D1/Queue resources.
 - `vapid.party` route/custom domain must be configured in Cloudflare.
 - A real browser push subscription and Converge XMTP registration must be used for final verification.
-- Current Worker URL: `https://vapid-party.bcrt43.workers.dev`.
-- Current blocker: `vapid.party` is not a Cloudflare zone in this account; public DNS is still hosted at Namecheap nameservers and points the apex at `216.198.79.1`.
+- Current Worker URLs: `https://vapid-party.bcrt43.workers.dev` and `https://vapid.party`.
+- Current remaining blocker: real Converge end-to-end push delivery has not been run.
+- DNS note: Cloudflare authoritative DNS returns Worker-managed records for `vapid.party`; some recursive resolvers may briefly lag after the cutover.
 - Wrangler auth is available by passing the valid `cf` OAuth token from `~/.cf/config.toml` as `CLOUDFLARE_API_TOKEN`.
 
 Test Criteria:
@@ -201,7 +202,7 @@ Test Criteria:
 - [x] Secrets and vars are configured in Cloudflare.
 - [x] Worker deployment exists in Cloudflare.
 - [x] `https://vapid-party.bcrt43.workers.dev/api/xmtp/vapid-public-key` returns the production public VAPID key.
-- [ ] `vapid.party` Cloudflare zone is created/activated.
-- [ ] `wrangler deploy` completes with `https://vapid.party` custom domain attached.
-- [ ] `https://vapid.party/api/xmtp/vapid-public-key` returns the production public VAPID key.
+- [x] `vapid.party` Cloudflare zone is created/activated.
+- [x] `wrangler deploy` completes with `https://vapid.party` custom domain attached.
+- [x] `https://vapid.party/api/xmtp/vapid-public-key` returns the production public VAPID key.
 - [ ] Real Converge end-to-end push delivery succeeds.
