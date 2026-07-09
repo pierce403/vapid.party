@@ -2,6 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "vapid-party",
   "main": "src/worker/index.ts",
+  "workers_dev": true,
   "compatibility_date": "2026-07-08",
   "compatibility_flags": ["nodejs_compat"],
   "observability": {
@@ -21,6 +22,7 @@
     {
       "binding": "DB",
       "database_name": "vapid-party",
+      "database_id": "c78e2c36-5768-43e1-936e-79b5850871bb",
       "migrations_dir": "migrations/d1"
     }
   ],

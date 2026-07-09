@@ -15,12 +15,15 @@ Properties:
 - Static assets from `public/` are available through the Worker assets binding.
 - `npm run dev` starts Wrangler for local Worker development.
 - `npm run build` produces a Wrangler dry-run bundle instead of a Vercel build.
+- Production Worker is deployed at `https://vapid-party.bcrt43.workers.dev`.
+- `vapid.party` custom-domain attachment is blocked because the zone is not in this Cloudflare account.
 
 Test Criteria:
 - [x] `npm run lint`
 - [x] `npm test`
 - [x] `npm run build`
-- [ ] `wrangler deploy` succeeds against the production Cloudflare account.
+- [x] Worker upload/deployment succeeds against the production Cloudflare account.
+- [ ] `wrangler deploy` succeeds with the `vapid.party` custom domain after the Cloudflare zone exists.
 
 ## D1 Persistence
 
@@ -32,12 +35,14 @@ Description:
 
 Properties:
 - D1 migrations live in `migrations/d1`.
+- Remote D1 database is `vapid-party` / `c78e2c36-5768-43e1-936e-79b5850871bb`.
 - App VAPID keys remain per app.
 - Converge registration rows are keyed by push endpoint, `inboxId`, and `installationId`.
 - XMTP topic/HMAC rows never store plaintext message content.
 
 Test Criteria:
 - [x] D1 migration applies locally with `npm run db:migrate`.
+- [x] D1 migration applies remotely with `npm run db:migrate:remote`.
 - [x] Idempotent Converge registration test passes.
 - [x] Unsubscribe test disables the expected registration rows.
 
@@ -92,6 +97,7 @@ Description:
 
 Properties:
 - Queue producer binding is `PUSH_QUEUE`.
+- Remote queues are `vapid-party-push-send` and `vapid-party-push-dlq`.
 - Consumer uses bounded batches and retry delays.
 - Dead-letter queue name is `vapid-party-push-dlq`.
 - XMTP push payloads only contain generic metadata.
@@ -186,11 +192,16 @@ Properties:
 - Cloudflare deployment requires account authentication and real D1/Queue resources.
 - `vapid.party` route/custom domain must be configured in Cloudflare.
 - A real browser push subscription and Converge XMTP registration must be used for final verification.
-- Current blocker: `npx wrangler whoami` reports the Cloudflare auth token is expired in this non-interactive shell.
+- Current Worker URL: `https://vapid-party.bcrt43.workers.dev`.
+- Current blocker: `vapid.party` is not a Cloudflare zone in this account; public DNS is still hosted at Namecheap nameservers and points the apex at `216.198.79.1`.
+- Wrangler auth is available by passing the valid `cf` OAuth token from `~/.cf/config.toml` as `CLOUDFLARE_API_TOKEN`.
 
 Test Criteria:
-- [ ] D1 database and queues are created in Cloudflare.
-- [ ] Secrets and vars are configured in Cloudflare.
-- [ ] `wrangler deploy` completes.
+- [x] D1 database and queues are created in Cloudflare.
+- [x] Secrets and vars are configured in Cloudflare.
+- [x] Worker deployment exists in Cloudflare.
+- [x] `https://vapid-party.bcrt43.workers.dev/api/xmtp/vapid-public-key` returns the production public VAPID key.
+- [ ] `vapid.party` Cloudflare zone is created/activated.
+- [ ] `wrangler deploy` completes with `https://vapid.party` custom domain attached.
 - [ ] `https://vapid.party/api/xmtp/vapid-public-key` returns the production public VAPID key.
 - [ ] Real Converge end-to-end push delivery succeeds.
