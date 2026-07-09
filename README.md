@@ -1,322 +1,171 @@
-# vapid.party 🔔
+# vapid.party
 
-A Web3-native Web Push notification relay. Connect your wallet, create apps, and send push notifications with your own VAPID keys.
+Cloudflare-hosted Web Push relay with public XMTP-aware registration endpoints for Converge.
 
-## Features
+The production target is a single Cloudflare Worker with D1, Queues, Durable Objects, and optional static assets. The legacy Next/Vercel code remains in the repository for reference/dashboard continuity, but the deployable runtime is now `src/worker`.
 
-- **Web3 Authentication**: Sign in with your wallet via thirdweb - no email or password required
-- **Per-App VAPID Keys**: Each app gets unique VAPID keypairs for complete isolation
-- **User & Channel Targeting**: Tag subscriptions with `userId` or `channelId` for targeted notifications
-- **Built-in Limits**: Per-app subscription caps and per-minute send limits protect against abuse
-- **Structured Logging**: Winston-based logging for monitoring and debugging
-- **Vercel-Ready**: Deploy instantly to Vercel with Postgres
+## Status
 
-## Quick Start
+Progress is tracked in [FEATURES.md](./FEATURES.md) using the `features.md` structure: Stability, Description, Properties, and Test Criteria.
 
-### 1. Prerequisites
+Implemented in this repo:
+- Cloudflare Worker API routes.
+- D1 migration for apps, push subscriptions, XMTP identity/topic registrations, delivery attempts, rate logs, and relay cursors.
+- Queue-backed push jobs with retry/dead-letter configuration.
+- Durable Object shard lease and cursor coordination.
+- Public Converge XMTP registration contract.
 
-- Node.js 18+
-- A [thirdweb](https://thirdweb.com) account and client ID
-- A [Vercel Postgres](https://vercel.com/docs/storage/vercel-postgres) database
+Not complete until verified live:
+- Cloudflare resources provisioned in the production account.
+- `vapid.party` custom domain routed to the Worker.
+- Worker-only XMTP stream or Container daemon proven in production.
+- Real Converge end-to-end push delivery test.
 
-### 2. Environment Setup
-
-```bash
-cp env.example .env.local
-```
-
-Fill in your environment variables:
-
-```env
-# Thirdweb Configuration
-NEXT_PUBLIC_THIRDWEB_CLIENT_ID=your_thirdweb_client_id
-
-# Vercel Postgres (auto-populated when you link a database)
-POSTGRES_URL=postgres://...
-
-# VAPID Configuration
-VAPID_SUBJECT=mailto:your-email@example.com
-```
-
-### 3. Install & Run
+## Local Workflow
 
 ```bash
 npm install
-npm run db:migrate  # Initialize database tables
-npm run dev         # Start development server
+npm run db:migrate
+npm run dev
 ```
 
-Visit [http://localhost:3000](http://localhost:3000)
+Useful checks:
 
-## API Reference
+```bash
+npm run lint
+npm test
+npm run build
+```
+
+## Cloudflare Runtime
+
+Wrangler config lives in `wrangler.jsonc`.
+
+Bindings:
+- `DB`: D1 database `vapid-party`.
+- `PUSH_QUEUE`: Cloudflare Queue `vapid-party-push-send`.
+- `RELAY_COORDINATOR`: Durable Object class `RelayCoordinator`.
+- `ASSETS`: optional static asset binding for files in `public/`.
+
+Provisioning outline:
+
+```bash
+npx wrangler d1 create vapid-party
+npx wrangler queues create vapid-party-push-send
+npx wrangler queues create vapid-party-push-dlq
+npm run db:migrate:remote
+npx wrangler deploy
+```
+
+If `wrangler d1 create` returns a database id, add it to `wrangler.jsonc`.
+
+Secrets:
+
+```bash
+npx wrangler secret put CONVERGE_VAPID_PUBLIC_KEY
+npx wrangler secret put CONVERGE_VAPID_PRIVATE_KEY
+npx wrangler secret put INTERNAL_INGEST_TOKEN
+```
+
+See [docs/cloudflare-architecture.md](./docs/cloudflare-architecture.md) for the architecture, monitor decision, privacy model, and deployment runbook.
+
+## Converge XMTP API
+
+Converge remains a static PWA and defaults to `https://vapid.party/api`.
+
+Public routes:
+- `GET /api/xmtp/vapid-public-key`
+- `POST /api/xmtp/subscriptions`
+- `DELETE /api/xmtp/subscriptions`
+
+These routes do not require a client secret or baked client API key.
+
+### GET /api/xmtp/vapid-public-key
+
+Returns the public VAPID key used by Converge:
+
+```json
+{
+  "success": true,
+  "data": {
+    "publicKey": "BN..."
+  }
+}
+```
+
+### POST /api/xmtp/subscriptions
+
+Idempotently registers a Web Push subscription for an XMTP inbox/installation and topic/HMAC set.
+
+```json
+{
+  "endpoint": "https://push.example/subscription",
+  "keys": {
+    "p256dh": "base64url...",
+    "auth": "base64url..."
+  },
+  "expirationTime": null,
+  "inboxId": "xmtp-inbox-id",
+  "installationId": "xmtp-installation-id",
+  "address": "0x...",
+  "hmacKeys": {
+    "/xmtp/topic": "base64url-hmac-key"
+  },
+  "preferences": {
+    "minimalPayloadOnly": true,
+    "plaintextPreview": false
+  }
+}
+```
+
+The route also accepts a browser-style nested `subscription` object and `topics` as an array of `{ topic, hmacKey, algorithm?, conversationId? }`.
+
+### DELETE /api/xmtp/subscriptions
+
+Best-effort unsubscribe/disable:
+
+```json
+{
+  "endpoint": "https://push.example/subscription",
+  "inboxId": "xmtp-inbox-id",
+  "installationId": "xmtp-installation-id"
+}
+```
+
+## XMTP Push Payload
+
+The relay sends only generic metadata:
+
+```json
+{
+  "type": "xmtp.new_message",
+  "title": "Converge",
+  "body": "New encrypted message",
+  "url": "/"
+}
+```
+
+`conversationId` may be included only if it is safe non-content metadata. The relay must never receive, store, forward, or preview plaintext XMTP message text, sender names, decrypted content, attachment URLs, or previews.
+
+## Generic Web Push API
+
+Generic app operations retain the prior auth model:
+- Owner/admin app routes use `Authorization: Bearer <wallet-token>`.
+- Generic push subscription/send routes use `X-API-Key`.
+
+Routes:
+- `POST /api/register-app`
+- `GET /api/apps`
+- `GET /api/apps/:id`
+- `PUT /api/apps/:id`
+- `DELETE /api/apps/:id`
+- `POST /api/apps/:id/regenerate-key`
+- `GET /api/vapid/public-key`
+- `POST /api/subscribe`
+- `POST /api/send`
+
+`POST /api/send` queues push jobs and returns `202` with queued delivery attempt ids. Actual Web Push delivery happens in the queue consumer.
 
 Machine-readable docs:
 - OpenAPI schema: `/openapi.yaml`
 - LLM guide: `/llms.txt`
-
-### Authentication
-
-All endpoints require authentication:
-- **Wallet Auth**: For managing your apps (via `Authorization: Bearer <token>` header)
-- **API Key Auth**: For subscribing users and sending notifications (via `X-API-Key` header)
-
-### Validation Errors
-
-Validation failures return **HTTP 422** with structured details:
-
-```json
-{
-  "success": false,
-  "error": "Validation failed",
-  "code": "VALIDATION_ERROR",
-  "details": {
-      "issues": [
-      { "fieldPath": "payload.icon", "message": "Must be an absolute URL or a path starting with /", "value": "icon.png" }
-    ]
-  }
-}
-```
-
-### Endpoints
-
-#### POST /api/register-app
-Create a new app (requires wallet auth).
-
-```bash
-curl -X POST https://vapid.party/api/register-app \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <wallet-token>" \
-  -d '{"name": "My App"}'
-```
-
-Response:
-```json
-{
-  "success": true,
-  "data": {
-    "id": "uuid",
-    "name": "My App",
-    "apiKey": "vp_...",
-    "vapidPublicKey": "BN...",
-    "createdAt": "2024-01-01T00:00:00.000Z"
-  }
-}
-```
-
-#### POST /api/subscribe
-Register a push subscription (requires API key).
-
-```bash
-curl -X POST https://vapid.party/api/subscribe \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: vp_..." \
-  -d '{
-    "endpoint": "https://fcm.googleapis.com/...",
-    "keys": {
-      "p256dh": "base64...",
-      "auth": "base64..."
-    },
-    "userId": "user_123",
-    "channelId": "announcements"
-  }'
-```
-
-#### POST /api/send
-Send push notifications (requires API key).
-
-Targeting rules:
-- If `subscriptionIds` is provided, only those subscriptions are targeted (and `userId` / `channelId` are ignored).
-- Otherwise, `userId` and/or `channelId` filter recipients.
-- If no targeting fields are provided, the message is broadcast to all subscriptions for the app.
-
-```bash
-curl -X POST https://vapid.party/api/send \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: vp_..." \
-  -d '{
-    "payload": {
-      "title": "Hello!",
-      "body": "This is a notification",
-      "icon": "/icon.png",
-      "url": "https://example.com"
-    },
-    "userId": "user_123"
-  }'
-```
-
-Response:
-```json
-{
-  "success": true,
-  "data": {
-    "sent": 1,
-    "failed": 0,
-    "total": 1
-  }
-}
-```
-
-#### GET /api/vapid/public-key
-Get VAPID public key for client-side subscription (requires API key).
-
-```bash
-curl https://vapid.party/api/vapid/public-key \
-  -H "X-API-Key: vp_..."
-```
-
-## Client Integration
-
-### 1. Service Worker
-
-```javascript
-// service-worker.js
-self.addEventListener('push', (event) => {
-  const data = event.data?.json() ?? {};
-  
-  event.waitUntil(
-    self.registration.showNotification(data.title, {
-      body: data.body,
-      icon: data.icon,
-      badge: data.badge,
-      data: { url: data.url }
-    })
-  );
-});
-
-self.addEventListener('notificationclick', (event) => {
-  event.notification.close();
-  
-  const url = event.notification.data?.url;
-  if (url) {
-    const target = new URL(url, self.location.origin);
-    event.waitUntil(clients.openWindow(target.toString()));
-  }
-});
-```
-
-### 2. Subscribe Users
-
-```javascript
-// Helper to convert VAPID key
-function urlBase64ToUint8Array(base64String) {
-  const padding = '='.repeat((4 - base64String.length % 4) % 4);
-  const base64 = (base64String + padding)
-    .replace(/-/g, '+')
-    .replace(/_/g, '/');
-  const rawData = window.atob(base64);
-  const outputArray = new Uint8Array(rawData.length);
-  for (let i = 0; i < rawData.length; ++i) {
-    outputArray[i] = rawData.charCodeAt(i);
-  }
-  return outputArray;
-}
-
-async function subscribeToPush(apiKey, vapidPublicKey) {
-  const registration = await navigator.serviceWorker.ready;
-  
-  const subscription = await registration.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: urlBase64ToUint8Array(vapidPublicKey)
-  });
-
-  await fetch('https://vapid.party/api/subscribe', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-Key': apiKey
-    },
-    body: JSON.stringify({
-      endpoint: subscription.endpoint,
-      keys: {
-        p256dh: btoa(String.fromCharCode(...new Uint8Array(subscription.getKey('p256dh')))),
-        auth: btoa(String.fromCharCode(...new Uint8Array(subscription.getKey('auth'))))
-      },
-      userId: 'optional-user-id'
-    })
-  });
-}
-```
-
-### 3. Send Notifications (Server-side)
-
-```javascript
-async function sendNotification(apiKey, userId, message) {
-  const response = await fetch('https://vapid.party/api/send', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-Key': apiKey
-    },
-    body: JSON.stringify({
-      payload: {
-        title: message.title,
-        body: message.body,
-        url: message.url
-      },
-      userId: userId // Optional: target specific user
-    })
-  });
-
-  return response.json();
-}
-```
-
-## Rate Limits
-
-The backend enforces per-app subscription caps on subscribe requests and
-per-minute notification limits on send requests. Limits are returned in the
-`rateLimit` field on the Apps API responses. `maxNotificationsPerDay` is
-currently stored app configuration, not an enforced daily window.
-
-## Project Structure
-
-```
-vapid.party/
-├── app/
-│   ├── api/
-│   │   ├── register-app/   # Create new apps
-│   │   ├── subscribe/      # Register push subscriptions
-│   │   ├── send/          # Send notifications
-│   │   ├── apps/          # Manage apps (CRUD)
-│   │   └── vapid/         # Get VAPID public key
-│   ├── dashboard/         # App management UI
-│   └── page.tsx           # Landing page
-├── components/            # React components
-├── lib/
-│   ├── db.ts             # Database operations
-│   ├── types.ts          # TypeScript types & Zod schemas
-│   ├── notifications.ts  # Push notification sending
-│   ├── api-utils.ts      # API helpers & auth
-│   └── logger.ts         # Winston logging
-└── scripts/
-    └── migrate.ts        # Database migration
-```
-
-## Deployment
-
-### Vercel (Recommended)
-
-1. Push to GitHub
-2. Import project in Vercel
-3. Add environment variables
-4. Deploy!
-
-The database will be automatically initialized on first request.
-
-### Manual Migration
-
-```bash
-npm run db:migrate
-```
-
-## Future Plans
-
-The architecture supports future additions:
-- Token-based billing (usage_logs table ready)
-- Staking for higher limits
-- Analytics dashboard
-- Webhook integrations
-
-## License
-
-Apache 2.0

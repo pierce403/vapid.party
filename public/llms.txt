@@ -1,4 +1,4 @@
-vapid.party — Web Push Relay API (VAPID)
+vapid.party — Cloudflare Web Push + XMTP-aware relay
 
 Base URL:
 - https://vapid.party
@@ -6,48 +6,76 @@ Base URL:
 OpenAPI:
 - /openapi.yaml
 
-Auth:
-- App management endpoints use `Authorization: Bearer <token>` (wallet auth)
-- Push endpoints use `X-API-Key: <vp_...>` (per-app API key)
-
 Response shape:
 - Success: `{ "success": true, "data": ... }`
 - Error: `{ "success": false, "error": "...", "code": "...", "details": ...? }`
-- Validation errors use HTTP 422 and include `details.issues[]` with:
-  - `fieldPath` (dot/bracket path), `message`, and best-effort `value`
+- Validation errors use HTTP 422 and include `details.issues[]`.
 
-Push workflow (typical):
-1) Create an app (wallet auth)
-   - POST /api/register-app
-   - Response includes: `apiKey` and `vapidPublicKey`
+Public Converge XMTP routes:
+- GET /api/xmtp/vapid-public-key
+- POST /api/xmtp/subscriptions
+- DELETE /api/xmtp/subscriptions
 
-2) Get VAPID public key (API key auth)
-   - GET /api/vapid/public-key
-   - Use `data.publicKey` as `applicationServerKey` for `PushManager.subscribe`
+Converge route auth:
+- No client secret.
+- No baked client API key.
+- Do not send `X-API-Key`.
 
-3) Create/update a subscription (API key auth)
-   - POST /api/subscribe
-   - Body:
-     - `endpoint` (absolute URL)
-     - `keys.p256dh` and `keys.auth` (base64url or base64; server normalizes to base64url)
-     - Optional tags:
-       - `userId`: arbitrary string for user-scoped targeting
-       - `channelId`: arbitrary string for channel-scoped targeting
+Converge registration body:
+- Web Push subscription endpoint and keys.
+- `inboxId`.
+- `installationId`.
+- optional `address`.
+- XMTP topic/HMAC registrations from Converge SDK-exposed `conversations.hmacKeys()`.
+- `preferences.minimalPayloadOnly` must be `true`.
+- `preferences.plaintextPreview` must be `false`.
 
-4) Send notifications (API key auth)
-   - POST /api/send
-   - Targeting rules:
-     - If `subscriptionIds` is present, only those subscriptions are targeted (and `userId`/`channelId` are ignored).
-     - Otherwise, `userId` and/or `channelId` filter recipients.
-     - If no targeting fields are present, sends to all subscriptions for the app.
-   - `payload.url`, `payload.icon`, `payload.badge`, `payload.image` can be absolute URLs or `/paths`.
-
-Example: send to a channel
-POST /api/send
-Headers:
-  X-API-Key: vp_...
+Converge registration example:
+POST /api/xmtp/subscriptions
 Body:
 {
-  "payload": { "title": "Announcement", "body": "Hello!", "url": "/announcements" },
-  "channelId": "announcements"
+  "endpoint": "https://push.example/subscription",
+  "keys": {
+    "p256dh": "base64url...",
+    "auth": "base64url..."
+  },
+  "inboxId": "xmtp-inbox-id",
+  "installationId": "xmtp-installation-id",
+  "hmacKeys": {
+    "/xmtp/topic": "base64url-hmac-key"
+  },
+  "preferences": {
+    "minimalPayloadOnly": true,
+    "plaintextPreview": false
+  }
 }
+
+XMTP push payload:
+- `type`: `xmtp.new_message`
+- `title`: `Converge`
+- `body`: `New encrypted message`
+- `url`: `/`
+- optional `conversationId` only if safe/non-content metadata
+
+Privacy rule:
+- vapid.party must never receive, store, forward, or preview plaintext XMTP message text, sender names, decrypted content, attachment URLs, or previews.
+- Converge opens and syncs/decrypts XMTP locally.
+
+Generic Web Push route auth:
+- App management endpoints use `Authorization: Bearer <token>` wallet auth.
+- Generic push endpoints use `X-API-Key: <vp_...>`.
+
+Generic workflow:
+1. Create an app:
+   - POST /api/register-app
+   - Response includes `apiKey` and `vapidPublicKey`.
+2. Get generic app VAPID public key:
+   - GET /api/vapid/public-key
+   - Requires `X-API-Key`.
+3. Create/update a generic subscription:
+   - POST /api/subscribe
+   - Requires `X-API-Key`.
+4. Queue notifications:
+   - POST /api/send
+   - Requires `X-API-Key`.
+   - Returns queued delivery attempt ids; Cloudflare Queue consumer performs actual Web Push send.

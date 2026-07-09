@@ -1,22 +1,28 @@
 {
   "name": "vapid-party",
   "version": "1.0.0",
-  "description": "Web Push Relay with Web3 Authentication",
+  "description": "Cloudflare Web Push and XMTP-aware relay",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint",
-    "test": "jest",
-    "db:migrate": "tsx scripts/migrate.ts"
+    "dev": "wrangler dev",
+    "dev:next": "next dev",
+    "build": "wrangler deploy --dry-run --outdir dist/worker",
+    "build:next": "next build",
+    "start": "wrangler dev --remote",
+    "lint": "tsc --noEmit -p tsconfig.worker.json",
+    "test": "vitest run",
+    "db:migrate": "wrangler d1 migrations apply vapid-party --local",
+    "db:migrate:remote": "wrangler d1 migrations apply vapid-party --remote",
+    "db:migrate:postgres": "tsx scripts/migrate.ts"
   },
   "keywords": [
     "vapid",
     "web-push",
     "notifications",
     "push-api",
-    "web3"
+    "web3",
+    "xmtp",
+    "cloudflare"
   ],
   "author": "",
   "license": "Apache-2.0",
@@ -32,6 +38,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
     "@types/hapi__shot": "^4.1.6",
     "@types/node": "^20.17.6",
     "@types/react": "^18.3.12",
@@ -44,7 +51,9 @@
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.14",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^3.2.7",
+    "wrangler": "^4.107.1"
   },
   "engines": {
     "node": ">=18.0.0"

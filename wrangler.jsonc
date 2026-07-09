@@ -1,0 +1,65 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vapid-party",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-07-08",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": true,
+    "not_found_handling": "none"
+  },
+  "vars": {
+    "VAPID_SUBJECT": "mailto:admin@vapid.party",
+    "CONVERGE_APP_ID": "converge"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "vapid-party",
+      "migrations_dir": "migrations/d1"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "PUSH_QUEUE",
+        "queue": "vapid-party-push-send"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "vapid-party-push-send",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "retry_delay": 30,
+        "dead_letter_queue": "vapid-party-push-dlq"
+      }
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "RELAY_COORDINATOR",
+        "class_name": "RelayCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["RelayCoordinator"]
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "vapid.party",
+      "custom_domain": true
+    }
+  ]
+}

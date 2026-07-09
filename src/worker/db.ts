@@ -1,0 +1,582 @@
+import type {
+  AppRecord,
+  Env,
+  PushPayload,
+  PushQueueJob,
+  RateLimitConfig,
+  SubscriptionRecord,
+  XmtpTopicMatch,
+} from './types';
+import { DEFAULT_RATE_LIMIT } from './types';
+import type {
+  NormalizedXmtpRegistration,
+  XmtpRegistrationResult,
+  XmtpRegistrationStore,
+  XmtpRelayStore,
+  XmtpUnsubscribeResult,
+} from './core';
+import { buildXmtpPushPayload } from './core';
+import { generateApiKey, generateVapidKeys } from './vapid';
+
+type JsonValue = Record<string, unknown> | unknown[];
+
+interface AppRow {
+  id: string;
+  name: string;
+  owner_wallet: string;
+  api_key: string;
+  vapid_public_key: string;
+  vapid_private_key: string;
+  metadata: string | null;
+  rate_limit: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface SubscriptionRow {
+  id: string;
+  app_id: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  user_id: string | null;
+  channel_id: string | null;
+  metadata: string | null;
+  created_at: string;
+  updated_at: string;
+  expires_at: string | null;
+  disabled_at: string | null;
+}
+
+interface TopicMatchRow {
+  topic_id: string;
+  subscription_id: string;
+  app_id: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  conversation_id: string | null;
+}
+
+function parseJsonObject(input: string | null, fallback: Record<string, unknown>): Record<string, unknown> {
+  if (!input) return fallback;
+  try {
+    const parsed = JSON.parse(input);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function parseRateLimit(input: string | null): RateLimitConfig {
+  return {
+    ...DEFAULT_RATE_LIMIT,
+    ...parseJsonObject(input, DEFAULT_RATE_LIMIT as unknown as Record<string, unknown>),
+  };
+}
+
+function json(input: JsonValue | Record<string, unknown> | undefined): string {
+  return JSON.stringify(input ?? {});
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function mapApp(row: AppRow): AppRecord {
+  return {
+    id: row.id,
+    name: row.name,
+    ownerWallet: row.owner_wallet,
+    apiKey: row.api_key,
+    vapidPublicKey: row.vapid_public_key,
+    vapidPrivateKey: row.vapid_private_key,
+    metadata: parseJsonObject(row.metadata, {}),
+    rateLimit: parseRateLimit(row.rate_limit),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapSubscription(row: SubscriptionRow): SubscriptionRecord {
+  return {
+    id: row.id,
+    appId: row.app_id,
+    endpoint: row.endpoint,
+    p256dh: row.p256dh,
+    auth: row.auth,
+    userId: row.user_id ?? undefined,
+    channelId: row.channel_id ?? undefined,
+    metadata: parseJsonObject(row.metadata, {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    expiresAt: row.expires_at ?? undefined,
+    disabledAt: row.disabled_at ?? undefined,
+  };
+}
+
+export async function getAppById(db: D1Database, id: string): Promise<AppRecord | null> {
+  const row = await db.prepare('SELECT * FROM apps WHERE id = ?').bind(id).first<AppRow>();
+  return row ? mapApp(row) : null;
+}
+
+export async function getAppByApiKey(db: D1Database, apiKey: string): Promise<AppRecord | null> {
+  const row = await db.prepare('SELECT * FROM apps WHERE api_key = ?').bind(apiKey).first<AppRow>();
+  return row ? mapApp(row) : null;
+}
+
+export async function getAppsByOwner(db: D1Database, ownerWallet: string): Promise<AppRecord[]> {
+  const result = await db
+    .prepare('SELECT * FROM apps WHERE owner_wallet = ? ORDER BY created_at DESC')
+    .bind(ownerWallet.toLowerCase())
+    .all<AppRow>();
+
+  return result.results.map(mapApp);
+}
+
+export async function createApp(
+  db: D1Database,
+  ownerWallet: string,
+  name: string,
+  metadata?: Record<string, unknown>
+): Promise<AppRecord> {
+  const id = crypto.randomUUID();
+  const apiKey = generateApiKey();
+  const vapidKeys = await generateVapidKeys();
+  const timestamp = nowIso();
+
+  await db.prepare(`
+    INSERT INTO apps (id, name, owner_wallet, api_key, vapid_public_key, vapid_private_key, metadata, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    id,
+    name,
+    ownerWallet.toLowerCase(),
+    apiKey,
+    vapidKeys.publicKey,
+    vapidKeys.privateKey,
+    json(metadata),
+    timestamp,
+    timestamp
+  ).run();
+
+  const app = await getAppById(db, id);
+  if (!app) throw new Error('Created app could not be loaded');
+  return app;
+}
+
+export async function updateApp(
+  db: D1Database,
+  id: string,
+  updates: { name?: string; metadata?: Record<string, unknown>; rateLimit?: Record<string, unknown> }
+): Promise<AppRecord | null> {
+  const current = await getAppById(db, id);
+  if (!current) return null;
+
+  await db.prepare(`
+    UPDATE apps
+    SET name = ?, metadata = ?, rate_limit = ?, updated_at = ?
+    WHERE id = ?
+  `).bind(
+    updates.name ?? current.name,
+    json(updates.metadata ?? current.metadata),
+    JSON.stringify(updates.rateLimit ?? current.rateLimit),
+    nowIso(),
+    id
+  ).run();
+
+  return getAppById(db, id);
+}
+
+export async function deleteApp(db: D1Database, id: string): Promise<boolean> {
+  const result = await db.prepare('DELETE FROM apps WHERE id = ?').bind(id).run();
+  return result.meta.changes > 0;
+}
+
+export async function regenerateApiKey(db: D1Database, id: string): Promise<string | null> {
+  const apiKey = generateApiKey();
+  const result = await db
+    .prepare('UPDATE apps SET api_key = ?, updated_at = ? WHERE id = ?')
+    .bind(apiKey, nowIso(), id)
+    .run();
+
+  return result.meta.changes > 0 ? apiKey : null;
+}
+
+export async function countSubscriptions(db: D1Database, appId: string): Promise<number> {
+  const row = await db
+    .prepare('SELECT COUNT(*) AS count FROM subscriptions WHERE app_id = ? AND disabled_at IS NULL')
+    .bind(appId)
+    .first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+export async function upsertSubscription(
+  db: D1Database,
+  appId: string,
+  input: {
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    userId?: string;
+    channelId?: string;
+    metadata?: Record<string, unknown>;
+    expirationTime?: number | null;
+  }
+): Promise<SubscriptionRecord> {
+  const id = crypto.randomUUID();
+  const timestamp = nowIso();
+  const expiresAt = input.expirationTime ? new Date(input.expirationTime).toISOString() : null;
+
+  await db.prepare(`
+    INSERT INTO subscriptions (id, app_id, endpoint, p256dh, auth, user_id, channel_id, metadata, expires_at, created_at, updated_at, disabled_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(app_id, endpoint) DO UPDATE SET
+      p256dh = excluded.p256dh,
+      auth = excluded.auth,
+      user_id = excluded.user_id,
+      channel_id = excluded.channel_id,
+      metadata = excluded.metadata,
+      expires_at = excluded.expires_at,
+      updated_at = excluded.updated_at,
+      disabled_at = NULL
+  `).bind(
+    id,
+    appId,
+    input.endpoint,
+    input.p256dh,
+    input.auth,
+    input.userId ?? null,
+    input.channelId ?? null,
+    json(input.metadata),
+    expiresAt,
+    timestamp,
+    timestamp
+  ).run();
+
+  const row = await db
+    .prepare('SELECT * FROM subscriptions WHERE app_id = ? AND endpoint = ?')
+    .bind(appId, input.endpoint)
+    .first<SubscriptionRow>();
+
+  if (!row) throw new Error('Subscription upsert could not be loaded');
+  return mapSubscription(row);
+}
+
+export async function getSubscriptionsByApp(
+  db: D1Database,
+  appId: string,
+  filters: { userId?: string; channelId?: string } = {}
+): Promise<SubscriptionRecord[]> {
+  const clauses = ['app_id = ?', 'disabled_at IS NULL'];
+  const values: unknown[] = [appId];
+
+  if (filters.userId) {
+    clauses.push('user_id = ?');
+    values.push(filters.userId);
+  }
+
+  if (filters.channelId) {
+    clauses.push('channel_id = ?');
+    values.push(filters.channelId);
+  }
+
+  const result = await db
+    .prepare(`SELECT * FROM subscriptions WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC`)
+    .bind(...values)
+    .all<SubscriptionRow>();
+
+  return result.results.map(mapSubscription);
+}
+
+export async function getSubscriptionsByIds(
+  db: D1Database,
+  appId: string,
+  ids: string[]
+): Promise<SubscriptionRecord[]> {
+  if (ids.length === 0) return [];
+  const placeholders = ids.map(() => '?').join(', ');
+  const result = await db
+    .prepare(`SELECT * FROM subscriptions WHERE app_id = ? AND id IN (${placeholders}) AND disabled_at IS NULL`)
+    .bind(appId, ...ids)
+    .all<SubscriptionRow>();
+
+  return result.results.map(mapSubscription);
+}
+
+export async function disableSubscription(db: D1Database, id: string): Promise<void> {
+  await db.prepare('UPDATE subscriptions SET disabled_at = ?, updated_at = ? WHERE id = ?')
+    .bind(nowIso(), nowIso(), id)
+    .run();
+}
+
+export async function checkAndIncrementRateLimit(
+  db: D1Database,
+  appId: string,
+  action: string,
+  limit: number
+): Promise<{ allowed: boolean; current: number; limit: number; resetAt: string }> {
+  const windowStart = new Date();
+  windowStart.setSeconds(0, 0);
+  const windowIso = windowStart.toISOString();
+
+  await db.prepare(`
+    INSERT INTO rate_limit_logs (id, app_id, action, count, window_start)
+    VALUES (?, ?, ?, 1, ?)
+    ON CONFLICT(app_id, action, window_start) DO UPDATE SET count = count + 1
+  `).bind(crypto.randomUUID(), appId, action, windowIso).run();
+
+  const row = await db.prepare(`
+    SELECT count FROM rate_limit_logs WHERE app_id = ? AND action = ? AND window_start = ?
+  `).bind(appId, action, windowIso).first<{ count: number }>();
+
+  const current = row?.count ?? 0;
+  const reset = new Date(windowStart.getTime() + 60_000).toISOString();
+  return { allowed: current <= limit, current, limit, resetAt: reset };
+}
+
+export async function ensureConvergeApp(env: Env): Promise<AppRecord | null> {
+  const appId = env.CONVERGE_APP_ID || 'converge';
+  const current = await getAppById(env.DB, appId);
+  if (current) return current;
+
+  if (!env.CONVERGE_VAPID_PUBLIC_KEY || !env.CONVERGE_VAPID_PRIVATE_KEY) {
+    return null;
+  }
+
+  const timestamp = nowIso();
+  await env.DB.prepare(`
+    INSERT INTO apps (id, name, owner_wallet, api_key, vapid_public_key, vapid_private_key, metadata, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO NOTHING
+  `).bind(
+    appId,
+    'Converge',
+    'converge',
+    'vp_internal_converge',
+    env.CONVERGE_VAPID_PUBLIC_KEY,
+    env.CONVERGE_VAPID_PRIVATE_KEY,
+    json({ source: 'env' }),
+    timestamp,
+    timestamp
+  ).run();
+
+  return getAppById(env.DB, appId);
+}
+
+export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
+  constructor(private readonly env: Env) {}
+
+  async upsertRegistration(input: NormalizedXmtpRegistration): Promise<XmtpRegistrationResult> {
+    const app = await ensureConvergeApp(this.env);
+    if (!app) {
+      throw new Error('Converge VAPID app is not configured');
+    }
+
+    const identityId = await this.upsertIdentity(input);
+    const subscription = await upsertSubscription(this.env.DB, app.id, {
+      endpoint: input.endpoint,
+      p256dh: input.p256dh,
+      auth: input.auth,
+      userId: input.inboxId,
+      channelId: input.installationId,
+      metadata: { source: 'converge-xmtp', address: input.address ?? null },
+      expirationTime: input.expirationTime,
+    });
+
+    const existing = await this.env.DB.prepare(`
+      SELECT id FROM xmtp_subscriptions WHERE identity_id = ? AND subscription_id = ?
+    `).bind(identityId, subscription.id).first<{ id: string }>();
+
+    const xmtpSubscriptionId = existing?.id ?? crypto.randomUUID();
+    await this.env.DB.prepare(`
+      INSERT INTO xmtp_subscriptions (id, identity_id, subscription_id, preferences, active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(identity_id, subscription_id) DO UPDATE SET
+        preferences = excluded.preferences,
+        active = 1,
+        updated_at = excluded.updated_at
+    `).bind(
+      xmtpSubscriptionId,
+      identityId,
+      subscription.id,
+      JSON.stringify(input.preferences),
+      nowIso(),
+      nowIso()
+    ).run();
+
+    await this.replaceTopics(identityId, input.topics);
+
+    return {
+      subscriptionId: subscription.id,
+      identityId,
+      topicsRegistered: input.topics.length,
+      created: !existing,
+    };
+  }
+
+  async disableRegistration(input: { endpoint: string; inboxId: string; installationId: string }): Promise<XmtpUnsubscribeResult> {
+    const row = await this.env.DB.prepare(`
+      SELECT xs.id AS xmtp_subscription_id, s.id AS subscription_id
+      FROM xmtp_subscriptions xs
+      JOIN xmtp_identities xi ON xi.id = xs.identity_id
+      JOIN subscriptions s ON s.id = xs.subscription_id
+      WHERE s.endpoint = ? AND xi.inbox_id = ? AND xi.installation_id = ? AND xs.active = 1
+    `).bind(input.endpoint, input.inboxId, input.installationId).first<{ xmtp_subscription_id: string; subscription_id: string }>();
+
+    if (!row) return { disabled: false };
+
+    await this.env.DB.prepare(`
+      UPDATE xmtp_subscriptions SET active = 0, updated_at = ? WHERE id = ?
+    `).bind(nowIso(), row.xmtp_subscription_id).run();
+
+    await disableSubscription(this.env.DB, row.subscription_id);
+    return { disabled: true };
+  }
+
+  async findTopicMatches(topic: string, hmacKey: string): Promise<XmtpTopicMatch[]> {
+    const result = await this.env.DB.prepare(`
+      SELECT
+        xt.id AS topic_id,
+        s.id AS subscription_id,
+        s.app_id AS app_id,
+        s.endpoint AS endpoint,
+        s.p256dh AS p256dh,
+        s.auth AS auth,
+        xt.conversation_id AS conversation_id
+      FROM xmtp_topics xt
+      JOIN xmtp_identities xi ON xi.id = xt.identity_id
+      JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
+      JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
+      WHERE xt.topic = ? AND xt.hmac_key = ?
+    `).bind(topic, hmacKey).all<TopicMatchRow>();
+
+    return result.results.map((row) => ({
+      topicId: row.topic_id,
+      subscriptionId: row.subscription_id,
+      appId: row.app_id,
+      endpoint: row.endpoint,
+      p256dh: row.p256dh,
+      auth: row.auth,
+      conversationId: row.conversation_id ?? undefined,
+    }));
+  }
+
+  async enqueueXmtpPush(match: XmtpTopicMatch, payload: PushPayload = buildXmtpPushPayload(match)): Promise<void> {
+    const deliveryAttemptId = await insertDeliveryAttempt(this.env.DB, {
+      appId: match.appId,
+      subscriptionId: match.subscriptionId,
+      xmtpTopicId: match.topicId,
+      eventType: 'xmtp.new_message',
+      payload,
+    });
+
+    await this.env.PUSH_QUEUE.send({
+      deliveryAttemptId,
+      appId: match.appId,
+      subscriptionId: match.subscriptionId,
+      payload,
+      source: 'xmtp',
+    });
+  }
+
+  private async upsertIdentity(input: NormalizedXmtpRegistration): Promise<string> {
+    const existing = await this.env.DB.prepare(`
+      SELECT id FROM xmtp_identities WHERE inbox_id = ? AND installation_id = ?
+    `).bind(input.inboxId, input.installationId).first<{ id: string }>();
+
+    const id = existing?.id ?? crypto.randomUUID();
+    await this.env.DB.prepare(`
+      INSERT INTO xmtp_identities (id, inbox_id, installation_id, address, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(inbox_id, installation_id) DO UPDATE SET
+        address = excluded.address,
+        updated_at = excluded.updated_at
+    `).bind(
+      id,
+      input.inboxId,
+      input.installationId,
+      input.address ?? null,
+      nowIso(),
+      nowIso()
+    ).run();
+
+    return id;
+  }
+
+  private async replaceTopics(identityId: string, topics: NormalizedXmtpRegistration['topics']): Promise<void> {
+    await this.env.DB.prepare('DELETE FROM xmtp_topics WHERE identity_id = ?').bind(identityId).run();
+
+    for (const topic of topics) {
+      await this.env.DB.prepare(`
+        INSERT INTO xmtp_topics (id, identity_id, topic, hmac_key, algorithm, conversation_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        crypto.randomUUID(),
+        identityId,
+        topic.topic,
+        topic.hmacKey,
+        topic.algorithm,
+        topic.conversationId ?? null,
+        nowIso(),
+        nowIso()
+      ).run();
+    }
+  }
+}
+
+export async function insertDeliveryAttempt(
+  db: D1Database,
+  input: {
+    appId: string;
+    subscriptionId: string;
+    xmtpTopicId?: string;
+    eventType: string;
+    payload: PushPayload;
+  }
+): Promise<string> {
+  const id = crypto.randomUUID();
+  await db.prepare(`
+    INSERT INTO delivery_attempts (id, app_id, subscription_id, xmtp_topic_id, event_type, status, payload_json)
+    VALUES (?, ?, ?, ?, ?, 'queued', ?)
+  `).bind(
+    id,
+    input.appId,
+    input.subscriptionId,
+    input.xmtpTopicId ?? null,
+    input.eventType,
+    JSON.stringify(input.payload)
+  ).run();
+  return id;
+}
+
+export async function getPushJobContext(
+  db: D1Database,
+  job: PushQueueJob
+): Promise<{ app: AppRecord; subscription: SubscriptionRecord } | null> {
+  const [app, subscriptionRow] = await Promise.all([
+    getAppById(db, job.appId),
+    db.prepare('SELECT * FROM subscriptions WHERE id = ? AND app_id = ? AND disabled_at IS NULL')
+      .bind(job.subscriptionId, job.appId)
+      .first<SubscriptionRow>(),
+  ]);
+
+  if (!app || !subscriptionRow) return null;
+  return { app, subscription: mapSubscription(subscriptionRow) };
+}
+
+export async function updateDeliveryAttempt(
+  db: D1Database,
+  id: string,
+  update: { status: 'queued' | 'sent' | 'failed' | 'expired'; error?: string; pushStatus?: number }
+): Promise<void> {
+  await db.prepare(`
+    UPDATE delivery_attempts
+    SET status = ?,
+        attempts = attempts + 1,
+        last_error = ?,
+        push_status = ?,
+        updated_at = ?
+    WHERE id = ?
+  `).bind(update.status, update.error ?? null, update.pushStatus ?? null, nowIso(), id).run();
+}
