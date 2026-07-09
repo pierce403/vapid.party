@@ -7,7 +7,7 @@ A Web3-native Web Push notification relay. Connect your wallet, create apps, and
 - **Web3 Authentication**: Sign in with your wallet via thirdweb - no email or password required
 - **Per-App VAPID Keys**: Each app gets unique VAPID keypairs for complete isolation
 - **User & Channel Targeting**: Tag subscriptions with `userId` or `channelId` for targeted notifications
-- **Built-in Rate Limiting**: Per-app rate limits protect against abuse
+- **Built-in Limits**: Per-app subscription caps and per-minute send limits protect against abuse
 - **Structured Logging**: Winston-based logging for monitoring and debugging
 - **Vercel-Ready**: Deploy instantly to Vercel with Postgres
 
@@ -263,8 +263,10 @@ async function sendNotification(apiKey, userId, message) {
 
 ## Rate Limits
 
-Rate limiting is enforced per app to protect against abuse. Limits are returned
-in the `rateLimit` field on the Apps API responses.
+The backend enforces per-app subscription caps on subscribe requests and
+per-minute notification limits on send requests. Limits are returned in the
+`rateLimit` field on the Apps API responses. `maxNotificationsPerDay` is
+currently stored app configuration, not an enforced daily window.
 
 ## Project Structure
 

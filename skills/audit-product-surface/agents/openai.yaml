@@ -1,0 +1,4 @@
+interface:
+  display_name: "Audit Product Surface"
+  short_description: "Keep UI and docs honest about shipped behavior"
+  default_prompt: "Use $audit-product-surface to check UI, README, and API docs for claims backed by real backend behavior."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ship Change"
+  short_description: "Verify, commit, and push finished work"
+  default_prompt: "Use $ship-change to close out a vapid.party change with checks, commit, push, and a clean status."

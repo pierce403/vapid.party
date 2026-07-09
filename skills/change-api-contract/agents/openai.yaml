@@ -1,0 +1,4 @@
+interface:
+  display_name: "Change API Contract"
+  short_description: "Update API routes, schemas, docs, and clients"
+  default_prompt: "Use $change-api-contract to make a vapid.party API change and keep schemas, docs, and behavior aligned."

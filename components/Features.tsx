@@ -7,7 +7,7 @@ export default function Features() {
         </svg>
       ),
       title: 'Your Keys, Your Control',
-      description: 'Each app gets unique VAPID keys. No shared infrastructure means no single point of failure.',
+      description: 'Each app gets a unique VAPID keypair for isolated push credentials.',
     },
     {
       icon: (
@@ -16,7 +16,7 @@ export default function Features() {
         </svg>
       ),
       title: 'Instant Setup',
-      description: 'Connect wallet → Create app → Copy API key. Start sending notifications in under 60 seconds.',
+      description: 'Connect a wallet, create an app, copy the API key, and wire it into your push flow.',
     },
     {
       icon: (
@@ -33,8 +33,8 @@ export default function Features() {
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
         </svg>
       ),
-      title: 'Built-in Rate Limiting',
-      description: 'Protect your app and our infrastructure with per-app rate limits. Upgrade for higher limits.',
+      title: 'Built-in Limits',
+      description: 'Protect your app with persisted subscription caps and per-minute send limits.',
     },
     {
       icon: (
@@ -43,7 +43,7 @@ export default function Features() {
         </svg>
       ),
       title: 'Simple REST API',
-      description: 'Three endpoints: subscribe, send, done. Works with any language or framework.',
+      description: 'Endpoints for public keys, subscriptions, and sends. Works with any server stack.',
     },
     {
       icon: (
@@ -51,8 +51,8 @@ export default function Features() {
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
         </svg>
       ),
-      title: 'Global Edge Network',
-      description: 'Deployed on Vercel\'s edge network for low-latency notification delivery worldwide.',
+      title: 'Vercel-Ready Runtime',
+      description: 'Designed for Vercel with Postgres-backed API routes and server-side push delivery.',
     },
   ];
 
@@ -88,4 +88,3 @@ export default function Features() {
     </section>
   );
 }
-

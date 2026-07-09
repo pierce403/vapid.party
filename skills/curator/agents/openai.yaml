@@ -1,0 +1,4 @@
+interface:
+  display_name: "Curator"
+  short_description: "Maintain repo-local skills and memory"
+  default_prompt: "Use $curator to update the repo skill catalog and memory notes after a repeated workflow changes."
