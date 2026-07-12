@@ -36,12 +36,18 @@ These instructions apply to the entire repository.
 - Keep detailed procedures in `skills/<name>/SKILL.md`; use `curator` as the default skill for updating the skill library.
 
 ## Project overview
-- Next.js 14 app-router project for a Web3-authenticated Web Push notification relay.
-- Data lives in Postgres via `postgres`; migrations are in `scripts/migrate.ts` and `lib/db.ts`.
-- Auth is split between wallet bearer tokens for app management and `X-API-Key` for push subscription/send endpoints.
+- Cloudflare Worker Web Push relay; the Next.js app remains as legacy dashboard code.
+- Worker data lives in D1 with migrations under `migrations/d1`; legacy Next data uses Postgres.
+- Auth is split between wallet bearer tokens for app management, `X-API-Key`
+  for generic push, public Converge registration, and a secret bearer token for
+  official XMTP notification-server delivery.
 - VAPID keypairs are generated per app and stored with app records.
 
 ## Project shape
+- `src/worker/`: primary deployed Worker API, D1 store, Queue producer/consumer,
+  validation, and Web Push delivery.
+- `migrations/d1/`: ordered production D1 migrations.
+- `tests/worker/`: contract tests plus a Miniflare D1 integration test.
 - `app/api/`: API route handlers; keep `runtime = 'nodejs'` for routes that use Node-only libraries.
 - `lib/types.ts`: Zod schemas and TypeScript API types; update this before or with API behavior changes.
 - `lib/db.ts`: table creation, mapping, CRUD, subscription counting, and rate-limit log operations.
@@ -61,5 +67,18 @@ These instructions apply to the entire repository.
 - `maxNotificationsPerMinute` is enforced on send requests.
 - `maxNotificationsPerDay` exists in stored app config but is not currently enforced by a daily window.
 - `npm run build` fetches Google Fonts through `next/font` in `app/layout.tsx`; sandboxed builds may need network approval or self-hosted fonts.
-- `npm test` is wired to Jest; confirm real test files/config exist before treating it as a meaningful pass.
+- `npm test` runs Vitest, and the D1 test uses Miniflare/workerd. Sandboxes that
+  prohibit a localhost socket must run it with the required process permission.
+- Explicit Converge unsubscribe deletes inbox topic/HMAC material immediately;
+  it keeps a physical endpoint only while another active logical inbox shares it.
+- The official XMTP HTTP delivery adapter retries every non-200 response and
+  must receive a minimal `{type, inboxHandle}` Web Push payload.
+- Production has the D1 0002 schema and the current Worker contract deployed.
+  Public XMTP registration/delete and bearer-protected official delivery ingest
+  are live. The D1 -> Queue -> FCM -> Converge service-worker path has passed a
+  real-Chrome test, and the production XMTP path has passed with the official v3
+  notification server running temporarily against PostgreSQL.
+- No always-on XMTP listener or PostgreSQL is deployed. Do not describe push as
+  continuously available until that runtime is deployed and observed; the live
+  tests prove the relay data path, not persistent network monitoring.
 - For GitHub auth, prefer `gh`/HTTPS over SSH. If SSH signing fails, run `gh auth setup-git` and use an HTTPS origin.

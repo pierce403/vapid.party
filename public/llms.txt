@@ -1,7 +1,20 @@
-vapid.party — Cloudflare Web Push + XMTP-aware relay
+vapid.party - Cloudflare Web Push + XMTP-aware relay
 
 Base URL:
 - https://vapid.party
+
+Production status:
+- The current Worker and D1 migration 0002 are deployed.
+- Public XMTP VAPID, registration, and logical-delete routes are live.
+- Official-envelope ingest is live and requires a bearer token.
+- A real-Chrome D1 -> Queue -> FCM -> Converge service-worker test passed with
+  two logical inboxes sharing one endpoint, welcome/group delivery, suppression,
+  deletion, privacy, and cleanup checks.
+- A genuine XMTP v3 test passed through the production relay using the official
+  notification server and temporary PostgreSQL, including installation welcome,
+  inbound conversation delivery, three HMAC epochs, and own-message suppression.
+- No always-on XMTP listener/PostgreSQL is deployed, so automatic production
+  delivery is not continuously available.
 
 OpenAPI:
 - /openapi.yaml
@@ -17,65 +30,55 @@ Public Converge XMTP routes:
 - DELETE /api/xmtp/subscriptions
 
 Converge route auth:
-- No client secret.
-- No baked client API key.
+- No client secret and no baked client API key.
 - Do not send `X-API-Key`.
 
-Converge registration body:
-- Web Push subscription endpoint and keys.
-- `inboxId`.
-- `installationId`.
-- optional `address`.
-- XMTP topic/HMAC registrations from Converge SDK-exposed `conversations.hmacKeys()`.
-- `preferences.minimalPayloadOnly` must be `true`.
-- `preferences.plaintextPreview` must be `false`.
+Primary Converge registration body:
+- `version` is 1 and `app.id` is `converge.cv`.
+- `identity` contains `inboxId`, `installationId`, and optional `address`.
+- `subscription` is a standard browser Web Push subscription.
+- `xmtp.env` is `production`.
+- `xmtp.topics` contains canonical `/xmtp/mls/1/g-<hex>/proto` group topics
+  with one or more `{ epoch, key }` HMAC entries, plus the canonical
+  `/xmtp/mls/1/w-<hex>/proto` welcome topic with an empty HMAC array.
+- `notification.inboxHandle` is an opaque base64url-style local routing token,
+  never a display name or raw inbox id.
+- `preferences.minimalPayloadOnly` is true.
+- `preferences.plaintextPreview` is false.
+- `registeredAt` is an ISO timestamp.
+- The legacy flattened registration body remains accepted for old clients.
 
-Converge registration example:
-POST /api/xmtp/subscriptions
-Body:
-{
-  "endpoint": "https://push.example/subscription",
-  "keys": {
-    "p256dh": "base64url...",
-    "auth": "base64url..."
-  },
-  "inboxId": "xmtp-inbox-id",
-  "installationId": "xmtp-installation-id",
-  "hmacKeys": {
-    "/xmtp/topic": "base64url-hmac-key"
-  },
-  "preferences": {
-    "minimalPayloadOnly": true,
-    "plaintextPreview": false
-  }
-}
+DELETE body:
+- Current clients send `{ version, app, endpoint, identity, deletedAt }`.
+- The flattened `{ endpoint, inboxId, installationId }` body remains accepted.
+- Delete removes the identity's topics and HMAC keys.
+- A physical endpoint remains while another active logical inbox shares it; the
+  last logical delete removes endpoint, p256dh, and auth data.
 
-XMTP push payload:
+Internal official XMTP delivery:
+- POST /api/internal/xmtp/deliveries
+- Requires `Authorization: Bearer <INTERNAL_INGEST_TOKEN>`.
+- `X-Internal-Token` and `/api/internal/xmtp/envelopes` are compatibility aliases.
+- Accepts the official example-notification-server-go HTTP SendRequest JSON.
+- Matches `installation.id` plus `subscription.topic`.
+- Honors `message_context.should_push` and deduplicates `idempotency_key`.
+- Returns HTTP 200 because the official adapter retries any other status.
+- Discards the encrypted `message.message` bytes without storing or forwarding them.
+
+XMTP Web Push payload:
 - `type`: `xmtp.new_message`
-- `title`: `Converge`
-- `body`: `New encrypted message`
-- `url`: `/`
-- optional `conversationId` only if safe/non-content metadata
+- `inboxHandle`: opaque local routing token
+- No title, body, URL, conversation id, sender, preview, or message content.
+- Converge's service worker owns visible notification copy and navigation.
 
 Privacy rule:
-- vapid.party must never receive, store, forward, or preview plaintext XMTP message text, sender names, decrypted content, attachment URLs, or previews.
+- vapid.party never stores, forwards, or previews plaintext XMTP message text,
+  sender names, decrypted content, attachment URLs, or previews.
 - Converge opens and syncs/decrypts XMTP locally.
 
 Generic Web Push route auth:
-- App management endpoints use `Authorization: Bearer <token>` wallet auth.
-- Generic push endpoints use `X-API-Key: <vp_...>`.
-
-Generic workflow:
-1. Create an app:
-   - POST /api/register-app
-   - Response includes `apiKey` and `vapidPublicKey`.
-2. Get generic app VAPID public key:
-   - GET /api/vapid/public-key
-   - Requires `X-API-Key`.
-3. Create/update a generic subscription:
-   - POST /api/subscribe
-   - Requires `X-API-Key`.
-4. Queue notifications:
-   - POST /api/send
-   - Requires `X-API-Key`.
-   - Returns queued delivery attempt ids; Cloudflare Queue consumer performs actual Web Push send.
+- App management endpoints use wallet bearer auth.
+- Generic push endpoints use `X-API-Key`.
+- The reserved Converge app's generic routes fail closed unless the
+  `CONVERGE_API_KEY` Worker secret is configured.
+- The former source-visible Converge generic API key is rejected in production.

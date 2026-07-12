@@ -1,5 +1,5 @@
 import { ZodError } from 'zod';
-import { authenticateApiKey, ownsApp, verifyWalletAuth } from './auth';
+import { authenticateApiKey, hasInternalIngestAuth, ownsApp, verifyWalletAuth } from './auth';
 import {
   checkAndIncrementRateLimit,
   countSubscriptions,
@@ -23,7 +23,7 @@ import {
   SubscribeSchema,
   UpdateAppSchema,
 } from './schemas';
-import { relayXmtpEnvelope, registerXmtpSubscription, unregisterXmtpSubscription } from './core';
+import { relayXmtpDelivery, registerXmtpSubscription, unregisterXmtpSubscription } from './core';
 import type { AppRecord, Env, PushQueueJob, SubscriptionRecord } from './types';
 
 function publicApp(app: AppRecord) {
@@ -131,14 +131,18 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
       return jsonResponse(result);
     }
 
-    if (method === 'POST' && pathname === '/api/internal/xmtp/envelopes') {
-      if (!env.INTERNAL_INGEST_TOKEN || request.headers.get('x-internal-token') !== env.INTERNAL_INGEST_TOKEN) {
+    if (method === 'POST' && (
+      pathname === '/api/internal/xmtp/deliveries' ||
+      pathname === '/api/internal/xmtp/envelopes'
+    )) {
+      if (!hasInternalIngestAuth(request, env)) {
         return errorResponse('Missing or invalid internal ingest token', ERROR_CODES.UNAUTHORIZED, 401);
       }
 
       const body = await readJson(request);
-      const result = await relayXmtpEnvelope(new D1XmtpStore(env), body);
-      return jsonResponse(result, 202);
+      const result = await relayXmtpDelivery(new D1XmtpStore(env), body);
+      // The official XMTP HTTP delivery adapter retries every non-200 response.
+      return jsonResponse(result, 200);
     }
 
     if (method === 'POST' && pathname === '/api/register-app') {

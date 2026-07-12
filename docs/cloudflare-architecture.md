@@ -1,6 +1,7 @@
 # Cloudflare Architecture
 
-This document separates what is implemented in the repository from what still needs live Cloudflare provisioning and Converge end-to-end verification.
+This document separates the deployed and verified Cloudflare relay path from the
+still-missing always-on XMTP listener runtime.
 
 ## Implemented
 
@@ -17,17 +18,45 @@ This document separates what is implemented in the repository from what still ne
 - D1 migration for apps, subscriptions, XMTP identities, topic/HMAC registrations, delivery attempts, rate limits, usage logs, and relay cursors.
 - Queue-backed push jobs with retry/dead-letter configuration in `wrangler.jsonc`.
 - Durable Object `RelayCoordinator` for shard leases and cursor state.
-- Internal XMTP envelope ingestion route at `POST /api/internal/xmtp/envelopes`.
+- Internal official XMTP HTTP delivery route at `POST /api/internal/xmtp/deliveries`.
+- Production D1 migration 0002, Worker routes, and bearer-protected internal
+  ingest deployed at `https://vapid.party`.
+
+## Live Verification
+
+The production relay has passed two complementary end-to-end tests:
+
+- A synthetic delivery test used real Chrome, one physical FCM subscription,
+  and two logical Converge inboxes. Welcome and group events traveled through
+  D1, Cloudflare Queue, FCM, and Converge's service worker. The test also proved
+  idempotency, `should_push=false`, shared-endpoint logical deletion,
+  post-delete suppression, local-only notification profile copy, privacy, and
+  cleanup.
+- A genuine XMTP test ran the official v3 `example-notification-server-go`
+  locally with temporary PostgreSQL while using the production relay. It passed
+  installation-welcome delivery, inbound conversation delivery with three HMAC
+  epochs, and own-message suppression through the real browser service worker.
+
+The former source-visible Converge generic API key is rejected in production.
+These tests prove the deployed relay path; they do not provide continuous XMTP
+monitoring.
 
 ## Privacy Model
 
 `vapid.party` only wakes Converge clients. It must not receive or forward plaintext XMTP message content.
 
-Allowed XMTP relay inputs:
-- XMTP topic.
-- HMAC key metadata.
-- Optional cursor.
-- Optional conversation id only when treated as safe non-content metadata.
+Allowed registration metadata:
+- XMTP installation id and topic.
+- Multiple 30-day HMAC epochs for a conversation topic.
+- A welcome topic with no HMAC key.
+- An opaque inbox handle used only for local browser routing.
+
+The official XMTP notification server sends a `SendRequest` containing an
+idempotency key, installation, subscription topic, message context, and opaque
+encrypted envelope bytes. The Worker validates the official shape, matches only
+installation id plus topic, and discards the encrypted bytes before persistence
+or queueing. HMAC filtering and sender suppression happen in the official
+listener; no HMAC secret is submitted as delivery authentication.
 
 Rejected plaintext-like fields include:
 - message body or message text.
@@ -41,36 +70,49 @@ Push payloads sent for XMTP notifications are constrained to:
 ```json
 {
   "type": "xmtp.new_message",
-  "title": "Converge",
-  "body": "New encrypted message",
-  "url": "/"
+  "inboxHandle": "opaque_base64url_handle"
 }
 ```
 
-`conversationId` may be added only when it is safe non-content metadata.
+`inboxHandle` is an opaque browser routing token. The Converge service worker,
+not the relay, owns visible copy and click navigation. No conversation id,
+sender metadata, or message content crosses Web Push.
 
-## Worker-Only Vs Container Monitor
+## XMTP Listener
 
-The current repository proves the Worker API, D1 schema, queue payload path, and Durable Object coordination pieces. The long-running XMTP monitor is not yet proven Worker-only.
+The Worker API, D1 schema, and queue path do not replace an XMTP network
+listener. The selected production design uses XMTP's maintained reference
+notification server for that long-running role instead of attempting to keep a
+stream alive inside a request-driven Worker.
 
-Preferred path:
-- Run the XMTP SDK stream from a Worker if the SDK supports Workers reliably.
-- Use `RelayCoordinator` leases for shard ownership.
-- Save cursor progress after each processed envelope.
-- Reconnect and catch up from durable cursor state after restarts.
+Production listener path:
+- Deploy XMTP's `example-notification-server-go` listener in a long-running
+  service with its required Postgres database and XMTP network access.
+- Configure its HTTP delivery address as
+  `POST /api/internal/xmtp/deliveries` and its auth header as
+  `Authorization: Bearer <INTERNAL_INGEST_TOKEN>`.
+- The Worker also accepts `X-Internal-Token` and the old
+  `/api/internal/xmtp/envelopes` path during migration, but the request body is
+  always the official HTTP `SendRequest` shape.
+- Never log or persist `message.message`; it contains the encrypted envelope and
+  is not needed for Web Push wake-up delivery.
 
-Fallback path:
-- Run the XMTP SDK stream in a Cloudflare Container daemon.
-- Use `RelayCoordinator` for shard locks and cursor state.
-- POST sanitized topic/HMAC envelope events to `POST /api/internal/xmtp/envelopes` with `X-Internal-Token`.
-- Never post plaintext message content to the Worker.
+No always-on listener or durable listener PostgreSQL is deployed today. Until
+both are deployed and observed, production registration succeeds but XMTP
+messages are not monitored continuously for automatic push delivery.
 
 ## Operational Limits
 
-- Cloudflare D1 database, queues, dead-letter queue, and custom domain must be created in the production account before deployment.
-- `CONVERGE_APP_ID` defaults to `converge`; either create that D1 app row or provide `CONVERGE_VAPID_PUBLIC_KEY` and `CONVERGE_VAPID_PRIVATE_KEY` secrets so the Worker can bootstrap it.
-- `INTERNAL_INGEST_TOKEN` is required before using the internal XMTP envelope ingestion route.
-- A real Converge browser/service-worker subscription is required before claiming end-to-end delivery.
+- Cloudflare D1, queues, dead-letter queue, custom domain, migration 0002, and
+  Worker deployment are provisioned in the production account.
+- `CONVERGE_APP_ID` defaults to `converge`; either create that D1 app row or
+  provide `CONVERGE_VAPID_PUBLIC_KEY`, `CONVERGE_VAPID_PRIVATE_KEY`, and
+  `CONVERGE_API_KEY` secrets so the Worker can bootstrap it.
+- Generic routes for the reserved Converge app fail closed when
+  `CONVERGE_API_KEY` is absent, even if an old app row exists.
+- `INTERNAL_INGEST_TOKEN` is required before using internal XMTP delivery.
+- Real Converge browser/service-worker delivery is verified, but continuous
+  service still requires the always-on listener and PostgreSQL described above.
 
 ## Runbook
 
@@ -89,6 +131,7 @@ Fallback path:
    ```bash
    npx wrangler secret put CONVERGE_VAPID_PUBLIC_KEY
    npx wrangler secret put CONVERGE_VAPID_PRIVATE_KEY
+   npx wrangler secret put CONVERGE_API_KEY
    npx wrangler secret put INTERNAL_INGEST_TOKEN
    ```
 5. Apply D1 migrations:
@@ -109,4 +152,8 @@ Fallback path:
    ```bash
    curl https://vapid.party/api/xmtp/vapid-public-key
    ```
-9. Run a real Converge end-to-end push delivery test before marking deployment stable in `FEATURES.md`.
+9. Re-run both the real-Chrome relay test and the genuine XMTP v3 listener test
+   after changes to registration, delivery matching, queueing, or service-worker
+   payload behavior.
+10. Deploy the official listener with durable PostgreSQL and observe reconnect
+    and catch-up behavior before marking automatic push stable.

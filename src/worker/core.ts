@@ -1,32 +1,18 @@
-import { z } from 'zod';
 import {
   XmtpDeleteSubscriptionRequestSchema,
-  XmtpEnvelopeSchema,
+  XmtpDeliveryRequestSchema,
   XmtpSubscriptionRequestSchema,
 } from './schemas';
-import { timingSafeEqualString } from './encoding';
 import type { PushPayload, XmtpTopicMatch } from './types';
 
-const UNSAFE_XMTP_KEYS = new Set([
-  'body',
-  'message',
-  'messageText',
-  'plaintext',
-  'plaintextBody',
-  'preview',
-  'plaintextPreview',
-  'sender',
-  'senderName',
-  'displayName',
-  'attachment',
-  'attachmentUrl',
-  'attachments',
-  'decryptedContent',
-]);
+export interface NormalizedXmtpHmacKey {
+  epoch: string;
+  key: string;
+}
 
 export interface NormalizedXmtpTopic {
   topic: string;
-  hmacKey: string;
+  hmacKeys: NormalizedXmtpHmacKey[];
   algorithm: 'hmac-sha256' | 'sha256';
   conversationId?: string;
 }
@@ -39,6 +25,7 @@ export interface NormalizedXmtpRegistration {
   inboxId: string;
   installationId: string;
   address?: string;
+  inboxHandle?: string;
   preferences: {
     minimalPayloadOnly: true;
     plaintextPreview: false;
@@ -50,6 +37,7 @@ export interface XmtpRegistrationResult {
   subscriptionId: string;
   identityId: string;
   topicsRegistered: number;
+  hmacKeysRegistered: number;
   created: boolean;
 }
 
@@ -63,45 +51,102 @@ export interface XmtpRegistrationStore {
 }
 
 export interface XmtpRelayStore {
-  findTopicMatches(topic: string, hmacKey: string): Promise<XmtpTopicMatch[]>;
-  enqueueXmtpPush(match: XmtpTopicMatch, payload: PushPayload): Promise<void>;
+  findDeliveryMatches(installationId: string, topic: string): Promise<XmtpTopicMatch[]>;
+  enqueueXmtpPush(
+    match: XmtpTopicMatch,
+    payload: PushPayload,
+    idempotencyKey: string
+  ): Promise<boolean>;
+}
+
+function addTopic(
+  output: Map<string, NormalizedXmtpTopic>,
+  input: {
+    topic: string;
+    hmacKeys?: NormalizedXmtpHmacKey[];
+    algorithm?: 'hmac-sha256' | 'sha256';
+    conversationId?: string;
+  }
+): void {
+  const existing = output.get(input.topic);
+  const topic = existing ?? {
+    topic: input.topic,
+    hmacKeys: [],
+    algorithm: input.algorithm ?? 'hmac-sha256',
+    conversationId: input.conversationId,
+  };
+
+  for (const candidate of input.hmacKeys ?? []) {
+    if (!topic.hmacKeys.some((entry) => entry.epoch === candidate.epoch && entry.key === candidate.key)) {
+      topic.hmacKeys.push(candidate);
+    }
+  }
+
+  output.set(input.topic, topic);
 }
 
 export function normalizeXmtpRegistration(input: unknown): NormalizedXmtpRegistration {
   const parsed = XmtpSubscriptionRequestSchema.parse(input);
+  const topics = new Map<string, NormalizedXmtpTopic>();
+
+  if ('version' in parsed) {
+    for (const topic of parsed.xmtp.topics) {
+      addTopic(topics, { topic: topic.topic, hmacKeys: topic.hmacKeys });
+    }
+
+    return {
+      endpoint: parsed.subscription.endpoint,
+      p256dh: parsed.subscription.keys.p256dh,
+      auth: parsed.subscription.keys.auth,
+      expirationTime: parsed.subscription.expirationTime,
+      inboxId: parsed.identity.inboxId,
+      installationId: parsed.identity.installationId,
+      address: parsed.identity.address,
+      inboxHandle: parsed.notification.inboxHandle,
+      preferences: parsed.preferences,
+      topics: [...topics.values()],
+    };
+  }
+
   const subscription = parsed.subscription ?? {
     endpoint: parsed.endpoint as string,
     keys: parsed.keys as { p256dh: string; auth: string },
     expirationTime: parsed.expirationTime,
   };
 
-  const topics: NormalizedXmtpTopic[] = [];
-
   if (parsed.topics) {
-    topics.push(...parsed.topics.map((topic) => ({
-      topic: topic.topic,
-      hmacKey: topic.hmacKey,
-      algorithm: topic.algorithm,
-      conversationId: topic.conversationId,
-    })));
+    for (const topic of parsed.topics) {
+      const hmacKeys = [...(topic.hmacKeys ?? [])];
+      if (topic.hmacKey) hmacKeys.push({ epoch: 'legacy', key: topic.hmacKey });
+      addTopic(topics, {
+        topic: topic.topic,
+        hmacKeys,
+        algorithm: topic.algorithm,
+        conversationId: topic.conversationId,
+      });
+    }
   }
 
   if (Array.isArray(parsed.hmacKeys)) {
-    topics.push(...parsed.hmacKeys.map((topic) => ({
-      topic: topic.topic,
-      hmacKey: topic.hmacKey,
-      algorithm: topic.algorithm,
-      conversationId: topic.conversationId,
-    })));
+    for (const topic of parsed.hmacKeys) {
+      const hmacKeys = [...(topic.hmacKeys ?? [])];
+      if (topic.hmacKey) hmacKeys.push({ epoch: 'legacy', key: topic.hmacKey });
+      addTopic(topics, {
+        topic: topic.topic,
+        hmacKeys,
+        algorithm: topic.algorithm,
+        conversationId: topic.conversationId,
+      });
+    }
   } else if (parsed.hmacKeys) {
     for (const [topic, value] of Object.entries(parsed.hmacKeys)) {
       if (typeof value === 'string') {
-        topics.push({ topic, hmacKey: value, algorithm: 'hmac-sha256' });
+        addTopic(topics, { topic, hmacKeys: [{ epoch: 'legacy', key: value }] });
       } else {
-        topics.push({
+        addTopic(topics, {
           topic,
-          hmacKey: value.hmacKey,
-          algorithm: value.algorithm ?? 'hmac-sha256',
+          hmacKeys: [{ epoch: 'legacy', key: value.hmacKey }],
+          algorithm: value.algorithm,
           conversationId: value.conversationId,
         });
       }
@@ -116,13 +161,22 @@ export function normalizeXmtpRegistration(input: unknown): NormalizedXmtpRegistr
     inboxId: parsed.inboxId,
     installationId: parsed.installationId,
     address: parsed.address,
+    inboxHandle: parsed.inboxHandle,
     preferences: parsed.preferences,
-    topics,
+    topics: [...topics.values()],
   };
 }
 
 export function normalizeXmtpDelete(input: unknown): { endpoint: string; inboxId: string; installationId: string } {
-  return XmtpDeleteSubscriptionRequestSchema.parse(input);
+  const parsed = XmtpDeleteSubscriptionRequestSchema.parse(input);
+  if ('version' in parsed) {
+    return {
+      endpoint: parsed.endpoint,
+      inboxId: parsed.identity.inboxId,
+      installationId: parsed.identity.installationId,
+    };
+  }
+  return parsed;
 }
 
 export async function registerXmtpSubscription(
@@ -139,68 +193,44 @@ export async function unregisterXmtpSubscription(
   return store.disableRegistration(normalizeXmtpDelete(input));
 }
 
-export function buildXmtpPushPayload(input?: { conversationId?: string }): PushPayload {
-  const payload: PushPayload = {
-    type: 'xmtp.new_message',
-    title: 'Converge',
-    body: 'New encrypted message',
-    url: '/',
-  };
-
-  if (input?.conversationId) {
-    payload.conversationId = input.conversationId;
-  }
+export function buildXmtpPushPayload(input?: { inboxHandle?: string }): PushPayload {
+  const payload: PushPayload = { type: 'xmtp.new_message' };
+  if (input?.inboxHandle) payload.inboxHandle = input.inboxHandle;
 
   return payload;
 }
 
-export function containsUnsafeXmtpKey(input: unknown): boolean {
-  if (!input || typeof input !== 'object') return false;
-  if (Array.isArray(input)) return input.some(containsUnsafeXmtpKey);
-
-  return Object.entries(input as Record<string, unknown>).some(([key, value]) => (
-    UNSAFE_XMTP_KEYS.has(key) || containsUnsafeXmtpKey(value)
-  ));
+export function parseXmtpDelivery(input: unknown) {
+  return XmtpDeliveryRequestSchema.parse(input);
 }
 
-export function parseXmtpEnvelope(input: unknown): z.infer<typeof XmtpEnvelopeSchema> {
-  if (containsUnsafeXmtpKey(input)) {
-    throw new z.ZodError([{
-      code: z.ZodIssueCode.custom,
-      path: [],
-      message: 'XMTP envelope ingestion must not include plaintext-like content fields',
-    }]);
-  }
-
-  return XmtpEnvelopeSchema.parse(input);
-}
-
-export function matchesTopicHmac(
-  envelope: { topic: string; hmacKey: string },
-  topic: { topic: string; hmacKey: string }
-): boolean {
-  return envelope.topic === topic.topic && timingSafeEqualString(envelope.hmacKey, topic.hmacKey);
-}
-
-export async function relayXmtpEnvelope(
+export async function relayXmtpDelivery(
   store: XmtpRelayStore,
   input: unknown
-): Promise<{ matched: number; queued: number }> {
-  const envelope = parseXmtpEnvelope(input);
-  const matches = await store.findTopicMatches(envelope.topic, envelope.hmacKey);
-
-  let queued = 0;
-  for (const match of matches) {
-    if (!matchesTopicHmac(envelope, { topic: envelope.topic, hmacKey: envelope.hmacKey })) {
-      continue;
-    }
-
-    await store.enqueueXmtpPush(
-      match,
-      buildXmtpPushPayload({ conversationId: envelope.conversationId ?? match.conversationId })
-    );
-    queued += 1;
+): Promise<{ matched: number; queued: number; deduplicated: number; skipped?: 'should_push_false' }> {
+  const delivery = parseXmtpDelivery(input);
+  if (delivery.message_context.should_push === false) {
+    return { matched: 0, queued: 0, deduplicated: 0, skipped: 'should_push_false' };
   }
 
-  return { matched: matches.length, queued };
+  const matches = await store.findDeliveryMatches(
+    delivery.installation.id,
+    delivery.subscription.topic
+  );
+
+  let queued = 0;
+  let deduplicated = 0;
+  for (const match of matches) {
+    const didQueue = await store.enqueueXmtpPush(
+      match,
+      buildXmtpPushPayload({
+        inboxHandle: match.inboxHandle,
+      }),
+      delivery.idempotency_key
+    );
+    if (didQueue) queued += 1;
+    else deduplicated += 1;
+  }
+
+  return { matched: matches.length, queued, deduplicated };
 }

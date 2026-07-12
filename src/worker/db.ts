@@ -52,10 +52,12 @@ interface TopicMatchRow {
   topic_id: string;
   subscription_id: string;
   app_id: string;
+  installation_id: string;
   endpoint: string;
   p256dh: string;
   auth: string;
   conversation_id: string | null;
+  inbox_handle: string | null;
 }
 
 function parseJsonObject(input: string | null, fallback: Record<string, unknown>): Record<string, unknown> {
@@ -338,9 +340,17 @@ export async function checkAndIncrementRateLimit(
 export async function ensureConvergeApp(env: Env): Promise<AppRecord | null> {
   const appId = env.CONVERGE_APP_ID || 'converge';
   const current = await getAppById(env.DB, appId);
-  if (current) return current;
+  if (current) {
+    if (env.CONVERGE_API_KEY && current.apiKey !== env.CONVERGE_API_KEY) {
+      await env.DB.prepare('UPDATE apps SET api_key = ?, updated_at = ? WHERE id = ?')
+        .bind(env.CONVERGE_API_KEY, nowIso(), appId)
+        .run();
+      return getAppById(env.DB, appId);
+    }
+    return current;
+  }
 
-  if (!env.CONVERGE_VAPID_PUBLIC_KEY || !env.CONVERGE_VAPID_PRIVATE_KEY) {
+  if (!env.CONVERGE_VAPID_PUBLIC_KEY || !env.CONVERGE_VAPID_PRIVATE_KEY || !env.CONVERGE_API_KEY) {
     return null;
   }
 
@@ -353,7 +363,7 @@ export async function ensureConvergeApp(env: Env): Promise<AppRecord | null> {
     appId,
     'Converge',
     'converge',
-    'vp_internal_converge',
+    env.CONVERGE_API_KEY,
     env.CONVERGE_VAPID_PUBLIC_KEY,
     env.CONVERGE_VAPID_PRIVATE_KEY,
     json({ source: 'env' }),
@@ -411,18 +421,26 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       subscriptionId: subscription.id,
       identityId,
       topicsRegistered: input.topics.length,
+      hmacKeysRegistered: input.topics.reduce((count, topic) => count + topic.hmacKeys.length, 0),
       created: !existing,
     };
   }
 
   async disableRegistration(input: { endpoint: string; inboxId: string; installationId: string }): Promise<XmtpUnsubscribeResult> {
     const row = await this.env.DB.prepare(`
-      SELECT xs.id AS xmtp_subscription_id, s.id AS subscription_id
+      SELECT
+        xs.id AS xmtp_subscription_id,
+        xs.identity_id AS identity_id,
+        s.id AS subscription_id
       FROM xmtp_subscriptions xs
       JOIN xmtp_identities xi ON xi.id = xs.identity_id
       JOIN subscriptions s ON s.id = xs.subscription_id
       WHERE s.endpoint = ? AND xi.inbox_id = ? AND xi.installation_id = ? AND xs.active = 1
-    `).bind(input.endpoint, input.inboxId, input.installationId).first<{ xmtp_subscription_id: string; subscription_id: string }>();
+    `).bind(input.endpoint, input.inboxId, input.installationId).first<{
+      xmtp_subscription_id: string;
+      identity_id: string;
+      subscription_id: string;
+    }>();
 
     if (!row) return { disabled: false };
 
@@ -430,54 +448,109 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       UPDATE xmtp_subscriptions SET active = 0, updated_at = ? WHERE id = ?
     `).bind(nowIso(), row.xmtp_subscription_id).run();
 
-    await disableSubscription(this.env.DB, row.subscription_id);
+    const activeIdentityRegistrations = await this.env.DB.prepare(`
+      SELECT COUNT(*) AS count
+      FROM xmtp_subscriptions
+      WHERE identity_id = ? AND active = 1
+    `).bind(row.identity_id).first<{ count: number }>();
+
+    if ((activeIdentityRegistrations?.count ?? 0) === 0) {
+      // Explicit unsubscribe must not retain an inbox's topic/HMAC secrets.
+      // Cascades remove its logical registrations, topics, and epoch keys.
+      await this.env.DB.prepare('DELETE FROM xmtp_identities WHERE id = ?')
+        .bind(row.identity_id)
+        .run();
+    }
+
+    const activeEndpointRegistrations = await this.env.DB.prepare(`
+      SELECT COUNT(*) AS count
+      FROM xmtp_subscriptions
+      WHERE subscription_id = ? AND active = 1
+    `).bind(row.subscription_id).first<{ count: number }>();
+
+    if ((activeEndpointRegistrations?.count ?? 0) === 0) {
+      // Remove endpoint keys as soon as the last logical inbox stops using them.
+      await this.env.DB.prepare('DELETE FROM subscriptions WHERE id = ?')
+        .bind(row.subscription_id)
+        .run();
+    }
+
     return { disabled: true };
   }
 
-  async findTopicMatches(topic: string, hmacKey: string): Promise<XmtpTopicMatch[]> {
+  async findDeliveryMatches(installationId: string, topic: string): Promise<XmtpTopicMatch[]> {
     const result = await this.env.DB.prepare(`
       SELECT
         xt.id AS topic_id,
         s.id AS subscription_id,
         s.app_id AS app_id,
+        xi.installation_id AS installation_id,
         s.endpoint AS endpoint,
         s.p256dh AS p256dh,
         s.auth AS auth,
-        xt.conversation_id AS conversation_id
+        xt.conversation_id AS conversation_id,
+        xi.inbox_handle AS inbox_handle
       FROM xmtp_topics xt
       JOIN xmtp_identities xi ON xi.id = xt.identity_id
       JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
       JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
-      WHERE xt.topic = ? AND xt.hmac_key = ?
-    `).bind(topic, hmacKey).all<TopicMatchRow>();
+      WHERE xi.installation_id = ? AND xt.topic = ?
+    `).bind(installationId, topic).all<TopicMatchRow>();
 
     return result.results.map((row) => ({
       topicId: row.topic_id,
       subscriptionId: row.subscription_id,
       appId: row.app_id,
+      installationId: row.installation_id,
       endpoint: row.endpoint,
       p256dh: row.p256dh,
       auth: row.auth,
       conversationId: row.conversation_id ?? undefined,
+      inboxHandle: row.inbox_handle ?? undefined,
     }));
   }
 
-  async enqueueXmtpPush(match: XmtpTopicMatch, payload: PushPayload = buildXmtpPushPayload(match)): Promise<void> {
-    const deliveryAttemptId = await insertDeliveryAttempt(this.env.DB, {
-      appId: match.appId,
-      subscriptionId: match.subscriptionId,
-      xmtpTopicId: match.topicId,
-      eventType: 'xmtp.new_message',
-      payload,
-    });
+  async enqueueXmtpPush(
+    match: XmtpTopicMatch,
+    payload: PushPayload = buildXmtpPushPayload(match),
+    idempotencyKey: string
+  ): Promise<boolean> {
+    const eventId = crypto.randomUUID();
+    const claimed = await this.env.DB.prepare(`
+      INSERT OR IGNORE INTO xmtp_delivery_events (
+        id, installation_id, topic, idempotency_key, subscription_id
+      ) VALUES (?, ?, (SELECT topic FROM xmtp_topics WHERE id = ?), ?, ?)
+    `).bind(
+      eventId,
+      match.installationId,
+      match.topicId,
+      idempotencyKey,
+      match.subscriptionId
+    ).run();
 
-    await this.env.PUSH_QUEUE.send({
-      deliveryAttemptId,
-      appId: match.appId,
-      subscriptionId: match.subscriptionId,
-      payload,
-      source: 'xmtp',
-    });
+    if (claimed.meta.changes === 0) return false;
+
+    try {
+      const deliveryAttemptId = await insertDeliveryAttempt(this.env.DB, {
+        appId: match.appId,
+        subscriptionId: match.subscriptionId,
+        xmtpTopicId: match.topicId,
+        eventType: 'xmtp.new_message',
+        payload,
+      });
+
+      await this.env.PUSH_QUEUE.send({
+        deliveryAttemptId,
+        appId: match.appId,
+        subscriptionId: match.subscriptionId,
+        payload,
+        source: 'xmtp',
+      });
+      return true;
+    } catch (error) {
+      await this.env.DB.prepare('DELETE FROM xmtp_delivery_events WHERE id = ?').bind(eventId).run();
+      throw error;
+    }
   }
 
   private async upsertIdentity(input: NormalizedXmtpRegistration): Promise<string> {
@@ -487,16 +560,18 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
 
     const id = existing?.id ?? crypto.randomUUID();
     await this.env.DB.prepare(`
-      INSERT INTO xmtp_identities (id, inbox_id, installation_id, address, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO xmtp_identities (id, inbox_id, installation_id, address, inbox_handle, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(inbox_id, installation_id) DO UPDATE SET
         address = excluded.address,
+        inbox_handle = COALESCE(excluded.inbox_handle, xmtp_identities.inbox_handle),
         updated_at = excluded.updated_at
     `).bind(
       id,
       input.inboxId,
       input.installationId,
       input.address ?? null,
+      input.inboxHandle ?? null,
       nowIso(),
       nowIso()
     ).run();
@@ -508,19 +583,33 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     await this.env.DB.prepare('DELETE FROM xmtp_topics WHERE identity_id = ?').bind(identityId).run();
 
     for (const topic of topics) {
+      const topicId = crypto.randomUUID();
       await this.env.DB.prepare(`
-        INSERT INTO xmtp_topics (id, identity_id, topic, hmac_key, algorithm, conversation_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO xmtp_topics (id, identity_id, topic, algorithm, conversation_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `).bind(
-        crypto.randomUUID(),
+        topicId,
         identityId,
         topic.topic,
-        topic.hmacKey,
         topic.algorithm,
         topic.conversationId ?? null,
         nowIso(),
         nowIso()
       ).run();
+
+      for (const hmacKey of topic.hmacKeys) {
+        await this.env.DB.prepare(`
+          INSERT INTO xmtp_topic_hmac_keys (id, topic_id, epoch, hmac_key, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).bind(
+          crypto.randomUUID(),
+          topicId,
+          hmacKey.epoch,
+          hmacKey.key,
+          nowIso(),
+          nowIso()
+        ).run();
+      }
     }
   }
 }

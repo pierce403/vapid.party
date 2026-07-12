@@ -36,10 +36,12 @@ export interface XmtpTopicMatch {
   topicId: string;
   subscriptionId: string;
   appId: string;
+  installationId: string;
   endpoint: string;
   p256dh: string;
   auth: string;
   conversationId?: string;
+  inboxHandle?: string;
 }
 
 export type PushPayload = Record<string, unknown>;
@@ -61,6 +63,7 @@ export interface Env {
   CONVERGE_APP_ID?: string;
   CONVERGE_VAPID_PUBLIC_KEY?: string;
   CONVERGE_VAPID_PRIVATE_KEY?: string;
+  CONVERGE_API_KEY?: string;
   INTERNAL_INGEST_TOKEN?: string;
 }
 
