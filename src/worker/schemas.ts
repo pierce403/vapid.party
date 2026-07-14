@@ -181,7 +181,7 @@ const XmtpHex32Schema = z.string()
 const CanonicalXmtpTopicSchema = z.string()
   .max(512)
   .regex(
-    /^\/xmtp\/mls\/1\/[gw]-[0-9a-f]{64}\/proto$/,
+    /^\/xmtp\/mls\/1\/(?:g-[0-9a-f]{32}|w-[0-9a-f]{64})\/proto$/,
     'topic must be a canonical lowercase XMTP group or welcome topic'
   );
 
@@ -231,6 +231,9 @@ const XmtpNestedSubscriptionRequestSchema = z.object({
   registeredAt: z.string().datetime({ offset: true }),
 }).strict();
 
+export const GenericXmtpSubscriptionRequestSchema = XmtpNestedSubscriptionRequestSchema
+  .omit({ app: true });
+
 export const XmtpSubscriptionRequestSchema = z.union([
   XmtpNestedSubscriptionRequestSchema,
   XmtpLegacySubscriptionRequestSchema,
@@ -257,12 +260,15 @@ const XmtpNestedDeleteSubscriptionRequestSchema = z.object({
   deletedAt: z.string().datetime({ offset: true }),
 }).strict();
 
+export const GenericXmtpDeleteSubscriptionRequestSchema = XmtpNestedDeleteSubscriptionRequestSchema
+  .omit({ app: true });
+
 export const XmtpDeleteSubscriptionRequestSchema = z.union([
   XmtpNestedDeleteSubscriptionRequestSchema,
   XmtpFlatDeleteSubscriptionRequestSchema,
 ]);
 
-export const XmtpDeliveryRequestSchema = z.object({
+const OfficialXmtpDeliveryRequestSchema = z.object({
   idempotency_key: z.string().min(1).max(512),
   message: z.object({
     content_topic: z.string().min(1).max(512),
@@ -278,7 +284,7 @@ export const XmtpDeliveryRequestSchema = z.object({
     id: z.string().min(1).max(255),
     delivery_mechanism: z.object({
       kind: z.string().min(1).max(64),
-      token: z.string().max(4096),
+      token: z.string().min(1).max(4096),
     }).strict(),
     payload_format: z.enum(['unspecified', 'v3', 'v4']),
   }).strict(),
@@ -299,6 +305,43 @@ export const XmtpDeliveryRequestSchema = z.object({
   }
 });
 
+const MinimalXmtpDeliveryRequestSchema = z.object({
+  version: z.literal(1),
+  idempotencyKey: z.string().min(1).max(512),
+  installationId: z.string().min(1).max(255),
+  deliveryToken: z.string().min(1).max(255),
+  topic: z.string().min(1).max(512),
+  messageType: z.string().min(1).max(64),
+  shouldPush: z.boolean().optional(),
+  isSilent: z.boolean(),
+}).strict();
+
+export const XmtpDeliveryRequestSchema = z.union([
+  MinimalXmtpDeliveryRequestSchema,
+  OfficialXmtpDeliveryRequestSchema,
+]);
+
+const ListenerCursorSchema = z.union([
+  z.string().regex(/^\d+$/, 'cursor must be a non-negative integer string'),
+  z.number().int().nonnegative().safe(),
+]).transform((value) => String(value));
+
+export const XmtpListenerStatusSchema = z.object({
+  version: z.literal(1),
+  instanceId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/),
+  ready: z.boolean(),
+  cursor: ListenerCursorSchema,
+  observedAt: z.string().datetime({ offset: true }),
+  errorCode: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/).optional(),
+  streamConnectedAt: z.string().datetime({ offset: true }).optional(),
+  lastEnvelopeAt: z.string().datetime({ offset: true }).optional(),
+  lastControlSyncAt: z.string().datetime({ offset: true }).optional(),
+  deliveryReady: z.boolean().optional(),
+  lastDeliveryProbeAt: z.string().datetime({ offset: true }).optional(),
+  registrationCount: z.number().int().nonnegative().safe().optional(),
+  topicCount: z.number().int().nonnegative().safe().optional(),
+}).strict();
+
 export type RegisterAppInput = z.infer<typeof RegisterAppSchema>;
 export type UpdateAppInput = z.infer<typeof UpdateAppSchema>;
 export type SubscribeInput = z.infer<typeof SubscribeSchema>;
@@ -306,3 +349,6 @@ export type SendNotificationInput = z.infer<typeof SendNotificationSchema>;
 export type XmtpSubscriptionRequestInput = z.infer<typeof XmtpSubscriptionRequestSchema>;
 export type XmtpDeleteSubscriptionRequestInput = z.infer<typeof XmtpDeleteSubscriptionRequestSchema>;
 export type XmtpDeliveryRequestInput = z.infer<typeof XmtpDeliveryRequestSchema>;
+export type GenericXmtpSubscriptionRequestInput = z.infer<typeof GenericXmtpSubscriptionRequestSchema>;
+export type GenericXmtpDeleteSubscriptionRequestInput = z.infer<typeof GenericXmtpDeleteSubscriptionRequestSchema>;
+export type XmtpListenerStatusInput = z.infer<typeof XmtpListenerStatusSchema>;

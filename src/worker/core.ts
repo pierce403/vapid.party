@@ -1,4 +1,6 @@
 import {
+  GenericXmtpDeleteSubscriptionRequestSchema,
+  GenericXmtpSubscriptionRequestSchema,
   XmtpDeleteSubscriptionRequestSchema,
   XmtpDeliveryRequestSchema,
   XmtpSubscriptionRequestSchema,
@@ -51,7 +53,7 @@ export interface XmtpRegistrationStore {
 }
 
 export interface XmtpRelayStore {
-  findDeliveryMatches(installationId: string, topic: string): Promise<XmtpTopicMatch[]>;
+  findDeliveryMatches(installationId: string, topic: string, deliveryToken: string): Promise<XmtpTopicMatch[]>;
   enqueueXmtpPush(
     match: XmtpTopicMatch,
     payload: PushPayload,
@@ -167,6 +169,27 @@ export function normalizeXmtpRegistration(input: unknown): NormalizedXmtpRegistr
   };
 }
 
+export function normalizeGenericXmtpRegistration(input: unknown): NormalizedXmtpRegistration {
+  const parsed = GenericXmtpSubscriptionRequestSchema.parse(input);
+  const topics = new Map<string, NormalizedXmtpTopic>();
+  for (const topic of parsed.xmtp.topics) {
+    addTopic(topics, { topic: topic.topic, hmacKeys: topic.hmacKeys });
+  }
+
+  return {
+    endpoint: parsed.subscription.endpoint,
+    p256dh: parsed.subscription.keys.p256dh,
+    auth: parsed.subscription.keys.auth,
+    expirationTime: parsed.subscription.expirationTime,
+    inboxId: parsed.identity.inboxId,
+    installationId: parsed.identity.installationId,
+    address: parsed.identity.address,
+    inboxHandle: parsed.notification.inboxHandle,
+    preferences: parsed.preferences,
+    topics: [...topics.values()],
+  };
+}
+
 export function normalizeXmtpDelete(input: unknown): { endpoint: string; inboxId: string; installationId: string } {
   const parsed = XmtpDeleteSubscriptionRequestSchema.parse(input);
   if ('version' in parsed) {
@@ -177,6 +200,15 @@ export function normalizeXmtpDelete(input: unknown): { endpoint: string; inboxId
     };
   }
   return parsed;
+}
+
+export function normalizeGenericXmtpDelete(input: unknown): { endpoint: string; inboxId: string; installationId: string } {
+  const parsed = GenericXmtpDeleteSubscriptionRequestSchema.parse(input);
+  return {
+    endpoint: parsed.endpoint,
+    inboxId: parsed.identity.inboxId,
+    installationId: parsed.identity.installationId,
+  };
 }
 
 export async function registerXmtpSubscription(
@@ -191,6 +223,20 @@ export async function unregisterXmtpSubscription(
   input: unknown
 ): Promise<XmtpUnsubscribeResult> {
   return store.disableRegistration(normalizeXmtpDelete(input));
+}
+
+export async function registerGenericXmtpSubscription(
+  store: XmtpRegistrationStore,
+  input: unknown
+): Promise<XmtpRegistrationResult> {
+  return store.upsertRegistration(normalizeGenericXmtpRegistration(input));
+}
+
+export async function unregisterGenericXmtpSubscription(
+  store: XmtpRegistrationStore,
+  input: unknown
+): Promise<XmtpUnsubscribeResult> {
+  return store.disableRegistration(normalizeGenericXmtpDelete(input));
 }
 
 export function buildXmtpPushPayload(input?: { inboxHandle?: string }): PushPayload {
@@ -209,13 +255,30 @@ export async function relayXmtpDelivery(
   input: unknown
 ): Promise<{ matched: number; queued: number; deduplicated: number; skipped?: 'should_push_false' }> {
   const delivery = parseXmtpDelivery(input);
-  if (delivery.message_context.should_push === false) {
+  const normalized = 'version' in delivery
+    ? {
+        idempotencyKey: delivery.idempotencyKey,
+        installationId: delivery.installationId,
+        deliveryToken: delivery.deliveryToken,
+        topic: delivery.topic,
+        shouldPush: delivery.shouldPush,
+      }
+    : {
+        idempotencyKey: delivery.idempotency_key,
+        installationId: delivery.installation.id,
+        deliveryToken: delivery.installation.delivery_mechanism.token,
+        topic: delivery.subscription.topic,
+        shouldPush: delivery.message_context.should_push,
+      };
+
+  if (normalized.shouldPush === false) {
     return { matched: 0, queued: 0, deduplicated: 0, skipped: 'should_push_false' };
   }
 
   const matches = await store.findDeliveryMatches(
-    delivery.installation.id,
-    delivery.subscription.topic
+    normalized.installationId,
+    normalized.topic,
+    normalized.deliveryToken
   );
 
   let queued = 0;
@@ -226,7 +289,7 @@ export async function relayXmtpDelivery(
       buildXmtpPushPayload({
         inboxHandle: match.inboxHandle,
       }),
-      delivery.idempotency_key
+      normalized.idempotencyKey
     );
     if (didQueue) queued += 1;
     else deduplicated += 1;

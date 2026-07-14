@@ -1,3 +1,5 @@
+import type { XmtpListenerContainer } from './xmtp-listener-container';
+
 export interface RateLimitConfig {
   maxNotificationsPerMinute: number;
   maxNotificationsPerDay: number;
@@ -58,6 +60,7 @@ export interface Env {
   DB: D1Database;
   PUSH_QUEUE: Queue<PushQueueJob>;
   RELAY_COORDINATOR: DurableObjectNamespace;
+  XMTP_LISTENER?: DurableObjectNamespace<XmtpListenerContainer>;
   ASSETS?: Fetcher;
   VAPID_SUBJECT?: string;
   CONVERGE_APP_ID?: string;
@@ -65,6 +68,26 @@ export interface Env {
   CONVERGE_VAPID_PRIVATE_KEY?: string;
   CONVERGE_API_KEY?: string;
   INTERNAL_INGEST_TOKEN?: string;
+  XMTP_LISTENER_SYNC_TOKEN?: string;
+  VAPID_PARTY_PUBLIC_URL?: string;
+}
+
+export interface XmtpListenerHmacKey {
+  thirtyDayPeriodsSinceEpoch: number;
+  key: string;
+}
+
+export interface XmtpListenerTopic {
+  topic: string;
+  isSilent: boolean;
+  hmacKeys: XmtpListenerHmacKey[];
+}
+
+export interface XmtpListenerRegistration {
+  appId: string;
+  installationId: string;
+  deliveryToken: string;
+  topics: XmtpListenerTopic[];
 }
 
 export interface ApiResponse<T = unknown> {

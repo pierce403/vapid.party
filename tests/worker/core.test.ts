@@ -21,7 +21,7 @@ const inboxId = '11'.repeat(32);
 const secondInboxId = '22'.repeat(32);
 const installationId = '33'.repeat(32);
 const secondInstallationId = '44'.repeat(32);
-const groupTopic = `/xmtp/mls/1/g-${'ab'.repeat(32)}/proto`;
+const groupTopic = `/xmtp/mls/1/g-${'ab'.repeat(16)}/proto`;
 const welcomeTopic = `/xmtp/mls/1/w-${installationId}/proto`;
 
 function nestedRegistration() {
@@ -232,6 +232,17 @@ describe('Converge XMTP registration', () => {
       xmtp: {
         ...base.xmtp,
         topics: [{ topic: '/xmtp/mls/1/g-abcd/proto', hmacKeys: [{ epoch: '7', key: hmacKey }] }],
+      },
+    })).toThrow(/canonical lowercase XMTP/);
+
+    expect(() => normalizeXmtpRegistration({
+      ...base,
+      xmtp: {
+        ...base.xmtp,
+        topics: [{
+          topic: `/xmtp/mls/1/g-${'ab'.repeat(32)}/proto`,
+          hmacKeys: [{ epoch: '7', key: hmacKey }],
+        }],
       },
     })).toThrow(/canonical lowercase XMTP/);
   });

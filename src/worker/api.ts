@@ -1,43 +1,41 @@
 import { ZodError } from 'zod';
-import { authenticateApiKey, hasInternalIngestAuth, ownsApp, verifyWalletAuth } from './auth';
+import {
+  authenticateApiKey,
+  hasInternalIngestAuth,
+  hasXmtpListenerSyncAuth,
+} from './auth';
 import {
   checkAndIncrementRateLimit,
   countSubscriptions,
-  createApp,
   D1XmtpStore,
-  deleteApp,
   ensureConvergeApp,
-  getAppById,
-  getAppsByOwner,
   getSubscriptionsByApp,
   getSubscriptionsByIds,
   insertDeliveryAttempt,
-  regenerateApiKey,
-  updateApp,
   upsertSubscription,
+  XmtpAppIsolationPendingError,
 } from './db';
 import { ERROR_CODES, errorResponse, jsonResponse, readJson, zodErrorResponse } from './http';
 import {
-  RegisterAppSchema,
   SendNotificationSchema,
   SubscribeSchema,
-  UpdateAppSchema,
+  XmtpListenerStatusSchema,
 } from './schemas';
-import { relayXmtpDelivery, registerXmtpSubscription, unregisterXmtpSubscription } from './core';
+import {
+  registerGenericXmtpSubscription,
+  relayXmtpDelivery,
+  registerXmtpSubscription,
+  unregisterGenericXmtpSubscription,
+  unregisterXmtpSubscription,
+} from './core';
+import {
+  getXmtpListenerDeltas,
+  getXmtpListenerHealth,
+  getXmtpListenerSnapshot,
+  parseListenerPageLimit,
+  saveXmtpListenerStatus,
+} from './listener-registry';
 import type { AppRecord, Env, PushQueueJob, SubscriptionRecord } from './types';
-
-function publicApp(app: AppRecord) {
-  return {
-    id: app.id,
-    name: app.name,
-    ownerWallet: app.ownerWallet,
-    vapidPublicKey: app.vapidPublicKey,
-    metadata: app.metadata,
-    rateLimit: app.rateLimit,
-    createdAt: app.createdAt,
-    updatedAt: app.updatedAt,
-  };
-}
 
 async function requireApiApp(request: Request, env: Env): Promise<AppRecord | Response> {
   const app = await authenticateApiKey(request, env);
@@ -45,18 +43,6 @@ async function requireApiApp(request: Request, env: Env): Promise<AppRecord | Re
     return errorResponse('Missing or invalid X-API-Key header', ERROR_CODES.INVALID_API_KEY, 401);
   }
   return app;
-}
-
-async function requireWallet(request: Request): Promise<string | Response> {
-  const auth = verifyWalletAuth(request);
-  if (!auth) {
-    return errorResponse('Missing or invalid Authorization bearer token', ERROR_CODES.UNAUTHORIZED, 401);
-  }
-  return auth.walletAddress;
-}
-
-function routeSegments(pathname: string): string[] {
-  return pathname.split('/').filter(Boolean);
 }
 
 async function queueGenericPushes(
@@ -96,12 +82,64 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
 
   try {
     if (method === 'GET' && pathname === '/api/health') {
+      const xmtp = await getXmtpListenerHealth(
+        env.DB,
+        Boolean(env.XMTP_LISTENER && env.XMTP_LISTENER_SYNC_TOKEN && env.INTERNAL_INGEST_TOKEN)
+      );
       return jsonResponse({
         status: 'healthy',
         runtime: 'cloudflare-worker',
         timestamp: new Date().toISOString(),
         version: '1.0.0',
+        xmtp,
       });
+    }
+
+    if (method === 'GET' && pathname === '/api/internal/xmtp/deliveries/ready') {
+      if (!hasInternalIngestAuth(request, env)) {
+        return new Response(null, {
+          status: 401,
+          headers: { 'Cache-Control': 'no-store' },
+        });
+      }
+      return new Response(null, {
+        status: 204,
+        headers: { 'Cache-Control': 'no-store' },
+      });
+    }
+
+    if (pathname.startsWith('/api/internal/xmtp/listener/')) {
+      if (!hasXmtpListenerSyncAuth(request, env)) {
+        return errorResponse('Missing or invalid XMTP listener sync token', ERROR_CODES.UNAUTHORIZED, 401);
+      }
+
+      if (method === 'GET' && pathname === '/api/internal/xmtp/listener/snapshot') {
+        const snapshot = await getXmtpListenerSnapshot(env.DB, {
+          limit: parseListenerPageLimit(url.searchParams.get('limit')),
+          pageToken: url.searchParams.get('pageToken') ?? undefined,
+        });
+        return Response.json(snapshot, { headers: { 'Cache-Control': 'no-store' } });
+      }
+
+      if (method === 'GET' && pathname === '/api/internal/xmtp/listener/deltas') {
+        const after = url.searchParams.get('after');
+        if (after === null) {
+          return errorResponse('after is required', ERROR_CODES.VALIDATION_ERROR, 422);
+        }
+        const deltas = await getXmtpListenerDeltas(env.DB, {
+          after,
+          limit: parseListenerPageLimit(url.searchParams.get('limit')),
+        });
+        return Response.json(deltas, { headers: { 'Cache-Control': 'no-store' } });
+      }
+
+      if (method === 'POST' && pathname === '/api/internal/xmtp/listener/status') {
+        const input = XmtpListenerStatusSchema.parse(await readJson(request));
+        const result = await saveXmtpListenerStatus(env.DB, input);
+        return Response.json({ version: 1, accepted: true, cursor: result.cursor });
+      }
+
+      return errorResponse('Not found', ERROR_CODES.NOT_FOUND, 404);
     }
 
     if (method === 'GET' && pathname === '/api/xmtp/vapid-public-key') {
@@ -131,6 +169,20 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
       return jsonResponse(result);
     }
 
+    if (pathname === '/api/xmtp/registrations' && (method === 'POST' || method === 'DELETE')) {
+      const app = await requireApiApp(request, env);
+      if (app instanceof Response) return app;
+      const body = await readJson(request);
+      const store = new D1XmtpStore(env, app.id);
+
+      if (method === 'POST') {
+        const result = await registerGenericXmtpSubscription(store, body);
+        return jsonResponse(result, result.created ? 201 : 200);
+      }
+
+      return jsonResponse(await unregisterGenericXmtpSubscription(store, body));
+    }
+
     if (method === 'POST' && (
       pathname === '/api/internal/xmtp/deliveries' ||
       pathname === '/api/internal/xmtp/envelopes'
@@ -143,67 +195,6 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
       const result = await relayXmtpDelivery(new D1XmtpStore(env), body);
       // The official XMTP HTTP delivery adapter retries every non-200 response.
       return jsonResponse(result, 200);
-    }
-
-    if (method === 'POST' && pathname === '/api/register-app') {
-      const wallet = await requireWallet(request);
-      if (wallet instanceof Response) return wallet;
-
-      const apps = await getAppsByOwner(env.DB, wallet);
-      if (apps.length >= 10) {
-        return errorResponse('Maximum apps limit reached', ERROR_CODES.RATE_LIMIT_EXCEEDED, 429);
-      }
-
-      const body = await readJson(request);
-      const input = RegisterAppSchema.parse(body);
-      const app = await createApp(env.DB, wallet, input.name, input.metadata);
-      return jsonResponse({
-        id: app.id,
-        name: app.name,
-        apiKey: app.apiKey,
-        vapidPublicKey: app.vapidPublicKey,
-        createdAt: app.createdAt,
-      }, 201);
-    }
-
-    if (method === 'GET' && pathname === '/api/apps') {
-      const wallet = await requireWallet(request);
-      if (wallet instanceof Response) return wallet;
-      const apps = await getAppsByOwner(env.DB, wallet);
-      return jsonResponse(apps.map(publicApp));
-    }
-
-    const segments = routeSegments(pathname);
-    if (segments[0] === 'api' && segments[1] === 'apps' && segments[2]) {
-      const appId = segments[2];
-      const wallet = await requireWallet(request);
-      if (wallet instanceof Response) return wallet;
-
-      if (!(await ownsApp(env, wallet, appId))) {
-        return errorResponse('App not found', ERROR_CODES.NOT_FOUND, 404);
-      }
-
-      if (method === 'GET' && segments.length === 3) {
-        const app = await getAppById(env.DB, appId);
-        return app ? jsonResponse(publicApp(app)) : errorResponse('App not found', ERROR_CODES.NOT_FOUND, 404);
-      }
-
-      if (method === 'PUT' && segments.length === 3) {
-        const body = await readJson(request);
-        const input = UpdateAppSchema.parse(body);
-        const app = await updateApp(env.DB, appId, input);
-        return app ? jsonResponse(publicApp(app)) : errorResponse('App not found', ERROR_CODES.NOT_FOUND, 404);
-      }
-
-      if (method === 'DELETE' && segments.length === 3) {
-        const deleted = await deleteApp(env.DB, appId);
-        return jsonResponse({ deleted });
-      }
-
-      if (method === 'POST' && segments[3] === 'regenerate-key') {
-        const apiKey = await regenerateApiKey(env.DB, appId);
-        return apiKey ? jsonResponse({ apiKey }) : errorResponse('App not found', ERROR_CODES.NOT_FOUND, 404);
-      }
     }
 
     if (method === 'GET' && pathname === '/api/vapid/public-key') {
@@ -286,6 +277,10 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
   } catch (error) {
     if (error instanceof ZodError) {
       return zodErrorResponse(error, null);
+    }
+
+    if (error instanceof XmtpAppIsolationPendingError) {
+      return errorResponse(error.message, ERROR_CODES.NOT_CONFIGURED, 503);
     }
 
     const message = error instanceof Error ? error.message : 'Internal error';

@@ -10,6 +10,18 @@ export function bytesToBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunkSize = 0x8000;
+
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.slice(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return btoa(binary);
+}
+
 export function base64UrlToBytes(input: string): Uint8Array | null {
   const compact = input.replace(/\s+/g, '');
   if (!compact || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return null;

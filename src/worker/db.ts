@@ -16,9 +16,20 @@ import type {
   XmtpUnsubscribeResult,
 } from './core';
 import { buildXmtpPushPayload } from './core';
+import {
+  markXmtpListenerRouteDirty,
+  recordXmtpListenerChange,
+} from './listener-registry';
 import { generateApiKey, generateVapidKeys } from './vapid';
 
 type JsonValue = Record<string, unknown> | unknown[];
+
+export class XmtpAppIsolationPendingError extends Error {
+  constructor() {
+    super('XMTP app-scoped identity migration is pending; retry after the contract migration');
+    this.name = 'XmtpAppIsolationPendingError';
+  }
+}
 
 interface AppRow {
   id: string;
@@ -191,8 +202,41 @@ export async function updateApp(
 }
 
 export async function deleteApp(db: D1Database, id: string): Promise<boolean> {
-  const result = await db.prepare('DELETE FROM apps WHERE id = ?').bind(id).run();
-  return result.meta.changes > 0;
+  const app = await db.prepare('SELECT id FROM apps WHERE id = ?')
+    .bind(id)
+    .first<{ id: string }>();
+  if (!app) return false;
+
+  const routes = await db.prepare(`
+    SELECT DISTINCT installation_id
+    FROM xmtp_identities
+    WHERE app_id = ?
+  `).bind(id).all<{ installation_id: string }>();
+
+  const dirtyVersions = new Map<string, string>();
+  for (const route of routes.results) {
+    dirtyVersions.set(
+      route.installation_id,
+      await markXmtpListenerRouteDirty(db, id, route.installation_id)
+    );
+  }
+
+  // Expansion migration 0003 cannot add an app FK without rebuilding this
+  // table. Delete explicitly so app removal is safe both before and after 0004.
+  await db.batch([
+    db.prepare('DELETE FROM xmtp_identities WHERE app_id = ?').bind(id),
+    db.prepare('DELETE FROM apps WHERE id = ?').bind(id),
+  ]);
+  for (const route of routes.results) {
+    await recordXmtpListenerChange(
+      db,
+      id,
+      route.installation_id,
+      'registration-deleted',
+      dirtyVersions.get(route.installation_id)
+    );
+  }
+  return true;
 }
 
 export async function regenerateApiKey(db: D1Database, id: string): Promise<string | null> {
@@ -375,22 +419,29 @@ export async function ensureConvergeApp(env: Env): Promise<AppRecord | null> {
 }
 
 export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
-  constructor(private readonly env: Env) {}
+  constructor(
+    private readonly env: Env,
+    private readonly appId?: string
+  ) {}
+
+  private async resolveApp(): Promise<AppRecord | null> {
+    return this.appId ? getAppById(this.env.DB, this.appId) : ensureConvergeApp(this.env);
+  }
 
   async upsertRegistration(input: NormalizedXmtpRegistration): Promise<XmtpRegistrationResult> {
-    const app = await ensureConvergeApp(this.env);
+    const app = await this.resolveApp();
     if (!app) {
-      throw new Error('Converge VAPID app is not configured');
+      throw new Error('XMTP VAPID app is not configured');
     }
 
-    const identityId = await this.upsertIdentity(input);
+    const { identityId, dirtyVersion } = await this.upsertIdentity(input);
     const subscription = await upsertSubscription(this.env.DB, app.id, {
       endpoint: input.endpoint,
       p256dh: input.p256dh,
       auth: input.auth,
       userId: input.inboxId,
       channelId: input.installationId,
-      metadata: { source: 'converge-xmtp', address: input.address ?? null },
+      metadata: { source: 'xmtp', address: input.address ?? null },
       expirationTime: input.expirationTime,
     });
 
@@ -416,6 +467,13 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     ).run();
 
     await this.replaceTopics(identityId, input.topics);
+    await recordXmtpListenerChange(
+      this.env.DB,
+      app.id,
+      input.installationId,
+      'registration-upserted',
+      dirtyVersion
+    );
 
     return {
       subscriptionId: subscription.id,
@@ -427,6 +485,8 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
   }
 
   async disableRegistration(input: { endpoint: string; inboxId: string; installationId: string }): Promise<XmtpUnsubscribeResult> {
+    const app = await this.resolveApp();
+    if (!app) return { disabled: false };
     const row = await this.env.DB.prepare(`
       SELECT
         xs.id AS xmtp_subscription_id,
@@ -435,14 +495,20 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       FROM xmtp_subscriptions xs
       JOIN xmtp_identities xi ON xi.id = xs.identity_id
       JOIN subscriptions s ON s.id = xs.subscription_id
-      WHERE s.endpoint = ? AND xi.inbox_id = ? AND xi.installation_id = ? AND xs.active = 1
-    `).bind(input.endpoint, input.inboxId, input.installationId).first<{
+      WHERE s.endpoint = ? AND xi.app_id = ? AND xi.inbox_id = ? AND xi.installation_id = ? AND xs.active = 1
+    `).bind(input.endpoint, app.id, input.inboxId, input.installationId).first<{
       xmtp_subscription_id: string;
       identity_id: string;
       subscription_id: string;
     }>();
 
     if (!row) return { disabled: false };
+
+    const dirtyVersion = await markXmtpListenerRouteDirty(
+      this.env.DB,
+      app.id,
+      input.installationId
+    );
 
     await this.env.DB.prepare(`
       UPDATE xmtp_subscriptions SET active = 0, updated_at = ? WHERE id = ?
@@ -475,10 +541,22 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
         .run();
     }
 
+    await recordXmtpListenerChange(
+      this.env.DB,
+      app.id,
+      input.installationId,
+      'registration-deleted',
+      dirtyVersion
+    );
+
     return { disabled: true };
   }
 
-  async findDeliveryMatches(installationId: string, topic: string): Promise<XmtpTopicMatch[]> {
+  async findDeliveryMatches(
+    installationId: string,
+    topic: string,
+    deliveryToken: string
+  ): Promise<XmtpTopicMatch[]> {
     const result = await this.env.DB.prepare(`
       SELECT
         xt.id AS topic_id,
@@ -494,8 +572,11 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       JOIN xmtp_identities xi ON xi.id = xt.identity_id
       JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
       JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
+      JOIN xmtp_listener_installations li
+        ON li.app_id = xi.app_id AND li.installation_id = xi.installation_id
       WHERE xi.installation_id = ? AND xt.topic = ?
-    `).bind(installationId, topic).all<TopicMatchRow>();
+        AND li.delivery_token = ?
+    `).bind(installationId, topic, deliveryToken).all<TopicMatchRow>();
 
     return result.results.map((row) => ({
       topicId: row.topic_id,
@@ -553,21 +634,47 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     }
   }
 
-  private async upsertIdentity(input: NormalizedXmtpRegistration): Promise<string> {
+  private async upsertIdentity(input: NormalizedXmtpRegistration): Promise<{
+    identityId: string;
+    dirtyVersion: string;
+  }> {
+    const app = await this.resolveApp();
+    if (!app) throw new Error('XMTP VAPID app is not configured');
     const existing = await this.env.DB.prepare(`
-      SELECT id FROM xmtp_identities WHERE inbox_id = ? AND installation_id = ?
-    `).bind(input.inboxId, input.installationId).first<{ id: string }>();
+      SELECT id FROM xmtp_identities WHERE app_id = ? AND inbox_id = ? AND installation_id = ?
+    `).bind(app.id, input.inboxId, input.installationId).first<{ id: string }>();
 
+    if (!existing) {
+      const table = await this.env.DB.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'xmtp_identities'
+      `).first<{ sql: string }>();
+      const hasAppScopedUnique = /UNIQUE\s*\(\s*app_id\s*,\s*inbox_id\s*,\s*installation_id\s*\)/i
+        .test(table?.sql ?? '');
+      if (!hasAppScopedUnique) {
+        const crossApp = await this.env.DB.prepare(`
+          SELECT id FROM xmtp_identities
+          WHERE inbox_id = ? AND installation_id = ? AND app_id <> ?
+        `).bind(input.inboxId, input.installationId, app.id).first<{ id: string }>();
+        if (crossApp) throw new XmtpAppIsolationPendingError();
+      }
+    }
+
+    const dirtyVersion = await markXmtpListenerRouteDirty(
+      this.env.DB,
+      app.id,
+      input.installationId
+    );
     const id = existing?.id ?? crypto.randomUUID();
     await this.env.DB.prepare(`
-      INSERT INTO xmtp_identities (id, inbox_id, installation_id, address, inbox_handle, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(inbox_id, installation_id) DO UPDATE SET
+      INSERT INTO xmtp_identities (id, app_id, inbox_id, installation_id, address, inbox_handle, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT DO UPDATE SET
         address = excluded.address,
         inbox_handle = COALESCE(excluded.inbox_handle, xmtp_identities.inbox_handle),
         updated_at = excluded.updated_at
     `).bind(
       id,
+      app.id,
       input.inboxId,
       input.installationId,
       input.address ?? null,
@@ -576,7 +683,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       nowIso()
     ).run();
 
-    return id;
+    return { identityId: id, dirtyVersion };
   }
 
   private async replaceTopics(identityId: string, topics: NormalizedXmtpRegistration['topics']): Promise<void> {

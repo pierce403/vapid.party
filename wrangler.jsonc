@@ -16,8 +16,18 @@
   },
   "vars": {
     "VAPID_SUBJECT": "mailto:admin@vapid.party",
-    "CONVERGE_APP_ID": "converge"
+    "CONVERGE_APP_ID": "converge",
+    "VAPID_PARTY_PUBLIC_URL": "https://vapid.party"
   },
+  "containers": [
+    {
+      "class_name": "XmtpListenerContainer",
+      "image": "./infra/xmtp-listener/Dockerfile",
+      "max_instances": 1,
+      "instance_type": "lite",
+      "rollout_step_percentage": 100
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
@@ -49,6 +59,10 @@
       {
         "name": "RELAY_COORDINATOR",
         "class_name": "RelayCoordinator"
+      },
+      {
+        "name": "XMTP_LISTENER",
+        "class_name": "XmtpListenerContainer"
       }
     ]
   },
@@ -56,8 +70,15 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["RelayCoordinator"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["XmtpListenerContainer"]
     }
   ],
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "routes": [
     {
       "pattern": "vapid.party",

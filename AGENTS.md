@@ -10,7 +10,7 @@ These instructions apply to the entire repository.
 
 ## Responsibilities
 - Keep the Web Push relay honest about shipped behavior.
-- Preserve wallet/API-key auth boundaries and per-app VAPID key isolation.
+- Preserve operator/API-key auth boundaries and per-app VAPID key isolation.
 - Keep API handlers, Zod schemas, OpenAPI docs, LLM docs, README examples, and UI copy aligned.
 - Verify changes with the relevant local workflow before landing.
 
@@ -36,11 +36,14 @@ These instructions apply to the entire repository.
 - Keep detailed procedures in `skills/<name>/SKILL.md`; use `curator` as the default skill for updating the skill library.
 
 ## Project overview
-- Cloudflare Worker Web Push relay. Historical Next.js files are archival reference only and have no package scripts or installed dependencies.
-- Worker data lives in D1 with migrations under `migrations/d1`. PostgreSQL belongs only to the separately deployed official XMTP listener.
-- Auth is split between wallet bearer tokens for app management, `X-API-Key`
-  for generic push, public Converge registration, and a secret bearer token for
-  official XMTP notification-server delivery.
+- Cloudflare-only Worker Web Push relay; there is no supported Next.js or Vercel runtime.
+- Worker and XMTP registration data live in D1 with migrations under
+  `migrations/d1`. The always-on XMTP v3 listener is a singleton Cloudflare
+  Container with an atomic in-memory routing index; do not add PostgreSQL or a
+  separate public listener service.
+- App provisioning is operator-only. Runtime auth is split between `X-API-Key`
+  for generic app routes, restricted public Converge registration, and separate
+  secret bearer tokens for listener control/status and delivery ingest.
 - VAPID keypairs are generated per app and stored with app records.
 
 ## Project shape
@@ -48,8 +51,11 @@ These instructions apply to the entire repository.
   validation, and Web Push delivery.
 - `migrations/d1/`: ordered production D1 migrations.
 - `tests/worker/`: contract tests plus a Miniflare D1 integration test.
+- `infra/xmtp-listener/`: custom Go XMTP v3 `SubscribeAll` listener, container
+  image, tests, and production canary runbook.
 - `public/openapi.yaml` and `public/llms.txt`: machine-readable API docs that must stay in sync with shipped handlers.
-- `app/`, `components/`, `hooks/`, `lib/`, and the Postgres migration script are historical reference only. Do not add them back to the package graph unless the product explicitly restores that runtime and its security maintenance burden.
+- Do not add a Vercel/Next runtime or PostgreSQL listener state. The supported
+  deployment is Worker + D1 + Queue + singleton Cloudflare Container.
 
 ## Local workflows
 - Dev: `npm run dev`
@@ -68,14 +74,16 @@ These instructions apply to the entire repository.
   prohibit a localhost socket must run it with the required process permission.
 - Explicit Converge unsubscribe deletes inbox topic/HMAC material immediately;
   it keeps a physical endpoint only while another active logical inbox shares it.
-- The official XMTP HTTP delivery adapter retries every non-200 response and
-  must receive a minimal `{type, inboxHandle}` Web Push payload.
-- Production has the D1 0002 schema and the current Worker contract deployed.
-  Public XMTP registration/delete and bearer-protected official delivery ingest
-  are live. The D1 -> Queue -> FCM -> Converge service-worker path has passed a
-  real-Chrome test, and the production XMTP path has passed with the official v3
-  notification server running temporarily against PostgreSQL.
-- No always-on XMTP listener or PostgreSQL is deployed. Do not describe push as
-  continuously available until that runtime is deployed and observed; the live
-  tests prove the relay data path, not persistent network monitoring.
+- XMTP listener routes are keyed by `(appId, installationId)`. Never union HMAC
+  keys or fan out registrations across apps, even for a shared installation or
+  topic. Listener-to-Worker delivery is a minimal authenticated hint and must
+  never include XMTP ciphertext, sender identity, or message content.
+- Production has D1 migrations 0001 through 0004, the current Worker contract,
+  Queue, and the singleton custom Go XMTP listener Container deployed. Public
+  health reported `deliveryReady: true`, listener `ready`, and bridge `synced`
+  on 2026-07-14. `SubscribeAll` has no listener replay cursor, so push can still
+  have restart/disconnect gaps while normal XMTP client sync remains authoritative.
+- XMTP v3 group message topics contain a 16-byte group id (`g-` plus 32 hex
+  characters). Welcome topics contain the 32-byte installation id (`w-` plus
+  64 hex characters). Never apply one identifier length to both topic kinds.
 - For GitHub auth, prefer `gh`/HTTPS over SSH. If SSH signing fails, run `gh auth setup-git` and use an HTTPS origin.

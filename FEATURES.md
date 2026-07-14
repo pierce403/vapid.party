@@ -1,277 +1,205 @@
 # FEATURES
 
-## Cloudflare Worker Runtime
+## Cloudflare-Only Runtime
 
-Stability: in-progress
+Stability: deployed
 
 Description:
-- `vapid.party` runs as a Cloudflare Worker rather than a Vercel/Next API deployment.
-- The Worker owns public API routing, CORS, health checks, generic Web Push endpoints, Converge XMTP endpoints, and queue consumption.
-- Historical Next/dashboard files remain only as unbuilt reference material. They have no package scripts or installed dependencies and are excluded from the supported runtime and security graph.
+- `vapid.party` runs on a Cloudflare Worker, D1, Cloudflare Queues, and one
+  singleton Cloudflare Container.
+- The Container runs the custom Go XMTP v3 `SubscribeAll` listener. D1 is its
+  durable control plane; the Container holds only a replaceable in-memory index.
+- This repository has no supported Next.js, Vercel, or PostgreSQL runtime.
 
 Properties:
-- Wrangler config lives in `wrangler.jsonc`.
-- Worker source lives under `src/worker`.
-- Static assets from `public/` are available through the Worker assets binding.
-- `npm run dev` starts Wrangler for local Worker development.
-- `npm run build` produces a Wrangler dry-run bundle instead of a Vercel build.
+- Worker source lives in `src/worker` and listener source in
+  `infra/xmtp-listener`.
+- Wrangler configuration lives in `wrangler.jsonc`.
+- Production is served at `https://vapid.party` and the Worker development URL.
+- D1 migrations 0001 through 0004 are applied in production.
 - Node.js 22 or newer is required by the pinned Wrangler toolchain.
-- The installable package graph contains only Worker runtime and test/build dependencies; `npm audit --audit-level=low` reports zero findings.
-- Production Worker is deployed at `https://vapid-party.bcrt43.workers.dev` and `https://vapid.party`.
-- `vapid.party` is an active Cloudflare zone and the Worker custom domain is attached.
 
 Test Criteria:
 - [x] `npm run lint`
 - [x] `npm test`
 - [x] `npm run build`
-- [x] Worker upload/deployment succeeds against the production Cloudflare account.
-- [x] `wrangler deploy` succeeds with the `vapid.party` custom domain after the Cloudflare zone exists.
+- [x] Go race tests and `go vet`
+- [x] Worker and Container production deployment
+- [x] Public health reported the listener ready and bridge synced on 2026-07-14
 
-## D1 Persistence
+## App-Scoped D1 Registry
 
-Stability: in-progress
-
-Description:
-- The supported relay persists in D1. Postgres is required only by the future official XMTP listener, not by this Worker.
-- The schema keeps apps, VAPID key metadata, physical Web Push subscriptions,
-  logical XMTP registrations, XMTP topics, per-epoch HMAC keys, idempotent
-  delivery events, delivery attempts, rate logs, and relay cursors.
-
-Properties:
-- D1 migrations live in `migrations/d1`.
-- Remote D1 database is `vapid-party` / `c78e2c36-5768-43e1-936e-79b5850871bb`.
-- App VAPID keys remain per app.
-- Converge registration rows are keyed by push endpoint, `inboxId`, and `installationId`.
-- A welcome topic is represented without an HMAC row; a conversation topic can
-  own multiple epoch-key rows.
-- Deleting one logical inbox registration removes its identity/topic/HMAC rows.
-  A shared physical Web Push endpoint remains only while another active logical
-  inbox uses it; the last delete removes endpoint, `p256dh`, and `auth` data.
-- XMTP topic/HMAC rows never store plaintext message content.
-
-Test Criteria:
-- [x] D1 migration applies locally with `npm run db:migrate`.
-- [x] Migration 0002 is applied to the production D1 database.
-- [x] Idempotent Converge registration test passes.
-- [x] Unsubscribe test disables the expected registration rows.
-- [x] Migration 0002 preserves seeded version-1 topics, HMAC keys, delivery
-  references, and foreign-key integrity.
-
-## Generic Web Push API
-
-Stability: in-progress
+Stability: deployed
 
 Description:
-- Existing generic Web Push behavior is ported to Worker routes.
-- Owner/admin app routes retain wallet bearer auth.
-- Generic subscription and send routes retain `X-API-Key` auth.
+- D1 stores apps, per-app VAPID keys, physical Web Push subscriptions, logical
+  XMTP registrations, topics, HMAC epochs, listener changes, delivery attempts,
+  and rate-limit records.
+- Listener routes are keyed by `(appId, installationId)`, not only by an inbox,
+  installation, endpoint, or topic.
 
 Properties:
-- `POST /api/subscribe` requires `X-API-Key`.
-- `POST /api/send` requires `X-API-Key` and enqueues push jobs.
-- `GET /api/vapid/public-key` requires `X-API-Key`.
-- Invalid subscriptions returned by push services are disabled.
-- The reserved Converge app's generic API-key routes fail closed unless the
-  `CONVERGE_API_KEY` Worker secret is configured.
+- Each app/installation route owns a stable opaque delivery token.
+- Two apps can register the same installation and topic without sharing HMAC
+  keys, sender-suppression state, VAPID keys, or delivery authorization.
+- One physical browser endpoint may back several logical inbox registrations.
+- Removing one logical registration removes that inbox's topics and HMAC keys.
+  The endpoint and Web Push keys are removed after the last logical user leaves.
+- Versioned dirty markers repair interrupted multi-statement registration
+  mutations. Tombstones remain until active listeners have consumed them.
+- Group topics are `/xmtp/mls/1/g-<32 hex>/proto` for a 16-byte group id.
+  Welcome topics are `/xmtp/mls/1/w-<64 hex>/proto` for a 32-byte installation id.
 
 Test Criteria:
-- [ ] API-key-protected routes reject missing keys.
-- [x] Reserved Converge generic routes fail closed without the secret binding.
-- [x] Production rejects the former source-visible Converge generic API key.
-- [ ] Generic send enqueues queue jobs for selected subscriptions.
-- [ ] Queue consumer updates delivery attempts.
+- [x] Local and production migrations preserve foreign-key integrity
+- [x] App-scoped uniqueness and backfill preflights pass
+- [x] Cross-app isolation is covered through snapshot, delivery, and deletion
+- [x] Dirty-route recovery and tombstone retention are covered
+- [x] Invalid legacy HMAC data is isolated without breaking valid routes
 
-## Converge XMTP Public Registration
+## Public Converge Registration
 
-Stability: in-progress
+Stability: deployed
 
 Description:
-- Converge is a static PWA and must be able to register push subscriptions without a client secret.
-- Public XMTP-aware routes are exposed under Converge's existing `https://vapid.party/api` base URL.
+- Converge is a static PWA and registers through a deliberately restricted
+  public compatibility contract without shipping an app secret.
+
+Routes:
+- `GET /api/xmtp/vapid-public-key`
+- `POST /api/xmtp/subscriptions`
+- `DELETE /api/xmtp/subscriptions`
 
 Properties:
-- `GET /api/xmtp/vapid-public-key` requires no client secret.
-- `POST /api/xmtp/subscriptions` requires no client secret.
-- `DELETE /api/xmtp/subscriptions` requires no client secret.
-- Registrations require `minimalPayloadOnly=true` and `plaintextPreview=false`.
-- The primary nested version-1 request accepts Web Push subscription data,
-  identity metadata, XMTP topics and epoch keys, an opaque `inboxHandle`, and
-  registration metadata emitted by Converge.
-- The former flattened request remains accepted for older clients.
-- `inboxHandle` is restricted to a base64url-style opaque token; display names
-  and raw inbox ids are not valid handles.
+- Version 1 requires `app.id: "converge.cv"`; it cannot enroll another app.
+- Registration includes one standard `PushSubscription`, inbox and installation
+  ids, canonical XMTP topics, all current HMAC epochs, and an opaque
+  `inboxHandle`.
+- `minimalPayloadOnly` must be true and `plaintextPreview` must be false.
+- Repeated registration is idempotent for endpoint, inbox, and installation.
+- A legacy flattened request remains accepted for older Converge clients.
 
 Test Criteria:
-- [x] Public Converge routes are not API-key gated.
-- [x] Subscription payload validation rejects plaintext preview preferences.
-- [x] Repeated registrations are idempotent for endpoint + inboxId + installationId.
-- [x] Delete disables the matching Converge registration.
-- [x] Nested Converge registration accepts multiple HMAC epochs and a welcome
-  topic with no HMAC.
-- [x] Delete keeps other logical registrations on the shared endpoint active.
-- [x] Production VAPID, registration, and logical-delete routes are live at
-  `https://vapid.party/api/xmtp/*`.
+- [x] Public routes do not require `X-API-Key`
+- [x] Another app id and plaintext preview preferences are rejected
+- [x] Multiple HMAC epochs and no-HMAC welcome topics are accepted
+- [x] Shared endpoints survive one logical inbox deletion
 
-## Queue-Backed Push Delivery
+## Authenticated App APIs
 
-Stability: in-progress
+Stability: deployed
 
 Description:
-- Push sends are moved out of request handlers and into Cloudflare Queues.
-- Queue retries and dead-letter handling are configured in Wrangler.
+- Pre-provisioned apps use `X-API-Key` for generic Web Push and app-scoped XMTP
+  registration.
+- App provisioning and key rotation are operator-only until a verifiable admin
+  authentication design is implemented.
 
-Properties:
-- Queue producer binding is `PUSH_QUEUE`.
-- Remote queues are `vapid-party-push-send` and `vapid-party-push-dlq`.
-- Consumer uses bounded batches and retry delays.
-- Dead-letter queue name is `vapid-party-push-dlq`.
-- XMTP push payloads only contain generic metadata.
+Routes:
+- `GET /api/vapid/public-key`
+- `POST /api/subscribe`
+- `POST /api/send`
+- `POST /api/xmtp/registrations`
+- `DELETE /api/xmtp/registrations`
+
+Security Properties:
+- The former unsigned wallet bearer/admin routes are removed and return 404.
+- The reserved Converge generic API routes fail closed without a configured
+  `CONVERGE_API_KEY`; its public compatibility routes remain independent.
+- API keys, listener sync tokens, ingest tokens, Web Push secrets, and delivery
+  tokens must never be sent to untrusted browser code or logs.
 
 Test Criteria:
-- [x] Queue payload shape test passes.
-- [ ] Consumer records sent, failed, and expired subscription outcomes.
-- [ ] Failed non-terminal sends retry through Queues.
+- [x] Missing or invalid app credentials are rejected
+- [x] A forged legacy wallet token cannot reach app administration
+- [x] The API key selects the app and the request cannot override app scope
 
-## XMTP Notification Delivery Matching
+## XMTP Listener And Matching
 
-Stability: in-progress
+Stability: experimental
 
 Description:
-- An official XMTP notification-server listener performs network subscription,
-  HMAC filtering, sender suppression, and `shouldPush` evaluation before HTTP
-  delivery to the Worker.
-- The relay does not receive, store, forward, or preview plaintext XMTP message content.
+- The singleton Container listens to XMTP production `SubscribeAll`, applies the
+  D1 snapshot and deltas, evaluates `shouldPush`, and suppresses messages sent by
+  the registered installation before posting a minimal delivery hint.
 
 Properties:
-- Worker matching uses the official delivery's `installation.id` plus
-  `subscription.topic`; it never asks the delivery caller to resend an HMAC
-  secret.
-- Retries are deduplicated per installation, topic, physical subscription, and
-  official `idempotency_key`.
-- Push payload is minimal: `xmtp.new_message` plus the opaque `inboxHandle`.
-- Converge's service worker owns all visible copy and click navigation.
-- Official encrypted envelope bytes are shape-validated and immediately
-  discarded; they are never stored or included in Web Push.
-- Delivery honors `message_context.should_push=false` defensively even though
-  the official listener already suppresses it.
+- Snapshot, delta, status, and delivery-readiness endpoints require the listener
+  sync token or ingest token as appropriate.
+- HMAC matching is performed independently for each app route and epoch.
+- Installation welcome topics need no HMAC key.
+- The listener sends no envelope ciphertext, sender identity, or message content
+  to the Worker.
+- Delivery uses bounded HTTP retries. Queue delivery and provider retries happen
+  after the Worker accepts the minimal event.
+- The Worker temporarily accepts the previous official HTTP `SendRequest` shape
+  for migration compatibility; the production Container uses the minimal event.
 
 Test Criteria:
-- [x] Installation/topic matching test passes without delivery HMAC secrets.
-- [x] Official request extensions and conflicting topics are rejected.
-- [x] Duplicate idempotency keys do not enqueue twice.
-- [x] `should_push=false` does not enqueue.
-- [x] Push payload shape excludes message text, sender names, previews, and attachment URLs.
-- [x] Shared-endpoint D1 test keeps the physical endpoint until the last logical
-  delete, then removes endpoint keys and inbox HMAC material.
-- [x] A production synthetic test used real Chrome and one physical FCM endpoint
-  for two logical inboxes, delivered welcome and group events through D1 ->
-  Queue -> FCM -> Converge's service worker, and verified idempotency,
-  `should_push=false`, logical deletion, post-delete suppression, local-only
-  profile copy, and cleanup.
+- [x] Real XMTP installation welcome reached Converge through the deployed Container
+- [x] Real XMTP group delivery matched three HMAC epochs through the deployed Container
+- [x] The production canary verified own-message and `shouldPush: false` suppression
+- [ ] Restart/disconnect behavior is observed over time
 
-## Durable Object Relay Coordination
+## Queue-Backed Web Push
 
-Stability: in-progress
+Stability: deployed
 
 Description:
-- Durable Objects provide shard ownership, relay cursor state, and restart coordination for XMTP monitoring.
+- Request handlers enqueue bounded push jobs. A Cloudflare Queue consumer owns
+  provider delivery, retries, dead-letter handling, and expired-endpoint cleanup.
 
 Properties:
-- Durable Object class is `RelayCoordinator`.
-- Shards are claimed with expiring leases.
-- Cursor updates are stored durably per shard.
-- Release only succeeds for the current owner.
+- Producer queue: `vapid-party-push-send`.
+- Dead-letter queue: `vapid-party-push-dlq`.
+- XMTP payloads contain only `type: "xmtp.new_message"` and the opaque local
+  `inboxHandle`.
+- `POST /api/send` returns 202 after queueing, not after browser delivery.
 
 Test Criteria:
-- [x] Worker bundle includes `RelayCoordinator`.
-- [ ] Shard claim and cursor RPCs are covered before production monitor rollout.
+- [x] Queue payloads exclude XMTP plaintext and ciphertext
+- [x] Real Chrome received D1 -> Queue -> FCM -> Converge service-worker pushes
+- [x] Duplicate delivery ids and `shouldPush: false` do not enqueue twice
 
-## XMTP Listener Runtime
+## Health And Readiness
 
-Stability: planned
+Stability: deployed
 
 Description:
-- The production design uses XMTP's `example-notification-server-go` as the
-  long-running network listener and the Worker as the Web Push delivery adapter.
+- `GET /api/health` exposes a secret-free, coarse readiness result for clients
+  and operators.
 
 Properties:
-- `POST /api/internal/xmtp/deliveries` accepts the official HTTP `SendRequest`
-  JSON and requires `Authorization: Bearer <INTERNAL_INGEST_TOKEN>`.
-- `X-Internal-Token` and `/api/internal/xmtp/envelopes` remain compatibility
-  aliases for the same request schema.
-- The official adapter requires HTTP 200, which the Worker returns after queueing
-  or idempotently recognizing the delivery.
-- The official listener still must be deployed with Postgres and XMTP network
-  access before real messages can trigger delivery continuously.
-- The bearer-protected production ingest has been exercised with XMTP's official
-  v3 notification server running temporarily against PostgreSQL. That test used
-  genuine installation-welcome and conversation envelopes, three HMAC epochs,
-  and verified own-message suppression through the Converge service worker.
+- Top-level Worker `status: healthy` does not imply XMTP delivery readiness.
+- `data.xmtp.deliveryReady` is true only when the listener heartbeat, XMTP
+  stream, internal delivery probe, and D1 cursor are fresh and synchronized.
+- `listener.status` is `ready`, `not_ready`, `not_configured`, or `unknown`.
+- `bridge.status` is `synced`, `pending`, `failed`, or `not_configured`, with
+  pending and failed registration counts.
+- The public response never exposes Container URLs, delivery tokens, HMAC keys,
+  Web Push endpoints, or bearer secrets.
 
 Test Criteria:
-- [x] Official HTTP delivery request shape is covered by contract tests.
-- [x] Production internal delivery ingest is live and rejects unauthenticated
-  requests.
-- [x] A full production data-path test passes with the official v3 listener and
-  temporary PostgreSQL: genuine welcome, inbound conversation push, three HMAC
-  epochs, and own-message suppression.
-- [ ] Official notification-server listener is deployed and its reconnect and
-  catch-up behavior is observed in production.
+- [x] Stale listener, stale cursor, failed routes, and dirty routes report non-ready
+- [x] Authenticated bodyless delivery probe is required for ready state
+- [x] Production reported `deliveryReady: true` after deployment
 
-## Privacy And Security Model
+## Privacy And Reliability Boundaries
 
-Stability: in-progress
+Stability: experimental
 
-Description:
-- `vapid.party` acts only as an encrypted-message wake-up relay for Converge.
-- Message sync and decryption stay in Converge through XMTP local client behavior.
-
-Properties:
-- Converge public registration requires no baked client API key.
-- Admin/dashboard/API-key auth remains scoped to owner and generic app operations.
-- XMTP push payloads contain no plaintext body, sender display name, decrypted content, attachment URL, or preview.
-- The Worker does not store or forward the encrypted envelope bytes delivered by
-  the official listener.
-- `inboxHandle` is opaque and is the only inbox-routing value in Web Push.
-- Unknown or unimplemented product metrics must not be shown as real values.
+Security Properties:
+- vapid.party never stores or pushes plaintext XMTP message text, sender names,
+  decrypted content, attachment URLs, conversation previews, or envelope bytes.
+- The app owns notification copy, navigation, XMTP sync, and decryption.
+- Push is an approximate wake-up hint, never message transport or history.
+- XMTP `SubscribeAll` has no durable listener replay cursor. A Container restart
+  or stream disconnect can therefore miss push hints; normal XMTP client sync
+  remains authoritative.
+- Installed-PWA and mobile-provider reliability still requires longer production
+  observation before notification delivery is called stable.
 
 Test Criteria:
-- [x] Public Converge endpoint tests pass without `X-API-Key`.
-- [x] Payload privacy tests pass.
-- [x] Source-visible Converge bootstrap API key is removed.
-- [x] Docs separate implemented behavior from planned monitor/deployment work.
-
-## Deployment And End-To-End Verification
-
-Stability: in-progress
-
-Description:
-- The Worker, D1/Queue/DO bindings, custom domain, and relay data path are
-  deployed and verified. Continuous automatic XMTP delivery remains incomplete
-  until the official listener and its PostgreSQL database run persistently.
-
-Properties:
-- Cloudflare deployment requires account authentication and real D1/Queue resources.
-- `vapid.party` route/custom domain must be configured in Cloudflare.
-- A real browser push subscription and Converge XMTP registration must be used for final verification.
-- Current Worker URLs: `https://vapid-party.bcrt43.workers.dev` and `https://vapid.party`.
-- The production relay passed both a synthetic real-Chrome delivery test and a
-  genuine XMTP v3 end-to-end test driven by a temporary official listener.
-- Current remaining blocker: no always-on official XMTP listener/PostgreSQL is
-  deployed, so production does not continuously monitor XMTP for notifications.
-- DNS note: Cloudflare authoritative DNS returns Worker-managed records for `vapid.party`; some recursive resolvers may briefly lag after the cutover.
-- Wrangler auth is available by passing the valid `cf` OAuth token from `~/.cf/config.toml` as `CLOUDFLARE_API_TOKEN`.
-
-Test Criteria:
-- [x] D1 database and queues are created in Cloudflare.
-- [x] Secrets and vars are configured in Cloudflare.
-- [x] Worker deployment exists in Cloudflare.
-- [x] `https://vapid-party.bcrt43.workers.dev/api/xmtp/vapid-public-key` returns the production public VAPID key.
-- [x] `vapid.party` Cloudflare zone is created/activated.
-- [x] `wrangler deploy` completes with `https://vapid.party` custom domain attached.
-- [x] `https://vapid.party/api/xmtp/vapid-public-key` returns the production public VAPID key.
-- [x] Two logical inboxes sharing one real browser endpoint pass production
-  welcome/group delivery, suppression, privacy, deletion, and cleanup checks.
-- [x] Genuine XMTP v3 welcome and group-message delivery reaches Converge through
-  the production relay when the official listener is run temporarily.
-- [ ] Deploy and observe an always-on official listener with durable PostgreSQL.
+- [x] Minimal payload privacy tests pass
+- [x] Welcome delivery works through a real production browser subscription
+- [ ] Long-running restart, disconnect, installed-PWA, and mobile tests complete

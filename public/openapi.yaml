@@ -1,35 +1,36 @@
 openapi: 3.1.0
 info:
   title: vapid.party API
-  version: 2.1.0
+  version: 3.0.0
   description: |
-    Cloudflare Web Push relay with public XMTP-aware registration endpoints for Converge.
-
-    Success responses are wrapped in `{ success, data }`.
-    Error responses are wrapped in `{ success: false, error, code, details? }`.
-
-    Converge XMTP registration endpoints are public and must not require a client API key.
+    Cloudflare-only Web Push relay with an app-scoped XMTP listener.
+    App provisioning is operator-only. Converge has a restricted public
+    compatibility registration; pre-provisioned apps use X-API-Key.
 servers:
   - url: https://vapid.party
   - url: http://localhost:8787
 tags:
   - name: Health
   - name: Converge XMTP
-  - name: Apps
+  - name: App XMTP
   - name: Generic Push
 paths:
   /api/health:
     get:
       tags: [Health]
-      summary: Health check
+      summary: Get Worker and coarse XMTP delivery readiness
+      security: []
       responses:
         "200":
-          description: OK
+          description: Health response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
   /api/xmtp/vapid-public-key:
     get:
       tags: [Converge XMTP]
-      summary: Get Converge public VAPID key
-      description: Public endpoint. Does not require a client secret or X-API-Key.
+      summary: Get the Converge public VAPID key
       security: []
       responses:
         "200":
@@ -45,8 +46,8 @@ paths:
       tags: [Converge XMTP]
       summary: Register or update a Converge XMTP push subscription
       description: |
-        Public endpoint. Idempotent upsert keyed by push endpoint, inboxId, and installationId.
-        The request must include topic/HMAC metadata and privacy-preserving preferences.
+        Restricted public endpoint. Version 1 requires app.id=converge.cv and
+        is idempotent for push endpoint, inboxId, and installationId.
       security: []
       requestBody:
         required: true
@@ -71,8 +72,7 @@ paths:
           description: Validation error
     delete:
       tags: [Converge XMTP]
-      summary: Disable a Converge XMTP push subscription
-      description: Public best-effort unsubscribe/update endpoint.
+      summary: Disable one Converge logical XMTP registration
       security: []
       requestBody:
         required: true
@@ -83,14 +83,59 @@ paths:
       responses:
         "200":
           description: Disabled or already absent
+  /api/xmtp/registrations:
+    post:
+      tags: [App XMTP]
+      summary: Register or update an app-scoped XMTP alert route
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericXmtpSubscriptionRequest"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XmtpSubscriptionResponse"
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XmtpSubscriptionResponse"
+        "401":
+          description: Missing or invalid app API key
+        "422":
+          description: Validation error
+    delete:
+      tags: [App XMTP]
+      summary: Disable one app-scoped XMTP alert route
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GenericXmtpDeleteSubscriptionRequest"
+      responses:
+        "200":
+          description: Disabled or already absent
+        "401":
+          description: Missing or invalid app API key
   /api/internal/xmtp/deliveries:
     post:
-      tags: [Converge XMTP]
-      summary: Accept an official XMTP notification-server HTTP delivery
+      tags: [App XMTP]
+      summary: Accept an authenticated XMTP listener delivery hint
       description: |
-        Internal endpoint for example-notification-server-go HttpDelivery.
-        Encrypted message bytes are validated for shape and discarded. The
-        response is always HTTP 200 after successful queue or deduplication.
+        The production Container sends the minimal version-1 shape. The previous
+        official HTTP SendRequest shape remains a transitional input. XMTP
+        ciphertext is never required by the minimal contract.
       security:
         - InternalBearerAuth: []
         - InternalTokenAuth: []
@@ -102,85 +147,15 @@ paths:
               $ref: "#/components/schemas/XmtpDeliveryRequest"
       responses:
         "200":
-          description: Queued, skipped by should_push, or already processed
+          description: Queued, skipped, or already processed
         "401":
           description: Missing or invalid internal ingest token
         "422":
           description: Validation error
-  /api/register-app:
-    post:
-      tags: [Apps]
-      summary: Register a generic push app
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RegisterAppRequest"
-      responses:
-        "201":
-          description: Created
-  /api/apps:
-    get:
-      tags: [Apps]
-      summary: List wallet-owned apps
-      security:
-        - BearerAuth: []
-      responses:
-        "200":
-          description: OK
-  /api/apps/{id}:
-    parameters:
-      - name: id
-        in: path
-        required: true
-        schema:
-          type: string
-    get:
-      tags: [Apps]
-      summary: Get an app
-      security:
-        - BearerAuth: []
-      responses:
-        "200":
-          description: OK
-    put:
-      tags: [Apps]
-      summary: Update an app
-      security:
-        - BearerAuth: []
-      responses:
-        "200":
-          description: OK
-    delete:
-      tags: [Apps]
-      summary: Delete an app
-      security:
-        - BearerAuth: []
-      responses:
-        "200":
-          description: OK
-  /api/apps/{id}/regenerate-key:
-    post:
-      tags: [Apps]
-      summary: Regenerate a generic app API key
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: OK
   /api/vapid/public-key:
     get:
       tags: [Generic Push]
-      summary: Get generic app public VAPID key
+      summary: Get a pre-provisioned app's public VAPID key
       security:
         - ApiKeyAuth: []
       responses:
@@ -190,6 +165,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/VapidPublicKeyResponse"
+        "401":
+          description: Missing or invalid app API key
   /api/subscribe:
     post:
       tags: [Generic Push]
@@ -205,11 +182,13 @@ paths:
       responses:
         "201":
           description: Created or updated
+        "401":
+          description: Missing or invalid app API key
   /api/send:
     post:
       tags: [Generic Push]
       summary: Queue generic Web Push notifications
-      description: Actual delivery occurs in the Cloudflare Queue consumer.
+      description: HTTP 202 means queued, not delivered to a provider or browser.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -221,11 +200,10 @@ paths:
       responses:
         "202":
           description: Queued
+        "401":
+          description: Missing or invalid app API key
 components:
   securitySchemes:
-    BearerAuth:
-      type: http
-      scheme: bearer
     ApiKeyAuth:
       type: apiKey
       in: header
@@ -233,12 +211,12 @@ components:
     InternalBearerAuth:
       type: http
       scheme: bearer
-      description: INTERNAL_INGEST_TOKEN used by the official HTTP delivery adapter.
+      description: INTERNAL_INGEST_TOKEN used by the production XMTP listener.
     InternalTokenAuth:
       type: apiKey
       in: header
       name: X-Internal-Token
-      description: Compatibility header for existing deployments.
+      description: Transitional compatibility header for internal delivery.
   schemas:
     ApiEnvelope:
       type: object
@@ -252,10 +230,66 @@ components:
         code:
           type: string
         details: {}
+    HealthResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [status, runtime, timestamp, version, xmtp]
+              properties:
+                status:
+                  type: string
+                  const: healthy
+                runtime:
+                  type: string
+                  const: cloudflare-worker
+                timestamp:
+                  type: string
+                  format: date-time
+                version:
+                  type: string
+                xmtp:
+                  type: object
+                  required: [deliveryReady, listener, bridge]
+                  properties:
+                    deliveryReady:
+                      type: boolean
+                    listener:
+                      type: object
+                      required: [configured, status]
+                      properties:
+                        configured:
+                          type: boolean
+                        status:
+                          type: string
+                          enum: [ready, not_ready, not_configured, unknown]
+                        lastCheckedAt:
+                          type: string
+                          format: date-time
+                    bridge:
+                      type: object
+                      required: [status, pendingRegistrationCount, failedRegistrationCount]
+                      properties:
+                        status:
+                          type: string
+                          enum: [synced, pending, failed, not_configured]
+                        pendingRegistrationCount:
+                          type: integer
+                          minimum: 0
+                        failedRegistrationCount:
+                          type: integer
+                          minimum: 0
+                        lastSuccessfulSyncAt:
+                          type: string
+                          format: date-time
     VapidPublicKeyResponse:
       allOf:
         - $ref: "#/components/schemas/ApiEnvelope"
         - type: object
+          required: [data]
           properties:
             data:
               type: object
@@ -281,8 +315,7 @@ components:
             auth:
               type: string
         expirationTime:
-          type: integer
-          nullable: true
+          type: [number, "null"]
     XmtpPreferences:
       type: object
       required: [minimalPayloadOnly, plaintextPreview]
@@ -294,64 +327,52 @@ components:
         plaintextPreview:
           type: boolean
           const: false
+    XmtpIdentity:
+      type: object
+      required: [inboxId, installationId]
+      additionalProperties: false
+      properties:
+        inboxId:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        installationId:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        address:
+          type: string
     XmtpHmacKey:
       type: object
       required: [epoch, key]
       additionalProperties: false
       properties:
         epoch:
-          type: string
-          pattern: '^\d+$'
+          oneOf:
+            - type: string
+              pattern: '^\d+$'
+            - type: integer
+              minimum: 0
         key:
           type: string
-    XmtpNestedTopic:
+    XmtpTopic:
       type: object
       required: [topic, hmacKeys]
       additionalProperties: false
       properties:
         topic:
           type: string
-          pattern: '^/xmtp/mls/1/[gw]-[0-9a-f]{64}/proto$'
+          pattern: '^/xmtp/mls/1/(g-[0-9a-f]{32}|w-[0-9a-f]{64})/proto$'
         hmacKeys:
           type: array
           maxItems: 16
           items:
             $ref: "#/components/schemas/XmtpHmacKey"
-      description: |
-        Group topics require at least one HMAC key. Welcome topics require an
-        empty array. These conditional constraints are enforced by the API.
-    XmtpNestedSubscriptionRequest:
+      description: Group topics require HMAC keys; welcome topics require an empty array.
+    XmtpBody:
       type: object
-      required: [version, app, identity, subscription, xmtp, notification, preferences, registeredAt]
-      additionalProperties: false
+      required: [identity, subscription, xmtp, notification, preferences, registeredAt]
       properties:
-        version:
-          type: integer
-          const: 1
-        app:
-          type: object
-          required: [id]
-          additionalProperties: false
-          properties:
-            id:
-              type: string
-              const: converge.cv
-            origin:
-              type: string
-              format: uri
         identity:
-          type: object
-          required: [inboxId, installationId]
-          additionalProperties: false
-          properties:
-            inboxId:
-              type: string
-              pattern: '^[0-9a-f]{64}$'
-            installationId:
-              type: string
-              pattern: '^[0-9a-f]{64}$'
-            address:
-              type: string
+          $ref: "#/components/schemas/XmtpIdentity"
         subscription:
           $ref: "#/components/schemas/PushSubscription"
         xmtp:
@@ -367,7 +388,7 @@ components:
               minItems: 1
               maxItems: 2000
               items:
-                $ref: "#/components/schemas/XmtpNestedTopic"
+                $ref: "#/components/schemas/XmtpTopic"
             topicSource:
               type: string
               const: conversations.hmacKeys
@@ -386,6 +407,37 @@ components:
         registeredAt:
           type: string
           format: date-time
+    GenericXmtpSubscriptionRequest:
+      allOf:
+        - type: object
+          required: [version]
+          properties:
+            version:
+              type: integer
+              const: 1
+        - $ref: "#/components/schemas/XmtpBody"
+      unevaluatedProperties: false
+    XmtpNestedSubscriptionRequest:
+      allOf:
+        - type: object
+          required: [version, app]
+          properties:
+            version:
+              type: integer
+              const: 1
+            app:
+              type: object
+              required: [id]
+              additionalProperties: false
+              properties:
+                id:
+                  type: string
+                  const: converge.cv
+                origin:
+                  type: string
+                  format: uri
+        - $ref: "#/components/schemas/XmtpBody"
+      unevaluatedProperties: false
     XmtpLegacyTopic:
       type: object
       required: [topic]
@@ -393,21 +445,61 @@ components:
       properties:
         topic:
           type: string
+          minLength: 1
+          maxLength: 512
         hmacKey:
           type: string
+          minLength: 1
         hmacKeys:
           type: array
+          maxItems: 16
           items:
             $ref: "#/components/schemas/XmtpHmacKey"
         algorithm:
           type: string
           enum: [hmac-sha256, sha256]
+          default: hmac-sha256
         conversationId:
           type: string
+          minLength: 1
+          maxLength: 255
+    XmtpLegacyHmacKeys:
+      oneOf:
+        - type: array
+          items:
+            $ref: "#/components/schemas/XmtpLegacyTopic"
+        - type: object
+          additionalProperties:
+            oneOf:
+              - type: string
+                minLength: 1
+              - type: object
+                required: [hmacKey]
+                additionalProperties: false
+                properties:
+                  hmacKey:
+                    type: string
+                    minLength: 1
+                  algorithm:
+                    type: string
+                    enum: [hmac-sha256, sha256]
+                    default: hmac-sha256
+                  conversationId:
+                    type: string
+                    minLength: 1
+                    maxLength: 255
     XmtpLegacySubscriptionRequest:
       type: object
       required: [inboxId, installationId, preferences]
+      description: Transitional flattened Converge request; new clients use version 1.
       additionalProperties: false
+      allOf:
+        - anyOf:
+            - required: [subscription]
+            - required: [endpoint, keys]
+        - anyOf:
+            - required: [topics]
+            - required: [hmacKeys]
       properties:
         subscription:
           $ref: "#/components/schemas/PushSubscription"
@@ -416,23 +508,40 @@ components:
           format: uri
         keys:
           type: object
+          required: [p256dh, auth]
+          additionalProperties: false
+          properties:
+            p256dh:
+              type: string
+              minLength: 1
+            auth:
+              type: string
+              minLength: 1
         expirationTime:
-          type: integer
-          nullable: true
+          type: [number, "null"]
         inboxId:
           type: string
+          minLength: 1
+          maxLength: 255
         installationId:
           type: string
+          minLength: 1
+          maxLength: 255
         address:
           type: string
+          minLength: 1
+          maxLength: 255
         inboxHandle:
           type: string
+          pattern: '^[A-Za-z0-9_-]{8,128}$'
         topics:
           type: array
+          minItems: 1
+          maxItems: 2000
           items:
             $ref: "#/components/schemas/XmtpLegacyTopic"
         hmacKeys:
-          description: Legacy topic-to-key map or array of legacy topic objects.
+          $ref: "#/components/schemas/XmtpLegacyHmacKeys"
         preferences:
           $ref: "#/components/schemas/XmtpPreferences"
     XmtpSubscriptionRequest:
@@ -443,6 +552,7 @@ components:
       allOf:
         - $ref: "#/components/schemas/ApiEnvelope"
         - type: object
+          required: [data]
           properties:
             data:
               type: object
@@ -458,48 +568,51 @@ components:
                   type: integer
                 created:
                   type: boolean
-    XmtpDeleteSubscriptionRequest:
-      oneOf:
-        - $ref: "#/components/schemas/XmtpNestedDeleteSubscriptionRequest"
-        - $ref: "#/components/schemas/XmtpFlatDeleteSubscriptionRequest"
-    XmtpNestedDeleteSubscriptionRequest:
+    XmtpDeleteBody:
       type: object
-      required: [version, app, endpoint, identity, deletedAt]
-      additionalProperties: false
+      required: [endpoint, identity]
       properties:
-        version:
-          type: integer
-          const: 1
-        app:
-          type: object
-          required: [id]
-          additionalProperties: false
-          properties:
-            id:
-              type: string
-              const: converge.cv
-            origin:
-              type: string
-              format: uri
         endpoint:
           type: string
           format: uri
         identity:
-          type: object
-          required: [inboxId, installationId]
-          additionalProperties: false
+          $ref: "#/components/schemas/XmtpIdentity"
+    GenericXmtpDeleteSubscriptionRequest:
+      allOf:
+        - type: object
+          required: [version, deletedAt]
           properties:
-            inboxId:
+            version:
+              type: integer
+              const: 1
+            deletedAt:
               type: string
-              pattern: '^[0-9a-f]{64}$'
-            installationId:
+              format: date-time
+        - $ref: "#/components/schemas/XmtpDeleteBody"
+      unevaluatedProperties: false
+    XmtpNestedDeleteSubscriptionRequest:
+      allOf:
+        - type: object
+          required: [version, app, deletedAt]
+          properties:
+            version:
+              type: integer
+              const: 1
+            app:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+                  const: converge.cv
+                origin:
+                  type: string
+                  format: uri
+            deletedAt:
               type: string
-              pattern: '^[0-9a-f]{64}$'
-            address:
-              type: string
-        deletedAt:
-          type: string
-          format: date-time
+              format: date-time
+        - $ref: "#/components/schemas/XmtpDeleteBody"
+      unevaluatedProperties: false
     XmtpFlatDeleteSubscriptionRequest:
       type: object
       required: [endpoint, inboxId, installationId]
@@ -512,7 +625,33 @@ components:
           type: string
         installationId:
           type: string
-    XmtpDeliveryRequest:
+    XmtpDeleteSubscriptionRequest:
+      oneOf:
+        - $ref: "#/components/schemas/XmtpNestedDeleteSubscriptionRequest"
+        - $ref: "#/components/schemas/XmtpFlatDeleteSubscriptionRequest"
+    MinimalXmtpDeliveryRequest:
+      type: object
+      required: [version, idempotencyKey, installationId, deliveryToken, topic, messageType, isSilent]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          const: 1
+        idempotencyKey:
+          type: string
+        installationId:
+          type: string
+        deliveryToken:
+          type: string
+        topic:
+          type: string
+        messageType:
+          type: string
+        shouldPush:
+          type: boolean
+        isSilent:
+          type: boolean
+    OfficialXmtpDeliveryRequest:
       type: object
       required: [idempotency_key, message, message_context, installation, subscription]
       additionalProperties: false
@@ -522,17 +661,15 @@ components:
         message:
           type: object
           required: [content_topic, message]
-          additionalProperties: false
           properties:
             content_topic:
               type: string
             message:
               type: string
-              description: Opaque encrypted envelope bytes encoded as base64; discarded by the Worker.
+              description: Transitional opaque encrypted envelope; discarded immediately.
         message_context:
           type: object
           required: [message_type]
-          additionalProperties: false
           properties:
             message_type:
               type: string
@@ -541,14 +678,12 @@ components:
         installation:
           type: object
           required: [id, delivery_mechanism, payload_format]
-          additionalProperties: false
           properties:
             id:
               type: string
             delivery_mechanism:
               type: object
               required: [kind, token]
-              additionalProperties: false
               properties:
                 kind:
                   type: string
@@ -560,7 +695,6 @@ components:
         subscription:
           type: object
           required: [created_at, topic, is_silent]
-          additionalProperties: false
           properties:
             created_at:
               type: string
@@ -574,26 +708,37 @@ components:
           enum: [unspecified, v3, v4]
         topicBytesB64:
           type: string
-    RegisterAppRequest:
+    XmtpDeliveryRequest:
+      oneOf:
+        - $ref: "#/components/schemas/MinimalXmtpDeliveryRequest"
+        - $ref: "#/components/schemas/OfficialXmtpDeliveryRequest"
+    SubscribeRequest:
       type: object
-      required: [name]
+      required: [endpoint, keys]
       additionalProperties: false
       properties:
-        name:
+        endpoint:
           type: string
+          format: uri
+        keys:
+          type: object
+          required: [p256dh, auth]
+          additionalProperties: false
+          properties:
+            p256dh:
+              type: string
+            auth:
+              type: string
+        expirationTime:
+          type: [number, "null"]
+        userId:
+          type: string
+          maxLength: 255
+        channelId:
+          type: string
+          maxLength: 255
         metadata:
           type: object
-    SubscribeRequest:
-      allOf:
-        - $ref: "#/components/schemas/PushSubscription"
-        - type: object
-          properties:
-            userId:
-              type: string
-            channelId:
-              type: string
-            metadata:
-              type: object
     SendNotificationRequest:
       type: object
       required: [payload]
@@ -602,7 +747,6 @@ components:
         payload:
           type: object
           required: [title]
-          additionalProperties: false
           properties:
             title:
               type: string

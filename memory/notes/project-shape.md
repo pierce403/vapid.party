@@ -2,12 +2,18 @@
 
 ## Current App
 
-- Cloudflare Worker project for a Web Push and XMTP-aware relay. Historical Next.js files are unbuilt reference only and are excluded from package scripts and dependencies.
-- App management uses wallet bearer auth; push subscription and send routes use `X-API-Key`.
+- Cloudflare-only Worker project for a Web Push and XMTP-aware relay, backed by
+  D1, Queue, and one custom Go XMTP listener Container. There is no supported
+  Vercel/Next or PostgreSQL runtime.
+- App provisioning is operator-only; generic app routes use `X-API-Key`,
+  Converge has a restricted public compatibility route, and listener control
+  plus delivery use separate bearer secrets.
 - Each app has its own VAPID keypair stored in D1.
 - `src/worker/schemas.ts` owns Zod request schemas; `src/worker/types.ts` owns shared Worker types.
 - `src/worker/db.ts` owns D1 row mapping, CRUD, subscription counts, and rate-limit logs.
 - `src/worker/push.ts`, `src/worker/core.ts`, and `src/worker/queue.ts` own Web Push delivery, XMTP targeting, expired-subscription cleanup, and queued delivery.
+- `infra/xmtp-listener/` owns the singleton production `SubscribeAll` listener;
+  its routing snapshot/cursor is supplied by D1 through authenticated Worker APIs.
 - `public/openapi.yaml`, `public/llms.txt`, and README examples are public API contract surfaces.
 
 ## Local Commands
