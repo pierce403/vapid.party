@@ -7,6 +7,8 @@ import {
 } from './listener-registry';
 import { handleQueue } from './queue';
 import type { Env, PushQueueJob } from './types';
+import { compactOperationalHistory } from './db';
+import { withStaticSecurityHeaders } from './security-headers';
 
 export { RelayCoordinator } from './relay-coordinator';
 export { XmtpListenerContainer } from './xmtp-listener-container';
@@ -21,7 +23,7 @@ export default {
     if (response) return response;
 
     if (env.ASSETS) {
-      return env.ASSETS.fetch(request);
+      return withStaticSecurityHeaders(await env.ASSETS.fetch(request));
     }
 
     return new Response('Not found', { status: 404 });
@@ -35,6 +37,7 @@ export default {
     try {
       await reconcileXmtpListenerDirtyRoutes(env.DB);
       await compactXmtpListenerChanges(env.DB);
+      await compactOperationalHistory(env.DB);
     } catch (error) {
       console.error(JSON.stringify({
         event: 'xmtp_listener_maintenance_failed',

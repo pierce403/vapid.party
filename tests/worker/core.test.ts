@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildXmtpPushPayload,
+  isAllowedPublicWebPushEndpoint,
   normalizeXmtpDelete,
   normalizeXmtpRegistration,
+  normalizePublicXmtpDelete,
+  normalizePublicXmtpRegistration,
   parseXmtpDelivery,
   registerXmtpSubscription,
   relayXmtpDelivery,
@@ -109,6 +112,11 @@ class MemoryRegistrationStore implements XmtpRegistrationStore {
       topicsRegistered: input.topics.length,
       hmacKeysRegistered: input.topics.reduce((count, topic) => count + topic.hmacKeys.length, 0),
       created: !current,
+      diagnostics: {
+        receipt: 'A'.repeat(43),
+        statusPath: '/api/xmtp/status' as const,
+        testPath: '/api/xmtp/status/test' as const,
+      },
     };
   }
 
@@ -143,6 +151,31 @@ class MemoryRelayStore implements XmtpRelayStore {
 }
 
 describe('Converge XMTP registration', () => {
+  it('accepts only known HTTPS browser Web Push provider endpoint shapes', () => {
+    for (const endpoint of [
+      'https://fcm.googleapis.com/fcm/send/opaque-token',
+      'https://fcm.googleapis.com/wp/opaque-token',
+      'https://updates.push.services.mozilla.com/wpush/v2/opaque-token',
+      'https://web.push.apple.com/opaque-token',
+      'https://cloud.notify.windows.com/?token=opaque-token',
+      'https://wns2-by3p.notify.windows.com/w/?token=opaque-token',
+    ]) expect(isAllowedPublicWebPushEndpoint(endpoint)).toBe(true);
+
+    for (const endpoint of [
+      'http://fcm.googleapis.com/fcm/send/token',
+      'https://fcm.googleapis.com:444/fcm/send/token',
+      'https://user:password@fcm.googleapis.com/fcm/send/token',
+      'https://fcm.googleapis.com.evil.example/fcm/send/token',
+      'https://updates.push.services.mozilla.com/other/token',
+      'https://push.apple.com/token',
+      'https://cloud.notify.windows.com/no-token',
+      'https://127.0.0.1/push',
+      'https://[::1]/push',
+      'https://localhost/push',
+      'https://example.com/push',
+    ]) expect(isAllowedPublicWebPushEndpoint(endpoint)).toBe(false);
+  });
+
   it('accepts the nested Converge payload, multiple epochs, and a welcome topic without HMAC', () => {
     const normalized = normalizeXmtpRegistration(nestedRegistration());
 
@@ -187,6 +220,88 @@ describe('Converge XMTP registration', () => {
       hmacKeys: [{ epoch: 'legacy', key: hmacKey }],
       conversationId: undefined,
     }]);
+  });
+
+  it('keeps the unauthenticated public compatibility contract strict', () => {
+    const nested = nestedRegistration();
+    expect(normalizePublicXmtpRegistration(nested)).toMatchObject({
+      inboxId,
+      installationId,
+    });
+    expect(() => normalizePublicXmtpRegistration({
+      endpoint: nested.subscription.endpoint,
+      keys: nested.subscription.keys,
+      inboxId,
+      installationId,
+      hmacKeys: { [groupTopic]: hmacKey },
+      preferences: nested.preferences,
+    })).toThrow();
+    expect(() => normalizePublicXmtpDelete({
+      endpoint: nested.subscription.endpoint,
+      inboxId,
+      installationId,
+    })).toThrow();
+  });
+
+  it('bounds public registration key size and aggregate D1 row cost', () => {
+    const nested = nestedRegistration();
+    expect(() => normalizePublicXmtpRegistration({
+      ...nested,
+      xmtp: {
+        ...nested.xmtp,
+        topics: [{
+          topic: groupTopic,
+          hmacKeys: [{ epoch: '7', key: 'A'.repeat(1025) }],
+        }],
+      },
+    })).toThrow();
+
+    const topics = Array.from({ length: 300 }, (_, index) => ({
+      topic: `/xmtp/mls/1/g-${index.toString(16).padStart(32, '0')}/proto`,
+      hmacKeys: [
+        { epoch: '7', key: hmacKey },
+        { epoch: '8', key: hmacKey },
+      ],
+    }));
+    expect(() => normalizePublicXmtpRegistration({
+      ...nested,
+      xmtp: { ...nested.xmtp, topics },
+    })).toThrow(/row count must not exceed 800/);
+
+    expect(() => normalizePublicXmtpRegistration({
+      ...nested,
+      subscription: {
+        ...nested.subscription,
+        endpoint: `https://fcm.googleapis.com/fcm/send/${'a'.repeat(4097)}`,
+      },
+    })).toThrow();
+
+    expect(() => normalizePublicXmtpRegistration({
+      ...nested,
+      subscription: {
+        ...nested.subscription,
+        keys: { ...nested.subscription.keys, auth: 'A'.repeat(23) },
+      },
+    })).toThrow(/exactly 16 bytes/);
+  });
+
+  it('accepts only uint32 HMAC epochs on the public contract', () => {
+    const nested = nestedRegistration();
+    const withEpoch = (epoch: string | number) => ({
+      ...nested,
+      xmtp: {
+        ...nested.xmtp,
+        topics: [{
+          topic: groupTopic,
+          hmacKeys: [{ epoch, key: hmacKey }],
+        }],
+      },
+    });
+    expect(normalizePublicXmtpRegistration(withEpoch('4294967295')).topics[0].hmacKeys[0].epoch)
+      .toBe('4294967295');
+    expect(() => normalizePublicXmtpRegistration(withEpoch('4294967296'))).toThrow(/uint32/);
+    expect(() => normalizePublicXmtpRegistration(withEpoch(4294967296))).toThrow();
+    expect(() => normalizePublicXmtpRegistration(withEpoch('0007'))).toThrow(/canonical uint32/);
   });
 
   it('rejects non-opaque handles and plaintext preview preferences', () => {
@@ -303,6 +418,7 @@ describe('Converge XMTP registration', () => {
 describe('official XMTP HTTP delivery', () => {
   const match: XmtpTopicMatch = {
     topicId: 'topic-1',
+    xmtpSubscriptionId: 'logical-1',
     subscriptionId: 'sub-1',
     appId: 'converge',
     installationId,

@@ -81,6 +81,7 @@ describe('app-scoped XMTP listener registry', () => {
       readFile(new URL('../../migrations/d1/0002_converge_push_contract.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0003_xmtp_listener_registry_expand.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql', import.meta.url), 'utf8'),
+      readFile(new URL('../../migrations/d1/0005_xmtp_diagnostics.sql', import.meta.url), 'utf8'),
     ]);
     for (const migration of migrations) {
       await applyMigration(db, migration);

@@ -132,6 +132,10 @@ describe('XMTP listener expand/contract migrations', () => {
       db,
       await loadMigration('../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql')
     );
+    await applyMigration(
+      db,
+      await loadMigration('../../migrations/d1/0005_xmtp_diagnostics.sql')
+    );
     expect((await db.prepare('PRAGMA foreign_key_check').all()).results).toEqual([]);
     expect(await db.prepare(`
       SELECT
@@ -139,12 +143,18 @@ describe('XMTP listener expand/contract migrations', () => {
         (SELECT COUNT(*) FROM xmtp_subscriptions) AS logical_count,
         (SELECT COUNT(*) FROM xmtp_topics) AS topic_count,
         (SELECT COUNT(*) FROM xmtp_topic_hmac_keys) AS hmac_count,
+        (SELECT COUNT(*) FROM pragma_table_info('xmtp_subscriptions')
+          WHERE name = 'diagnostic_token_hash') AS diagnostic_column_count,
+        (SELECT COUNT(*) FROM pragma_table_info('delivery_attempts')
+          WHERE name = 'xmtp_subscription_id') AS attempt_registration_column_count,
         (SELECT xmtp_topic_id FROM delivery_attempts WHERE id = 'attempt-1') AS attempt_topic
     `).first()).toEqual({
       identity_count: 1,
       logical_count: 1,
       topic_count: 1,
       hmac_count: 1,
+      diagnostic_column_count: 1,
+      attempt_registration_column_count: 1,
       attempt_topic: 'topic-1',
     });
 

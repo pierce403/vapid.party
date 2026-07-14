@@ -38,6 +38,9 @@ interface ConsumerRow {
   error_code: string | null;
   observed_at: string;
   updated_at: string;
+  stream_connected_at: string | null;
+  last_envelope_at: string | null;
+  last_control_sync_at: string | null;
 }
 
 interface SnapshotPageToken {
@@ -75,6 +78,8 @@ export interface XmtpListenerHealth {
     configured: boolean;
     status: 'ready' | 'not_ready' | 'not_configured' | 'unknown';
     lastCheckedAt?: string;
+    streamConnectedAt?: string;
+    lastEnvelopeAt?: string;
   };
   bridge: {
     status: 'synced' | 'pending' | 'failed' | 'not_configured';
@@ -492,7 +497,9 @@ export async function getXmtpListenerHealth(
   const [latest, consumer, invalidRoutes, dirtyRoutes] = await Promise.all([
     getLatestSequence(db),
     db.prepare(`
-      SELECT ready, cursor, error_code, observed_at, updated_at
+      SELECT
+        ready, cursor, error_code, observed_at, updated_at,
+        stream_connected_at, last_envelope_at, last_control_sync_at
       FROM xmtp_listener_consumers
       ORDER BY updated_at DESC
       LIMIT 1
@@ -548,12 +555,16 @@ export async function getXmtpListenerHealth(
       configured: true,
       status: listenerStatus,
       lastCheckedAt: consumer?.updated_at,
+      streamConnectedAt: consumer?.stream_connected_at ?? undefined,
+      lastEnvelopeAt: consumer?.last_envelope_at ?? undefined,
     },
     bridge: {
       status: bridgeStatus,
       pendingRegistrationCount: pendingCount,
       failedRegistrationCount: failedCount,
-      lastSuccessfulSyncAt: deliveryReady ? consumer?.updated_at : undefined,
+      lastSuccessfulSyncAt: deliveryReady
+        ? consumer?.last_control_sync_at ?? consumer?.updated_at
+        : undefined,
     },
   };
 }

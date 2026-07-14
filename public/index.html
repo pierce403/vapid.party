@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#081119" />
+    <meta
+      name="description"
+      content="vapid.party is a Cloudflare-only XMTP and Web Push relay that delivers minimal, privacy-preserving activity hints."
+    />
+    <meta property="og:title" content="vapid.party | XMTP to Web Push relay" />
+    <meta
+      property="og:description"
+      content="Cloudflare-only delivery infrastructure for minimal XMTP activity hints."
+    />
+    <meta property="og:image" content="https://vapid.party/relay-network.webp" />
+    <meta property="og:type" content="website" />
+    <title>vapid.party | XMTP to Web Push relay</title>
+    <link rel="stylesheet" href="/site.css" />
+  </head>
+  <body>
+    <header class="hero">
+      <img
+        class="hero-art"
+        src="/relay-network.webp"
+        alt=""
+        width="1600"
+        height="760"
+        fetchpriority="high"
+      />
+      <div class="hero-shade" aria-hidden="true"></div>
+
+      <nav class="site-nav shell" aria-label="Primary navigation">
+        <a class="brand" href="/">vapid<span>.</span>party</a>
+        <div class="nav-links">
+          <a href="/openapi.yaml">OpenAPI</a>
+          <a class="nav-llms" href="/llms.txt">LLMs</a>
+          <a href="https://github.com/pierce403/vapid.party" rel="noreferrer">GitHub</a>
+        </div>
+      </nav>
+
+      <div class="hero-body shell">
+        <div class="hero-copy">
+          <p class="eyebrow">XMTP &rarr; Web Push</p>
+          <h1>vapid.party</h1>
+          <p class="lede">
+            A Cloudflare-only relay that turns live XMTP events into minimal Web Push
+            hints, without putting message content in the delivery path.
+          </p>
+        </div>
+      </div>
+
+      <section
+        class="status-rail shell"
+        data-state="checking"
+        aria-labelledby="relay-status-title"
+        aria-live="polite"
+      >
+        <div class="status-head">
+          <p class="status-title" id="relay-status-title">
+            <span class="status-indicator" aria-hidden="true"></span>
+            <span data-overall>Checking relay status</span>
+          </p>
+          <button
+            class="refresh-button"
+            type="button"
+            aria-label="Refresh relay status"
+            title="Refresh relay status"
+            data-refresh
+          >
+            <span aria-hidden="true">&#8635;</span>
+          </button>
+        </div>
+        <div class="status-grid">
+          <div class="status-item">
+            <span class="status-label">Delivery path</span>
+            <span class="status-value" data-delivery>Checking</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">XMTP listener</span>
+            <span class="status-value" data-listener>Checking</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Route bridge</span>
+            <span class="status-value" data-bridge>Checking</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Health checked</span>
+            <span class="status-value" data-checked>Waiting</span>
+          </div>
+        </div>
+      </section>
+    </header>
+
+    <main>
+      <section class="pipeline shell" aria-labelledby="pipeline-title">
+        <div class="section-intro">
+          <div>
+            <p class="section-kicker">Delivery pipeline</p>
+            <h2 id="pipeline-title">One small signal across a focused path.</h2>
+          </div>
+          <p class="section-summary">
+            vapid.party keeps XMTP matching, app routing, and browser delivery inside
+            a Cloudflare Worker, D1, Queue, and singleton Container deployment.
+          </p>
+        </div>
+
+        <div class="pipeline-grid">
+          <article class="pipeline-step">
+            <span class="step-number">01 / Listen</span>
+            <h3>Follow the live XMTP stream</h3>
+            <p>A singleton Container receives production XMTP v3 events as they arrive.</p>
+          </article>
+          <article class="pipeline-step">
+            <span class="step-number">02 / Match</span>
+            <h3>Resolve an app-scoped route</h3>
+            <p>Topic HMAC epochs and sender suppression decide whether an alert should move.</p>
+          </article>
+          <article class="pipeline-step">
+            <span class="step-number">03 / Deliver</span>
+            <h3>Queue a minimal Web Push hint</h3>
+            <p>The browser receives opaque activity, then the XMTP client performs authoritative sync.</p>
+          </article>
+        </div>
+
+        <aside class="reliability-note" aria-label="Delivery limitation">
+          <strong>Experimental</strong>
+          <p>
+            XMTP SubscribeAll has no durable replay cursor. A listener restart or disconnect can
+            miss a push hint; the receiving XMTP inbox remains the source of truth.
+          </p>
+        </aside>
+
+        <section class="troubleshoot" aria-labelledby="trace-title">
+          <div>
+            <p class="section-kicker">Missing an alert?</p>
+            <h3 id="trace-title">Trace the path in order.</h3>
+          </div>
+          <ol class="trace-list">
+            <li>
+              <strong>Confirm global ingestion.</strong>
+              The live rail should show both the XMTP listener ready and route bridge synced.
+            </li>
+            <li>
+              <strong>Confirm actual XMTP matching.</strong>
+              In the client app, compare registered topics and HMAC epochs, then check its last
+              XMTP match. Global health cannot prove one app route matched.
+            </li>
+            <li>
+              <strong>Confirm provider delivery separately.</strong>
+              A diagnostic canary proves the Web Push provider and browser path only; it does not
+              prove that a real XMTP message matched the registration.
+            </li>
+          </ol>
+        </section>
+      </section>
+
+      <section class="privacy" aria-labelledby="privacy-title">
+        <div class="privacy-layout shell">
+          <div>
+            <p class="section-kicker">Privacy boundary</p>
+            <h2 id="privacy-title">Signals, not messages.</h2>
+            <p class="privacy-copy">
+              The listener matches encrypted event metadata inside the Container. The delivery
+              pipeline carries only the minimum opaque activity hint needed to wake the right app.
+            </p>
+          </div>
+          <ul class="privacy-list">
+            <li>No message text, preview, or sender name</li>
+            <li>No conversation ID or attachment URL</li>
+            <li>No XMTP ciphertext in Queue or Web Push payloads</li>
+            <li>App and installation routes stay isolated</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="resources shell" aria-labelledby="resources-title">
+        <div>
+          <p class="section-kicker">Build against the contract</p>
+          <h2 id="resources-title">Public specs, plain text.</h2>
+        </div>
+        <div class="resource-links">
+          <a class="resource-link" href="/openapi.yaml">OpenAPI specification</a>
+          <a class="resource-link" href="/llms.txt">LLM reference</a>
+          <a
+            class="resource-link"
+            href="https://github.com/pierce403/vapid.party"
+            rel="noreferrer"
+          >GitHub source</a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="footer-inner shell">
+        <p>Cloudflare-only XMTP alert infrastructure.</p>
+        <p><a href="/api/health">Raw health JSON</a></p>
+      </div>
+    </footer>
+
+    <script src="/site.js" defer></script>
+  </body>
+</html>

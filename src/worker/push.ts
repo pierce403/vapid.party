@@ -13,14 +13,12 @@ export async function sendWebPush(
   app: AppRecord,
   subscription: SubscriptionRecord,
   payload: Record<string, unknown>,
-  options: { vapidSubject?: string } = {}
+  options: {
+    vapidSubject?: string;
+    ttl?: number;
+    urgency?: 'very-low' | 'low' | 'normal' | 'high';
+  } = {}
 ): Promise<WebPushResult> {
-  webPush.setVapidDetails(
-    options.vapidSubject || 'mailto:admin@vapid.party',
-    app.vapidPublicKey,
-    app.vapidPrivateKey
-  );
-
   try {
     const result = await webPush.sendNotification(
       {
@@ -32,8 +30,13 @@ export async function sendWebPush(
       },
       JSON.stringify(payload),
       {
-        TTL: 86400,
-        urgency: 'normal',
+        TTL: options.ttl ?? 86400,
+        urgency: options.urgency ?? 'normal',
+        vapidDetails: {
+          subject: options.vapidSubject || 'mailto:admin@vapid.party',
+          publicKey: app.vapidPublicKey,
+          privateKey: app.vapidPrivateKey,
+        },
       }
     );
 

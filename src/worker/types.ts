@@ -36,6 +36,7 @@ export interface SubscriptionRecord {
 
 export interface XmtpTopicMatch {
   topicId: string;
+  xmtpSubscriptionId: string;
   subscriptionId: string;
   appId: string;
   installationId: string;
@@ -53,7 +54,7 @@ export interface PushQueueJob {
   appId: string;
   subscriptionId: string;
   payload: PushPayload;
-  source: 'generic' | 'xmtp';
+  source: 'generic' | 'xmtp' | 'diagnostic';
 }
 
 export interface Env {

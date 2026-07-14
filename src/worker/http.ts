@@ -12,6 +12,8 @@ export const ERROR_CODES = {
   APP_NOT_FOUND: 'APP_NOT_FOUND',
   PUSH_FAILED: 'PUSH_FAILED',
   NOT_CONFIGURED: 'NOT_CONFIGURED',
+  CONFLICT: 'CONFLICT',
+  PAYLOAD_TOO_LARGE: 'PAYLOAD_TOO_LARGE',
 } as const;
 
 export type ErrorCode = typeof ERROR_CODES[keyof typeof ERROR_CODES];
@@ -20,7 +22,7 @@ export function corsHeaders(): HeadersInit {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, X-Internal-Token',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, X-Internal-Token, X-Vapid-Party-Diagnostics',
   };
 }
 
@@ -87,6 +89,45 @@ export async function readJson(request: Request): Promise<unknown> {
     return await request.json();
   } catch {
     return null;
+  }
+}
+
+export class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super('Request body is too large');
+    this.name = 'RequestBodyTooLargeError';
+  }
+}
+
+export async function readJsonBounded(request: Request, maxBytes: number): Promise<unknown> {
+  const contentLength = Number(request.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new RequestBodyTooLargeError();
+  }
+  if (!request.body) return null;
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        await reader.cancel();
+        throw new RequestBodyTooLargeError();
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return JSON.parse(text);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) throw error;
+    return null;
+  } finally {
+    reader.releaseLock();
   }
 }
 

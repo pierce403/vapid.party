@@ -16,7 +16,8 @@ Properties:
   `infra/xmtp-listener`.
 - Wrangler configuration lives in `wrangler.jsonc`.
 - Production is served at `https://vapid.party` and the Worker development URL.
-- D1 migrations 0001 through 0004 are applied in production.
+- D1 migrations 0001 through 0004 are applied in production; migration 0005
+  adds management receipts and route diagnostics for the next Worker rollout.
 - Node.js 22 or newer is required by the pinned Wrangler toolchain.
 
 Test Criteria:
@@ -43,10 +44,16 @@ Properties:
 - Two apps can register the same installation and topic without sharing HMAC
   keys, sender-suppression state, VAPID keys, or delivery authorization.
 - One physical browser endpoint may back several logical inbox registrations.
+- Exactly one logical registration is active per app/inbox/installation.
+- An active physical endpoint's `p256dh`/`auth` tuple is immutable across every
+  logical route that shares it.
 - Removing one logical registration removes that inbox's topics and HMAC keys.
   The endpoint and Web Push keys are removed after the last logical user leaves.
 - Versioned dirty markers repair interrupted multi-statement registration
   mutations. Tombstones remain until active listeners have consumed them.
+- Topic/HMAC snapshot replacement is a transactional D1 batch. The complete
+  registration mutation spans several statements and is repaired by dirty-route
+  reconciliation; it is not claimed to be one atomic transaction.
 - Group topics are `/xmtp/mls/1/g-<32 hex>/proto` for a 16-byte group id.
   Welcome topics are `/xmtp/mls/1/w-<64 hex>/proto` for a 32-byte installation id.
 
@@ -69,6 +76,8 @@ Routes:
 - `GET /api/xmtp/vapid-public-key`
 - `POST /api/xmtp/subscriptions`
 - `DELETE /api/xmtp/subscriptions`
+- `POST /api/xmtp/status`
+- `POST /api/xmtp/status/test`
 
 Properties:
 - Version 1 requires `app.id: "converge.cv"`; it cannot enroll another app.
@@ -76,14 +85,31 @@ Properties:
   ids, canonical XMTP topics, all current HMAC epochs, and an opaque
   `inboxHandle`.
 - `minimalPayloadOnly` must be true and `plaintextPreview` must be false.
-- Repeated registration is idempotent for endpoint, inbox, and installation.
-- A legacy flattened request remains accepted for older Converge clients.
+- Only strict nested version-1 registration/deletion bodies are accepted.
+- Provider endpoints are limited to canonical HTTPS FCM, Mozilla, Apple, and
+  WNS Web Push shapes.
+- Registrations allow at most 400 topics, 800 combined topic/HMAC rows, 1024
+  characters per base64 key, and uint32 HMAC epochs.
+- `X-Vapid-Party-Diagnostics: 1` opts into a no-store management receipt. Only
+  its hash is stored; a valid bearer receipt is required for endpoint replacement
+  and post-bootstrap deletion.
+- Endpoint replacement preserves the valid receipt so retries after a lost
+  response are idempotent. Exact endpoint/key refresh can bootstrap or recover
+  a receipt for compatibility with deployed clients.
+- Status is receipt-scoped and secret-free. Diagnostic tests use a minimal
+  short-lived payload; provider acceptance does not prove browser display.
+- The unsigned first claim is not XMTP ownership proof and can be squatted for
+  denial of service. This is a Converge-only compatibility path, not a general
+  multi-tenant enrollment mechanism.
 
 Test Criteria:
 - [x] Public routes do not require `X-API-Key`
 - [x] Another app id and plaintext preview preferences are rejected
 - [x] Multiple HMAC epochs and no-HMAC welcome topics are accepted
 - [x] Shared endpoints survive one logical inbox deletion
+- [x] Legacy/oversized payloads mutate no protected registration state
+- [x] Receipt bootstrap, replacement retry, deletion, and terminal cleanup
+- [x] Concurrent first claims cannot rewrite a shared endpoint key tuple
 
 ## Authenticated App APIs
 

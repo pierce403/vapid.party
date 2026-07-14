@@ -74,6 +74,19 @@ These instructions apply to the entire repository.
   prohibit a localhost socket must run it with the required process permission.
 - Explicit Converge unsubscribe deletes inbox topic/HMAC material immediately;
   it keeps a physical endpoint only while another active logical inbox shares it.
+- Public Converge registration accepts only strict nested version 1. Keep the
+  FCM/Mozilla/Apple/WNS endpoint allowlist, 400-topic/800-row cost ceiling,
+  1024-character key bound, and uint32 epoch bound aligned across Zod, OpenAPI,
+  README, FEATURES, and `public/llms.txt`.
+- A diagnostic receipt is a 256-bit bearer management capability whose raw
+  value is returned only in a no-store response and never persisted or logged.
+  Valid receipts survive endpoint replacement for lost-response retry safety.
+- Public first claim is not signed XMTP ownership proof and retains a bounded
+  route-squatting denial-of-service risk. Never present this Converge-only
+  compatibility route as a general multi-tenant enrollment API.
+- Topic replacement is a transactional D1 batch, but the entire registration
+  mutation is not atomic. Preserve dirty-route repair and do not document
+  stronger guarantees.
 - XMTP listener routes are keyed by `(appId, installationId)`. Never union HMAC
   keys or fan out registrations across apps, even for a shared installation or
   topic. Listener-to-Worker delivery is a minimal authenticated hint and must

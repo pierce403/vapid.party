@@ -34,11 +34,14 @@ Public Converge XMTP routes:
 - GET /api/xmtp/vapid-public-key
 - POST /api/xmtp/subscriptions
 - DELETE /api/xmtp/subscriptions
+- POST /api/xmtp/status
+- POST /api/xmtp/status/test
 
 Converge registration:
 - No client secret or X-API-Key.
 - Version is 1 and app.id must be `converge.cv`.
-- Identity contains a 64-hex inboxId, 64-hex installationId, and optional address.
+- Identity contains a 64-hex inboxId and 64-hex installationId. An optional
+  address is accepted for wire compatibility but is not needed for routing.
 - Subscription is a standard browser PushSubscription.
 - Group topics are `/xmtp/mls/1/g-<32 lowercase hex>/proto` and require HMAC keys.
 - Welcome topic is `/xmtp/mls/1/w-<64 lowercase hex>/proto` and has no HMAC key.
@@ -47,7 +50,25 @@ Converge registration:
   display name or raw inbox id.
 - preferences.minimalPayloadOnly must be true.
 - preferences.plaintextPreview must be false.
-- Re-registration is idempotent for endpoint, inbox, and installation.
+- Only the strict nested version-1 body is public; flattened legacy bodies fail.
+- Browser endpoints are restricted to canonical HTTPS FCM, Mozilla autopush,
+  Apple Web Push, and WNS shapes.
+- Maximums: 400 topics, 800 combined topic/HMAC rows, 1024 characters per
+  base64 key, uint32 epochs. The max row contract assumes paid D1 limits.
+- One active logical route exists per app/inbox/installation. Active endpoint
+  p256dh/auth keys are immutable, though several logical routes can share them.
+- Send X-Vapid-Party-Diagnostics: 1 to receive a random 256-bit management
+  receipt in the no-store response. The server stores only its hash.
+- Send the receipt only as Authorization: Bearer. Endpoint replacement and
+  post-bootstrap deletion require it; replacement preserves it for safe retry.
+- Exact endpoint/key refresh can bootstrap or recover a receipt for deployed
+  client compatibility.
+- POST /api/xmtp/status has an empty body and returns secret-free route coverage,
+  listener/bridge readiness, and delivery stages.
+- POST /api/xmtp/status/test queues only `{type:"vapid.diagnostic",testId}`.
+  `sent` means provider accepted, not that the browser displayed it.
+- First public claim is not signed XMTP ownership proof and can be squatted for
+  denial of service. This route is Converge-only, not general app enrollment.
 
 Authenticated app routes:
 - Pre-provisioned apps use X-API-Key.

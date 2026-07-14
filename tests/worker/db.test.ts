@@ -67,6 +67,8 @@ describe('D1 XMTP unsubscribe cleanup', () => {
       readFile(new URL('../../migrations/d1/0001_cloudflare_relay.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0002_converge_push_contract.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0003_xmtp_listener_registry_expand.sql', import.meta.url), 'utf8'),
+      readFile(new URL('../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql', import.meta.url), 'utf8'),
+      readFile(new URL('../../migrations/d1/0005_xmtp_diagnostics.sql', import.meta.url), 'utf8'),
     ]);
     for (const migration of migrations) {
       await applyMigration(db, migration);
@@ -155,7 +157,7 @@ describe('D1 XMTP unsubscribe cleanup', () => {
     });
   });
 
-  it('deletes XMTP identity material safely during the 0003 expansion phase', async () => {
+  it('deletes XMTP identity and diagnostic material safely', async () => {
     await store.upsertRegistration(registration('inbox-1', 'aabb', 'opaque_inbox_1'));
 
     expect(await deleteApp(db, 'converge')).toBe(true);

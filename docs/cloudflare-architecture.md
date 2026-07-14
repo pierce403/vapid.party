@@ -43,16 +43,41 @@ The listener's routing key is `(appId, installationId)`. Each route owns an
 opaque delivery token and independent topic/HMAC set. Sharing an installation,
 topic, or physical Web Push endpoint across apps must not merge routes.
 
-Converge uses three restricted public compatibility routes:
+Converge uses five restricted public compatibility routes:
 
 - `GET /api/xmtp/vapid-public-key`
 - `POST /api/xmtp/subscriptions`
 - `DELETE /api/xmtp/subscriptions`
+- `POST /api/xmtp/status`
+- `POST /api/xmtp/status/test`
 
 The public request must declare `app.id: "converge.cv"`; it cannot create or
 select any other app. Pre-provisioned apps use `X-API-Key` with the generic
 routes, including `/api/xmtp/registrations`. App provisioning and key rotation
 are operator-only. The former unsigned wallet-admin endpoints are removed.
+
+Public registration accepts only the canonical nested version-1 contract and
+known HTTPS browser push-provider endpoint shapes. It enforces one active route
+per app/inbox/installation, an immutable endpoint/key tuple, 400 topics, 800
+combined topic/HMAC rows, 1024-character key fields, and uint32 epochs. The
+maximum row contract assumes the paid D1 invocation query allowance.
+Shared physical endpoint rows contain only push delivery material and a source
+marker; inbox ids, installation ids, and optional legacy addresses remain out
+of their user/channel/metadata fields.
+
+A client can opt into a random 256-bit bearer management receipt. Only its hash
+is stored. Exact endpoint/key refresh can bootstrap or recover it; endpoint
+replacement and deletion require it after bootstrap. Replacement preserves the
+valid receipt so a response-loss retry cannot strand the client. Status and a
+minimal test push are available only with that bearer capability.
+
+The first public claim is not signed by the XMTP installation and therefore is
+not an ownership proof. Route squatting remains a denial-of-service boundary
+requiring operator recovery. General apps must use the API-key contract.
+
+Topic snapshot replacement uses a transactional D1 batch. Identity,
+subscription, snapshot, listener outbox, and final logical-route updates are a
+multi-statement mutation; versioned dirty markers reconcile interruptions.
 
 ## Privacy Boundary
 

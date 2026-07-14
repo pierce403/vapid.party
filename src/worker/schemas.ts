@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { base64UrlToBytes, normalizeBase64Url } from './encoding';
 
-const Base64OrBase64UrlString = z.string().min(1).transform((value, ctx) => {
+const Base64OrBase64UrlString = z.string().min(1).max(1024).transform((value, ctx) => {
   const normalized = normalizeBase64Url(value);
   if (!normalized) {
     ctx.addIssue({
@@ -25,15 +25,16 @@ const P256dhKey = Base64OrBase64UrlString.superRefine((value, ctx) => {
 
 const AuthKey = Base64OrBase64UrlString.superRefine((value, ctx) => {
   const bytes = base64UrlToBytes(value);
-  if (!bytes || bytes.length < 16) {
+  if (!bytes || bytes.length !== 16) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'keys.auth must decode to at least 16 bytes',
+      message: 'keys.auth must decode to exactly 16 bytes',
     });
   }
 });
 
 const AbsoluteUrl = z.string().url();
+const WebPushEndpoint = z.string().url().max(4096);
 const AbsoluteUrlOrPath = z.union([
   AbsoluteUrl,
   z.string().refine((value) => value.startsWith('/'), {
@@ -65,7 +66,7 @@ export const UpdateAppSchema = z.object({
 }).strict();
 
 export const PushSubscriptionSchema = z.object({
-  endpoint: z.string().url(),
+  endpoint: WebPushEndpoint,
   keys: z.object({
     p256dh: P256dhKey,
     auth: AuthKey,
@@ -108,8 +109,10 @@ export const XmtpPreferencesSchema = z.object({
 }).strict();
 
 const XmtpEpochSchema = z.union([
-  z.string().regex(/^\d+$/, 'epoch must be a non-negative integer string'),
-  z.number().int().nonnegative().safe(),
+  z.string()
+    .regex(/^(?:0|[1-9]\d{0,9})$/, 'epoch must be a canonical uint32 string')
+    .refine((value) => Number(value) <= 0xffff_ffff, 'epoch must not exceed uint32'),
+  z.number().int().min(0).max(0xffff_ffff),
 ]).transform((value) => String(value));
 
 export const XmtpHmacKeySchema = z.object({
@@ -206,7 +209,7 @@ const XmtpNestedTopicSchema = z.object({
   }
 });
 
-const XmtpNestedSubscriptionRequestSchema = z.object({
+const XmtpNestedSubscriptionRequestObjectSchema = z.object({
   version: z.literal(1),
   app: z.object({
     id: z.literal('converge.cv'),
@@ -220,7 +223,7 @@ const XmtpNestedSubscriptionRequestSchema = z.object({
   subscription: PushSubscriptionSchema,
   xmtp: z.object({
     env: z.literal('production'),
-    topics: z.array(XmtpNestedTopicSchema).min(1).max(2000),
+    topics: z.array(XmtpNestedTopicSchema).min(1).max(400),
     topicSource: z.literal('conversations.hmacKeys'),
   }).strict(),
   notification: z.object({
@@ -231,27 +234,49 @@ const XmtpNestedSubscriptionRequestSchema = z.object({
   registeredAt: z.string().datetime({ offset: true }),
 }).strict();
 
-export const GenericXmtpSubscriptionRequestSchema = XmtpNestedSubscriptionRequestSchema
-  .omit({ app: true });
+function validateXmtpRegistrationCost(
+  value: { xmtp: { topics: Array<{ hmacKeys: unknown[] }> } },
+  ctx: z.RefinementCtx
+): void {
+  const persistedRowCount = value.xmtp.topics.reduce(
+    (count, topic) => count + 1 + topic.hmacKeys.length,
+    0
+  );
+  if (persistedRowCount > 800) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['xmtp', 'topics'],
+      message: 'topic and HMAC-key row count must not exceed 800',
+    });
+  }
+}
+
+export const XmtpPublicSubscriptionRequestSchema =
+  XmtpNestedSubscriptionRequestObjectSchema.superRefine(validateXmtpRegistrationCost);
+
+export const GenericXmtpSubscriptionRequestSchema =
+  XmtpNestedSubscriptionRequestObjectSchema
+    .omit({ app: true })
+    .superRefine(validateXmtpRegistrationCost);
 
 export const XmtpSubscriptionRequestSchema = z.union([
-  XmtpNestedSubscriptionRequestSchema,
+  XmtpPublicSubscriptionRequestSchema,
   XmtpLegacySubscriptionRequestSchema,
 ]);
 
 const XmtpFlatDeleteSubscriptionRequestSchema = z.object({
-  endpoint: z.string().url(),
+  endpoint: WebPushEndpoint,
   inboxId: z.string().min(1).max(255),
   installationId: z.string().min(1).max(255),
 }).strict();
 
-const XmtpNestedDeleteSubscriptionRequestSchema = z.object({
+export const XmtpPublicDeleteSubscriptionRequestSchema = z.object({
   version: z.literal(1),
   app: z.object({
     id: z.literal('converge.cv'),
     origin: z.string().url().optional(),
   }).strict(),
-  endpoint: z.string().url(),
+  endpoint: WebPushEndpoint,
   identity: z.object({
     inboxId: XmtpHex32Schema,
     installationId: XmtpHex32Schema,
@@ -260,11 +285,11 @@ const XmtpNestedDeleteSubscriptionRequestSchema = z.object({
   deletedAt: z.string().datetime({ offset: true }),
 }).strict();
 
-export const GenericXmtpDeleteSubscriptionRequestSchema = XmtpNestedDeleteSubscriptionRequestSchema
+export const GenericXmtpDeleteSubscriptionRequestSchema = XmtpPublicDeleteSubscriptionRequestSchema
   .omit({ app: true });
 
 export const XmtpDeleteSubscriptionRequestSchema = z.union([
-  XmtpNestedDeleteSubscriptionRequestSchema,
+  XmtpPublicDeleteSubscriptionRequestSchema,
   XmtpFlatDeleteSubscriptionRequestSchema,
 ]);
 

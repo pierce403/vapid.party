@@ -46,9 +46,23 @@ paths:
       tags: [Converge XMTP]
       summary: Register or update a Converge XMTP push subscription
       description: |
-        Restricted public endpoint. Version 1 requires app.id=converge.cv and
-        is idempotent for push endpoint, inboxId, and installationId.
-      security: []
+        Converge-only compatibility endpoint. It accepts only strict nested
+        version 1 with app.id=converge.cv and known browser Web Push provider
+        endpoints. Send X-Vapid-Party-Diagnostics: 1 to receive a bearer
+        management receipt in the no-store response. Exact endpoint/key refresh
+        can bootstrap a receipt; endpoint replacement requires and preserves a
+        current receipt. The unsigned first claim is not XMTP ownership proof.
+      security:
+        - {}
+        - DiagnosticBearerAuth: []
+      parameters:
+        - in: header
+          name: X-Vapid-Party-Diagnostics
+          required: false
+          schema:
+            type: string
+            const: "1"
+          description: Opt into a receipt-scoped diagnostic capability.
       requestBody:
         required: true
         content:
@@ -70,10 +84,21 @@ paths:
                 $ref: "#/components/schemas/XmtpSubscriptionResponse"
         "422":
           description: Validation error
+        "409":
+          description: Existing route or endpoint capability conflict
+        "413":
+          description: Request body exceeds 2,000,000 bytes
+        "429":
+          description: Registration rate limit exceeded
     delete:
       tags: [Converge XMTP]
       summary: Disable one Converge logical XMTP registration
-      security: []
+      description: |
+        Once a management receipt exists, deletion requires it. A legacy route
+        with no receipt may delete only its exact endpoint.
+      security:
+        - {}
+        - DiagnosticBearerAuth: []
       requestBody:
         required: true
         content:
@@ -83,6 +108,58 @@ paths:
       responses:
         "200":
           description: Disabled or already absent
+        "409":
+          description: Current management receipt required
+        "413":
+          description: Request body exceeds 2,000,000 bytes
+        "429":
+          description: Mutation attempt rate limit exceeded
+  /api/xmtp/status:
+    post:
+      tags: [Converge XMTP]
+      summary: Inspect one private XMTP push route
+      description: |
+        Empty-body request scoped by a 256-bit bearer receipt. Returns only
+        coarse registration coverage, route synchronization, pipeline readiness,
+        and latest delivery stages. No identity, endpoint, topic, HMAC, receipt,
+        or message content is returned.
+      security:
+        - DiagnosticBearerAuth: []
+      responses:
+        "200":
+          description: Receipt-scoped diagnostic status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XmtpDiagnosticStatusResponse"
+        "401":
+          description: Missing or malformed receipt
+        "404":
+          description: Receipt is not active
+        "429":
+          description: Lookup rate limit exceeded
+  /api/xmtp/status/test:
+    post:
+      tags: [Converge XMTP]
+      summary: Queue one minimal diagnostic Web Push
+      description: |
+        Queues only {type:"vapid.diagnostic",testId}. A later sent status means
+        provider accepted, not that the browser or OS displayed a notification.
+      security:
+        - DiagnosticBearerAuth: []
+      responses:
+        "202":
+          description: Minimal diagnostic push queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XmtpDiagnosticTestResponse"
+        "401":
+          description: Missing or malformed receipt
+        "404":
+          description: Receipt is not active
+        "429":
+          description: Diagnostic test rate limit exceeded
   /api/xmtp/registrations:
     post:
       tags: [App XMTP]
@@ -208,6 +285,11 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
+    DiagnosticBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-256-bit-capability
+      description: Receipt returned by an opted-in Converge registration.
     InternalBearerAuth:
       type: http
       scheme: bearer
@@ -305,6 +387,8 @@ components:
         endpoint:
           type: string
           format: uri
+          maxLength: 4096
+          description: Canonical HTTPS FCM, Mozilla autopush, Apple Web Push, or WNS endpoint.
         keys:
           type: object
           required: [p256dh, auth]
@@ -312,8 +396,12 @@ components:
           properties:
             p256dh:
               type: string
+              maxLength: 1024
+              description: Base64/base64url uncompressed P-256 public key; decodes to exactly 65 bytes.
             auth:
               type: string
+              maxLength: 1024
+              description: Base64/base64url Web Push authentication secret; decodes to exactly 16 bytes.
         expirationTime:
           type: [number, "null"]
     XmtpPreferences:
@@ -348,11 +436,14 @@ components:
         epoch:
           oneOf:
             - type: string
-              pattern: '^\d+$'
+              pattern: '^(0|[1-9]\d{0,9})$'
+              maxLength: 10
             - type: integer
               minimum: 0
+              maximum: 4294967295
         key:
           type: string
+          maxLength: 1024
     XmtpTopic:
       type: object
       required: [topic, hmacKeys]
@@ -386,9 +477,10 @@ components:
             topics:
               type: array
               minItems: 1
-              maxItems: 2000
+              maxItems: 400
               items:
                 $ref: "#/components/schemas/XmtpTopic"
+              description: Topics plus all HMAC entries must total at most 800 persisted rows.
             topicSource:
               type: string
               const: conversations.hmacKeys
@@ -438,116 +530,8 @@ components:
                   format: uri
         - $ref: "#/components/schemas/XmtpBody"
       unevaluatedProperties: false
-    XmtpLegacyTopic:
-      type: object
-      required: [topic]
-      additionalProperties: false
-      properties:
-        topic:
-          type: string
-          minLength: 1
-          maxLength: 512
-        hmacKey:
-          type: string
-          minLength: 1
-        hmacKeys:
-          type: array
-          maxItems: 16
-          items:
-            $ref: "#/components/schemas/XmtpHmacKey"
-        algorithm:
-          type: string
-          enum: [hmac-sha256, sha256]
-          default: hmac-sha256
-        conversationId:
-          type: string
-          minLength: 1
-          maxLength: 255
-    XmtpLegacyHmacKeys:
-      oneOf:
-        - type: array
-          items:
-            $ref: "#/components/schemas/XmtpLegacyTopic"
-        - type: object
-          additionalProperties:
-            oneOf:
-              - type: string
-                minLength: 1
-              - type: object
-                required: [hmacKey]
-                additionalProperties: false
-                properties:
-                  hmacKey:
-                    type: string
-                    minLength: 1
-                  algorithm:
-                    type: string
-                    enum: [hmac-sha256, sha256]
-                    default: hmac-sha256
-                  conversationId:
-                    type: string
-                    minLength: 1
-                    maxLength: 255
-    XmtpLegacySubscriptionRequest:
-      type: object
-      required: [inboxId, installationId, preferences]
-      description: Transitional flattened Converge request; new clients use version 1.
-      additionalProperties: false
-      allOf:
-        - anyOf:
-            - required: [subscription]
-            - required: [endpoint, keys]
-        - anyOf:
-            - required: [topics]
-            - required: [hmacKeys]
-      properties:
-        subscription:
-          $ref: "#/components/schemas/PushSubscription"
-        endpoint:
-          type: string
-          format: uri
-        keys:
-          type: object
-          required: [p256dh, auth]
-          additionalProperties: false
-          properties:
-            p256dh:
-              type: string
-              minLength: 1
-            auth:
-              type: string
-              minLength: 1
-        expirationTime:
-          type: [number, "null"]
-        inboxId:
-          type: string
-          minLength: 1
-          maxLength: 255
-        installationId:
-          type: string
-          minLength: 1
-          maxLength: 255
-        address:
-          type: string
-          minLength: 1
-          maxLength: 255
-        inboxHandle:
-          type: string
-          pattern: '^[A-Za-z0-9_-]{8,128}$'
-        topics:
-          type: array
-          minItems: 1
-          maxItems: 2000
-          items:
-            $ref: "#/components/schemas/XmtpLegacyTopic"
-        hmacKeys:
-          $ref: "#/components/schemas/XmtpLegacyHmacKeys"
-        preferences:
-          $ref: "#/components/schemas/XmtpPreferences"
     XmtpSubscriptionRequest:
-      oneOf:
-        - $ref: "#/components/schemas/XmtpNestedSubscriptionRequest"
-        - $ref: "#/components/schemas/XmtpLegacySubscriptionRequest"
+      $ref: "#/components/schemas/XmtpNestedSubscriptionRequest"
     XmtpSubscriptionResponse:
       allOf:
         - $ref: "#/components/schemas/ApiEnvelope"
@@ -568,6 +552,138 @@ components:
                   type: integer
                 created:
                   type: boolean
+                diagnostics:
+                  type: object
+                  required: [receipt, statusPath, testPath]
+                  additionalProperties: false
+                  properties:
+                    receipt:
+                      type: string
+                      pattern: '^[A-Za-z0-9_-]{43}$'
+                    statusPath:
+                      type: string
+                      const: /api/xmtp/status
+                    testPath:
+                      type: string
+                      const: /api/xmtp/status/test
+    XmtpDiagnosticDeliveryStage:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [none, queued, sent, failed, expired]
+        lastMatchedAt:
+          type: string
+          format: date-time
+        queuedAt:
+          type: string
+          format: date-time
+        lastAttemptAt:
+          type: string
+          format: date-time
+        providerAcceptedAt:
+          type: string
+          format: date-time
+        failureCategory:
+          type: string
+          enum: [subscription_expired, provider_rate_limited, provider_unavailable, provider_rejected, relay_failure]
+        testId:
+          type: string
+    XmtpDiagnosticStatusResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [version, checkedAt, registration, route, pipeline, deliveries]
+              additionalProperties: false
+              properties:
+                version:
+                  type: integer
+                  const: 1
+                checkedAt:
+                  type: string
+                  format: date-time
+                registration:
+                  type: object
+                  required: [status, coverage, groupTopicCount, welcomeTopicCount, hmacEpochCount, registeredAt, updatedAt]
+                  properties:
+                    status:
+                      type: string
+                      const: active
+                    coverage:
+                      type: string
+                      enum: [complete, welcome_only, missing_welcome, empty]
+                    groupTopicCount:
+                      type: integer
+                      minimum: 0
+                    welcomeTopicCount:
+                      type: integer
+                      minimum: 0
+                    hmacEpochCount:
+                      type: integer
+                      minimum: 0
+                    registeredAt:
+                      type: string
+                      format: date-time
+                    updatedAt:
+                      type: string
+                      format: date-time
+                route:
+                  type: object
+                  required: [status, changePending]
+                  properties:
+                    status:
+                      type: string
+                      enum: [synced, pending, unavailable]
+                    changePending:
+                      type: boolean
+                    updatedAt:
+                      type: string
+                      format: date-time
+                pipeline:
+                  type: object
+                  required: [deliveryReady, listenerStatus, bridgeStatus]
+                  properties:
+                    deliveryReady:
+                      type: boolean
+                    listenerStatus:
+                      type: string
+                      enum: [ready, not_ready, not_configured, unknown]
+                    bridgeStatus:
+                      type: string
+                      enum: [synced, pending, failed, not_configured]
+                deliveries:
+                  type: object
+                  required: [xmtp, diagnostic]
+                  properties:
+                    xmtp:
+                      $ref: "#/components/schemas/XmtpDiagnosticDeliveryStage"
+                    diagnostic:
+                      $ref: "#/components/schemas/XmtpDiagnosticDeliveryStage"
+    XmtpDiagnosticTestResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [queued, testId, checkedAt]
+              additionalProperties: false
+              properties:
+                queued:
+                  type: boolean
+                  const: true
+                testId:
+                  type: string
+                checkedAt:
+                  type: string
+                  format: date-time
     XmtpDeleteBody:
       type: object
       required: [endpoint, identity]
@@ -575,6 +691,7 @@ components:
         endpoint:
           type: string
           format: uri
+          maxLength: 4096
         identity:
           $ref: "#/components/schemas/XmtpIdentity"
     GenericXmtpDeleteSubscriptionRequest:
@@ -613,22 +730,8 @@ components:
               format: date-time
         - $ref: "#/components/schemas/XmtpDeleteBody"
       unevaluatedProperties: false
-    XmtpFlatDeleteSubscriptionRequest:
-      type: object
-      required: [endpoint, inboxId, installationId]
-      additionalProperties: false
-      properties:
-        endpoint:
-          type: string
-          format: uri
-        inboxId:
-          type: string
-        installationId:
-          type: string
     XmtpDeleteSubscriptionRequest:
-      oneOf:
-        - $ref: "#/components/schemas/XmtpNestedDeleteSubscriptionRequest"
-        - $ref: "#/components/schemas/XmtpFlatDeleteSubscriptionRequest"
+      $ref: "#/components/schemas/XmtpNestedDeleteSubscriptionRequest"
     MinimalXmtpDeliveryRequest:
       type: object
       required: [version, idempotencyKey, installationId, deliveryToken, topic, messageType, isSilent]
@@ -720,6 +823,7 @@ components:
         endpoint:
           type: string
           format: uri
+          maxLength: 4096
         keys:
           type: object
           required: [p256dh, auth]
@@ -727,8 +831,12 @@ components:
           properties:
             p256dh:
               type: string
+              maxLength: 1024
+              description: Base64/base64url uncompressed P-256 public key; decodes to exactly 65 bytes.
             auth:
               type: string
+              maxLength: 1024
+              description: Base64/base64url Web Push authentication secret; decodes to exactly 16 bytes.
         expirationTime:
           type: [number, "null"]
         userId:

@@ -17,9 +17,11 @@ import type {
 } from './core';
 import { buildXmtpPushPayload } from './core';
 import {
+  getXmtpListenerHealth,
   markXmtpListenerRouteDirty,
   recordXmtpListenerChange,
 } from './listener-registry';
+import { bytesToBase64Url, bytesToHex, timingSafeEqualString } from './encoding';
 import { generateApiKey, generateVapidKeys } from './vapid';
 
 type JsonValue = Record<string, unknown> | unknown[];
@@ -28,6 +30,13 @@ export class XmtpAppIsolationPendingError extends Error {
   constructor() {
     super('XMTP app-scoped identity migration is pending; retry after the contract migration');
     this.name = 'XmtpAppIsolationPendingError';
+  }
+}
+
+export class XmtpEndpointKeyConflictError extends Error {
+  constructor() {
+    super('An active Web Push endpoint cannot be reused with different subscription keys');
+    this.name = 'XmtpEndpointKeyConflictError';
   }
 }
 
@@ -61,6 +70,7 @@ interface SubscriptionRow {
 
 interface TopicMatchRow {
   topic_id: string;
+  xmtp_subscription_id: string;
   subscription_id: string;
   app_id: string;
   installation_id: string;
@@ -69,6 +79,28 @@ interface TopicMatchRow {
   auth: string;
   conversation_id: string | null;
   inbox_handle: string | null;
+}
+
+interface XmtpDiagnosticRegistrationRow {
+  xmtp_subscription_id: string;
+  subscription_id: string;
+  app_id: string;
+  installation_id: string;
+  registered_at: string;
+  updated_at: string;
+  route_updated_at: string | null;
+  group_topic_count: number;
+  welcome_topic_count: number;
+  hmac_epoch_count: number;
+}
+
+interface DiagnosticAttemptRow {
+  status: 'queued' | 'sent' | 'failed' | 'expired';
+  attempts: number;
+  push_status: number | null;
+  payload_json: string;
+  created_at: string;
+  updated_at: string;
 }
 
 function parseJsonObject(input: string | null, fallback: Record<string, unknown>): Record<string, unknown> {
@@ -94,6 +126,23 @@ function json(input: JsonValue | Record<string, unknown> | undefined): string {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function generateDiagnosticReceipt(): string {
+  return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+async function hashDiagnosticReceipt(receipt: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(receipt));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+function diagnosticPaths(receipt: string): XmtpRegistrationResult['diagnostics'] {
+  return {
+    receipt,
+    statusPath: '/api/xmtp/status',
+    testPath: '/api/xmtp/status/test',
+  };
 }
 
 function mapApp(row: AppRow): AppRecord {
@@ -268,7 +317,8 @@ export async function upsertSubscription(
     channelId?: string;
     metadata?: Record<string, unknown>;
     expirationTime?: number | null;
-  }
+  },
+  options: { immutableKeys?: boolean } = {}
 ): Promise<SubscriptionRecord> {
   const id = crypto.randomUUID();
   const timestamp = nowIso();
@@ -286,6 +336,9 @@ export async function upsertSubscription(
       expires_at = excluded.expires_at,
       updated_at = excluded.updated_at,
       disabled_at = NULL
+    ${options.immutableKeys
+      ? 'WHERE subscriptions.p256dh = excluded.p256dh AND subscriptions.auth = excluded.auth'
+      : ''}
   `).bind(
     id,
     appId,
@@ -306,6 +359,9 @@ export async function upsertSubscription(
     .first<SubscriptionRow>();
 
   if (!row) throw new Error('Subscription upsert could not be loaded');
+  if (options.immutableKeys && (row.p256dh !== input.p256dh || row.auth !== input.auth)) {
+    throw new XmtpEndpointKeyConflictError();
+  }
   return mapSubscription(row);
 }
 
@@ -351,9 +407,62 @@ export async function getSubscriptionsByIds(
 }
 
 export async function disableSubscription(db: D1Database, id: string): Promise<void> {
-  await db.prepare('UPDATE subscriptions SET disabled_at = ?, updated_at = ? WHERE id = ?')
-    .bind(nowIso(), nowIso(), id)
-    .run();
+  const routes = await db.prepare(`
+    SELECT DISTINCT
+      xs.identity_id,
+      xi.app_id,
+      xi.installation_id
+    FROM xmtp_subscriptions xs
+    JOIN xmtp_identities xi ON xi.id = xs.identity_id
+    WHERE xs.subscription_id = ? AND xs.active = 1
+  `).bind(id).all<{
+    identity_id: string;
+    app_id: string;
+    installation_id: string;
+  }>();
+  const dirtyVersions = new Map<string, string>();
+  for (const route of routes.results) {
+    const key = `${route.app_id}\u0000${route.installation_id}`;
+    if (!dirtyVersions.has(key)) {
+      dirtyVersions.set(
+        key,
+        await markXmtpListenerRouteDirty(db, route.app_id, route.installation_id)
+      );
+    }
+  }
+
+  const timestamp = nowIso();
+  await db.prepare(`
+    UPDATE xmtp_subscriptions
+    SET active = 0, diagnostic_token_hash = NULL, updated_at = ?
+    WHERE subscription_id = ? AND active = 1
+  `).bind(timestamp, id).run();
+
+  for (const route of routes.results) {
+    await db.prepare(`
+      DELETE FROM xmtp_identities
+      WHERE id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM xmtp_subscriptions xs
+          WHERE xs.identity_id = xmtp_identities.id AND xs.active = 1
+        )
+    `).bind(route.identity_id).run();
+  }
+  for (const [key, dirtyVersion] of dirtyVersions) {
+    const [appId, installationId] = key.split('\u0000');
+    await recordXmtpListenerChange(
+      db,
+      appId,
+      installationId,
+      'registration-deleted',
+      dirtyVersion
+    );
+  }
+
+  // A 404/410 means the provider capability is permanently invalid. Delete
+  // the physical row after recording listener removals so p256dh/auth secrets
+  // and every logical route backed by that endpoint are removed immediately.
+  await db.prepare('DELETE FROM subscriptions WHERE id = ?').bind(id).run();
 }
 
 export async function checkAndIncrementRateLimit(
@@ -366,17 +475,15 @@ export async function checkAndIncrementRateLimit(
   windowStart.setSeconds(0, 0);
   const windowIso = windowStart.toISOString();
 
-  await db.prepare(`
+  const row = await db.prepare(`
     INSERT INTO rate_limit_logs (id, app_id, action, count, window_start)
     VALUES (?, ?, ?, 1, ?)
     ON CONFLICT(app_id, action, window_start) DO UPDATE SET count = count + 1
-  `).bind(crypto.randomUUID(), appId, action, windowIso).run();
+    WHERE rate_limit_logs.count <= ?
+    RETURNING count
+  `).bind(crypto.randomUUID(), appId, action, windowIso, limit).first<{ count: number }>();
 
-  const row = await db.prepare(`
-    SELECT count FROM rate_limit_logs WHERE app_id = ? AND action = ? AND window_start = ?
-  `).bind(appId, action, windowIso).first<{ count: number }>();
-
-  const current = row?.count ?? 0;
+  const current = row?.count ?? limit + 1;
   const reset = new Date(windowStart.getTime() + 60_000).toISOString();
   return { allowed: current <= limit, current, limit, resetAt: reset };
 }
@@ -428,7 +535,16 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     return this.appId ? getAppById(this.env.DB, this.appId) : ensureConvergeApp(this.env);
   }
 
-  async upsertRegistration(input: NormalizedXmtpRegistration): Promise<XmtpRegistrationResult> {
+  async upsertRegistration(
+    input: NormalizedXmtpRegistration,
+    options: {
+      diagnosticReceipt?: string;
+      issueDiagnosticReceipt?: boolean;
+      immutableEndpointKeys?: boolean;
+    } = {
+      issueDiagnosticReceipt: true,
+    }
+  ): Promise<XmtpRegistrationResult> {
     const app = await this.resolveApp();
     if (!app) {
       throw new Error('XMTP VAPID app is not configured');
@@ -439,32 +555,38 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       endpoint: input.endpoint,
       p256dh: input.p256dh,
       auth: input.auth,
-      userId: input.inboxId,
-      channelId: input.installationId,
-      metadata: { source: 'xmtp', address: input.address ?? null },
+      metadata: { source: 'xmtp' },
       expirationTime: input.expirationTime,
-    });
+    }, { immutableKeys: options.immutableEndpointKeys });
 
     const existing = await this.env.DB.prepare(`
-      SELECT id FROM xmtp_subscriptions WHERE identity_id = ? AND subscription_id = ?
-    `).bind(identityId, subscription.id).first<{ id: string }>();
+      SELECT id, subscription_id
+      FROM xmtp_subscriptions
+      WHERE identity_id = ? AND active = 1
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `).bind(identityId).first<{ id: string; subscription_id: string }>();
 
     const xmtpSubscriptionId = existing?.id ?? crypto.randomUUID();
-    await this.env.DB.prepare(`
-      INSERT INTO xmtp_subscriptions (id, identity_id, subscription_id, preferences, active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 1, ?, ?)
-      ON CONFLICT(identity_id, subscription_id) DO UPDATE SET
-        preferences = excluded.preferences,
-        active = 1,
-        updated_at = excluded.updated_at
-    `).bind(
-      xmtpSubscriptionId,
-      identityId,
-      subscription.id,
-      JSON.stringify(input.preferences),
-      nowIso(),
-      nowIso()
-    ).run();
+    if (!existing) {
+      await this.env.DB.prepare(`
+        DELETE FROM xmtp_subscriptions
+        WHERE identity_id = ? AND subscription_id = ? AND active = 0
+      `).bind(identityId, subscription.id).run();
+      await this.env.DB.prepare(`
+        INSERT INTO xmtp_subscriptions (
+          id, identity_id, subscription_id, preferences, active,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+      `).bind(
+        xmtpSubscriptionId,
+        identityId,
+        subscription.id,
+        JSON.stringify(input.preferences),
+        nowIso(),
+        nowIso()
+      ).run();
+    }
 
     await this.replaceTopics(identityId, input.topics);
     await recordXmtpListenerChange(
@@ -475,12 +597,62 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       dirtyVersion
     );
 
+    // Preserve an established management capability across ordinary refreshes.
+    // A failed refresh must leave the client's previous receipt usable.
+    const shouldIssueDiagnosticReceipt = options.issueDiagnosticReceipt !== false
+      || Boolean(options.diagnosticReceipt);
+    const diagnosticReceipt = shouldIssueDiagnosticReceipt
+      ? options.diagnosticReceipt ?? generateDiagnosticReceipt()
+      : undefined;
+    const diagnosticTokenHash = diagnosticReceipt
+      ? await hashDiagnosticReceipt(diagnosticReceipt)
+      : null;
+    await this.env.DB.prepare(`
+      DELETE FROM xmtp_subscriptions
+      WHERE identity_id = ? AND subscription_id = ? AND id <> ? AND active = 0
+    `).bind(identityId, subscription.id, xmtpSubscriptionId).run();
+    await this.env.DB.prepare(`
+      UPDATE xmtp_subscriptions
+      SET subscription_id = ?,
+          preferences = ?,
+          active = 1,
+          diagnostic_token_hash = COALESCE(?, diagnostic_token_hash),
+          diagnostic_group_topic_count = ?,
+          diagnostic_welcome_topic_count = ?,
+          diagnostic_hmac_epoch_count = ?,
+          updated_at = ?
+      WHERE id = ?
+    `).bind(
+      subscription.id,
+      JSON.stringify(input.preferences),
+      diagnosticTokenHash,
+      input.topics.filter((topic) => topic.topic.startsWith('/xmtp/mls/1/g-')).length,
+      input.topics.filter((topic) => topic.topic.startsWith('/xmtp/mls/1/w-')).length,
+      input.topics.reduce((count, topic) => count + topic.hmacKeys.length, 0),
+      nowIso(),
+      xmtpSubscriptionId
+    ).run();
+
+    if (existing && existing.subscription_id !== subscription.id) {
+      const active = await this.env.DB.prepare(`
+        SELECT COUNT(*) AS count
+        FROM xmtp_subscriptions
+        WHERE subscription_id = ? AND active = 1
+      `).bind(existing.subscription_id).first<{ count: number }>();
+      if ((active?.count ?? 0) === 0) {
+        await this.env.DB.prepare('DELETE FROM subscriptions WHERE id = ?')
+          .bind(existing.subscription_id)
+          .run();
+      }
+    }
+
     return {
       subscriptionId: subscription.id,
       identityId,
       topicsRegistered: input.topics.length,
       hmacKeysRegistered: input.topics.reduce((count, topic) => count + topic.hmacKeys.length, 0),
       created: !existing,
+      ...(diagnosticReceipt ? { diagnostics: diagnosticPaths(diagnosticReceipt) } : {}),
     };
   }
 
@@ -560,6 +732,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     const result = await this.env.DB.prepare(`
       SELECT
         xt.id AS topic_id,
+        xs.id AS xmtp_subscription_id,
         s.id AS subscription_id,
         s.app_id AS app_id,
         xi.installation_id AS installation_id,
@@ -580,6 +753,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
 
     return result.results.map((row) => ({
       topicId: row.topic_id,
+      xmtpSubscriptionId: row.xmtp_subscription_id,
       subscriptionId: row.subscription_id,
       appId: row.app_id,
       installationId: row.installation_id,
@@ -615,6 +789,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       const deliveryAttemptId = await insertDeliveryAttempt(this.env.DB, {
         appId: match.appId,
         subscriptionId: match.subscriptionId,
+        xmtpSubscriptionId: match.xmtpSubscriptionId,
         xmtpTopicId: match.topicId,
         eventType: 'xmtp.new_message',
         payload,
@@ -687,11 +862,14 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
   }
 
   private async replaceTopics(identityId: string, topics: NormalizedXmtpRegistration['topics']): Promise<void> {
-    await this.env.DB.prepare('DELETE FROM xmtp_topics WHERE identity_id = ?').bind(identityId).run();
+    const statements: D1PreparedStatement[] = [
+      this.env.DB.prepare('DELETE FROM xmtp_topics WHERE identity_id = ?').bind(identityId),
+    ];
+    const timestamp = nowIso();
 
     for (const topic of topics) {
       const topicId = crypto.randomUUID();
-      await this.env.DB.prepare(`
+      statements.push(this.env.DB.prepare(`
         INSERT INTO xmtp_topics (id, identity_id, topic, algorithm, conversation_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `).bind(
@@ -700,12 +878,12 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
         topic.topic,
         topic.algorithm,
         topic.conversationId ?? null,
-        nowIso(),
-        nowIso()
-      ).run();
+        timestamp,
+        timestamp
+      ));
 
       for (const hmacKey of topic.hmacKeys) {
-        await this.env.DB.prepare(`
+        statements.push(this.env.DB.prepare(`
           INSERT INTO xmtp_topic_hmac_keys (id, topic_id, epoch, hmac_key, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?)
         `).bind(
@@ -713,11 +891,15 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
           topicId,
           hmacKey.epoch,
           hmacKey.key,
-          nowIso(),
-          nowIso()
-        ).run();
+          timestamp,
+          timestamp
+        ));
       }
     }
+
+    // D1 batch execution is transactional, so a failed replacement retains
+    // the previous complete topic/HMAC snapshot instead of a partial one.
+    await this.env.DB.batch(statements);
   }
 }
 
@@ -726,6 +908,7 @@ export async function insertDeliveryAttempt(
   input: {
     appId: string;
     subscriptionId: string;
+    xmtpSubscriptionId?: string;
     xmtpTopicId?: string;
     eventType: string;
     payload: PushPayload;
@@ -733,12 +916,16 @@ export async function insertDeliveryAttempt(
 ): Promise<string> {
   const id = crypto.randomUUID();
   await db.prepare(`
-    INSERT INTO delivery_attempts (id, app_id, subscription_id, xmtp_topic_id, event_type, status, payload_json)
-    VALUES (?, ?, ?, ?, ?, 'queued', ?)
+    INSERT INTO delivery_attempts (
+      id, app_id, subscription_id, xmtp_subscription_id,
+      xmtp_topic_id, event_type, status, payload_json
+    )
+    VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
   `).bind(
     id,
     input.appId,
     input.subscriptionId,
+    input.xmtpSubscriptionId ?? null,
     input.xmtpTopicId ?? null,
     input.eventType,
     JSON.stringify(input.payload)
@@ -775,4 +962,457 @@ export async function updateDeliveryAttempt(
         updated_at = ?
     WHERE id = ?
   `).bind(update.status, update.error ?? null, update.pushStatus ?? null, nowIso(), id).run();
+}
+
+export async function hasActiveSubscriptionEndpoint(
+  db: D1Database,
+  appId: string,
+  endpoint: string
+): Promise<boolean> {
+  const row = await db.prepare(`
+    SELECT 1 AS present
+    FROM subscriptions
+    WHERE app_id = ? AND endpoint = ? AND disabled_at IS NULL
+  `).bind(appId, endpoint).first<{ present: number }>();
+  return Boolean(row);
+}
+
+export async function getActiveSubscriptionEndpointKeys(
+  db: D1Database,
+  appId: string,
+  endpoint: string
+): Promise<{ p256dh: string; auth: string } | null> {
+  return db.prepare(`
+    SELECT p256dh, auth
+    FROM subscriptions
+    WHERE app_id = ? AND endpoint = ? AND disabled_at IS NULL
+  `).bind(appId, endpoint).first<{ p256dh: string; auth: string }>();
+}
+
+export async function countActiveXmtpRegistrations(
+  db: D1Database,
+  appId: string
+): Promise<number> {
+  const row = await db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM xmtp_subscriptions xs
+    JOIN xmtp_identities xi ON xi.id = xs.identity_id
+    JOIN subscriptions s ON s.id = xs.subscription_id
+    WHERE xi.app_id = ? AND xs.active = 1 AND s.disabled_at IS NULL
+  `).bind(appId).first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+export async function hasActiveXmtpRegistration(
+  db: D1Database,
+  appId: string,
+  input: { endpoint: string; inboxId: string; installationId: string }
+): Promise<boolean> {
+  const row = await db.prepare(`
+    SELECT 1 AS present
+    FROM xmtp_subscriptions xs
+    JOIN xmtp_identities xi ON xi.id = xs.identity_id
+    JOIN subscriptions s ON s.id = xs.subscription_id
+    WHERE xi.app_id = ?
+      AND s.endpoint = ?
+      AND xi.inbox_id = ?
+      AND xi.installation_id = ?
+      AND xs.active = 1
+      AND s.disabled_at IS NULL
+  `).bind(
+    appId,
+    input.endpoint,
+    input.inboxId,
+    input.installationId
+  ).first<{ present: number }>();
+  return Boolean(row);
+}
+
+export interface ActiveXmtpRegistrationState {
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  diagnosticTokenHash?: string;
+}
+
+export async function getActiveXmtpRegistrationState(
+  db: D1Database,
+  appId: string,
+  input: { inboxId: string; installationId: string }
+): Promise<ActiveXmtpRegistrationState | null> {
+  const row = await db.prepare(`
+    SELECT
+      s.endpoint,
+      s.p256dh,
+      s.auth,
+      xs.diagnostic_token_hash
+    FROM xmtp_subscriptions xs
+    JOIN xmtp_identities xi ON xi.id = xs.identity_id
+    JOIN subscriptions s ON s.id = xs.subscription_id
+    WHERE xi.app_id = ?
+      AND xi.inbox_id = ?
+      AND xi.installation_id = ?
+      AND xs.active = 1
+      AND s.disabled_at IS NULL
+    LIMIT 1
+  `).bind(appId, input.inboxId, input.installationId).first<{
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    diagnostic_token_hash: string | null;
+  }>();
+  if (!row) return null;
+  return {
+    endpoint: row.endpoint,
+    p256dh: row.p256dh,
+    auth: row.auth,
+    diagnosticTokenHash: row.diagnostic_token_hash ?? undefined,
+  };
+}
+
+export async function diagnosticReceiptMatches(
+  receipt: string,
+  expectedHash: string
+): Promise<boolean> {
+  return timingSafeEqualString(await hashDiagnosticReceipt(receipt), expectedHash);
+}
+
+export async function acquireXmtpRegistrationMutationLock(
+  db: D1Database,
+  appId: string,
+  input: { inboxId: string; installationId: string }
+): Promise<string | null> {
+  const lockToken = crypto.randomUUID();
+  const now = nowIso();
+  await db.prepare(`
+    DELETE FROM xmtp_registration_mutation_locks
+    WHERE app_id = ? AND inbox_id = ? AND installation_id = ? AND expires_at <= ?
+  `).bind(appId, input.inboxId, input.installationId, now).run();
+  const result = await db.prepare(`
+    INSERT OR IGNORE INTO xmtp_registration_mutation_locks (
+      app_id, inbox_id, installation_id, lock_token, expires_at
+    ) VALUES (?, ?, ?, ?, ?)
+  `).bind(
+    appId,
+    input.inboxId,
+    input.installationId,
+    lockToken,
+    new Date(Date.now() + 30_000).toISOString()
+  ).run();
+  return result.meta.changes === 1 ? lockToken : null;
+}
+
+export async function releaseXmtpRegistrationMutationLock(
+  db: D1Database,
+  appId: string,
+  input: { inboxId: string; installationId: string },
+  lockToken: string
+): Promise<void> {
+  await db.prepare(`
+    DELETE FROM xmtp_registration_mutation_locks
+    WHERE app_id = ? AND inbox_id = ? AND installation_id = ? AND lock_token = ?
+  `).bind(appId, input.inboxId, input.installationId, lockToken).run();
+}
+
+async function endpointMutationLockInput(endpoint: string): Promise<{
+  inboxId: string;
+  installationId: string;
+}> {
+  return {
+    inboxId: '__web_push_endpoint__',
+    installationId: await hashDiagnosticReceipt(endpoint),
+  };
+}
+
+export async function acquireXmtpEndpointMutationLock(
+  db: D1Database,
+  appId: string,
+  endpoint: string
+): Promise<string | null> {
+  return acquireXmtpRegistrationMutationLock(
+    db,
+    appId,
+    await endpointMutationLockInput(endpoint)
+  );
+}
+
+export async function releaseXmtpEndpointMutationLock(
+  db: D1Database,
+  appId: string,
+  endpoint: string,
+  lockToken: string
+): Promise<void> {
+  return releaseXmtpRegistrationMutationLock(
+    db,
+    appId,
+    await endpointMutationLockInput(endpoint),
+    lockToken
+  );
+}
+
+export async function scopedPublicRateLimitAction(
+  request: Request,
+  env: Pick<Env, 'INTERNAL_INGEST_TOKEN'>,
+  action: string
+): Promise<string> {
+  const connectingIp = request.headers.get('cf-connecting-ip');
+  if (!connectingIp || connectingIp.length > 128 || !env.INTERNAL_INGEST_TOKEN) {
+    return `${action}:unscoped`;
+  }
+
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`${env.INTERNAL_INGEST_TOKEN}\u0000${connectingIp}`)
+  );
+  return `${action}:${bytesToHex(new Uint8Array(digest)).slice(0, 24)}`;
+}
+
+export async function compactOperationalHistory(db: D1Database): Promise<void> {
+  const rateLimitBefore = new Date(Date.now() - 2 * 24 * 60 * 60_000).toISOString();
+  const diagnosticBefore = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+  const deliveryBefore = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+
+  await db.batch([
+    db.prepare('DELETE FROM rate_limit_logs WHERE window_start < ?').bind(rateLimitBefore),
+    db.prepare(`
+      DELETE FROM delivery_attempts
+      WHERE event_type = 'vapid.diagnostic' AND created_at < ?
+    `).bind(diagnosticBefore),
+    db.prepare(`
+      DELETE FROM delivery_attempts
+      WHERE event_type <> 'vapid.diagnostic' AND created_at < ?
+    `).bind(deliveryBefore),
+    db.prepare('DELETE FROM xmtp_delivery_events WHERE created_at < ?').bind(deliveryBefore),
+    db.prepare('DELETE FROM xmtp_registration_mutation_locks WHERE expires_at <= ?').bind(nowIso()),
+  ]);
+}
+
+async function findXmtpDiagnosticRegistration(
+  db: D1Database,
+  receipt: string
+): Promise<XmtpDiagnosticRegistrationRow | null> {
+  const tokenHash = await hashDiagnosticReceipt(receipt);
+  return db.prepare(`
+    SELECT
+      xs.id AS xmtp_subscription_id,
+      s.id AS subscription_id,
+      xi.app_id AS app_id,
+      xi.installation_id AS installation_id,
+      xs.created_at AS registered_at,
+      xs.updated_at AS updated_at,
+      li.updated_at AS route_updated_at,
+      xs.diagnostic_group_topic_count AS group_topic_count,
+      xs.diagnostic_welcome_topic_count AS welcome_topic_count,
+      xs.diagnostic_hmac_epoch_count AS hmac_epoch_count
+    FROM xmtp_subscriptions xs
+    JOIN xmtp_identities xi ON xi.id = xs.identity_id
+    JOIN subscriptions s ON s.id = xs.subscription_id
+    LEFT JOIN xmtp_listener_installations li
+      ON li.app_id = xi.app_id AND li.installation_id = xi.installation_id
+    WHERE xs.diagnostic_token_hash = ?
+      AND xs.active = 1
+      AND s.disabled_at IS NULL
+  `).bind(tokenHash).first<XmtpDiagnosticRegistrationRow>();
+}
+
+function diagnosticFailureCategory(row: DiagnosticAttemptRow): string | undefined {
+  if (row.status === 'expired') return 'subscription_expired';
+  if (row.status !== 'failed') return undefined;
+  if (row.push_status === 429) return 'provider_rate_limited';
+  if (row.push_status !== null && row.push_status >= 500) return 'provider_unavailable';
+  if (row.push_status !== null && row.push_status >= 400) return 'provider_rejected';
+  return 'relay_failure';
+}
+
+function parseDiagnosticTestId(payloadJson: string): string | undefined {
+  try {
+    const payload = JSON.parse(payloadJson) as { testId?: unknown };
+    return typeof payload.testId === 'string' ? payload.testId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function summarizeDeliveryAttempt(
+  row: DiagnosticAttemptRow | null,
+  kind: 'xmtp' | 'diagnostic'
+): Record<string, unknown> {
+  if (!row) return { status: 'none' };
+
+  return {
+    status: row.status,
+    ...(kind === 'xmtp' ? { lastMatchedAt: row.created_at } : { queuedAt: row.created_at }),
+    ...(row.attempts > 0 ? { lastAttemptAt: row.updated_at } : {}),
+    ...(row.status === 'sent' ? { providerAcceptedAt: row.updated_at } : {}),
+    ...(diagnosticFailureCategory(row)
+      ? { failureCategory: diagnosticFailureCategory(row) }
+      : {}),
+    ...(kind === 'diagnostic' && parseDiagnosticTestId(row.payload_json)
+      ? { testId: parseDiagnosticTestId(row.payload_json) }
+      : {}),
+  };
+}
+
+export async function getXmtpDiagnosticStatus(
+  env: Env,
+  receipt: string
+): Promise<Record<string, unknown> | null> {
+  const registration = await findXmtpDiagnosticRegistration(env.DB, receipt);
+  if (!registration) return null;
+
+  const listenerConfigured = Boolean(
+    env.XMTP_LISTENER && env.XMTP_LISTENER_SYNC_TOKEN && env.INTERNAL_INGEST_TOKEN
+  );
+  const [health, latestChange, consumer, dirty, xmtpAttempt, diagnosticAttempt] = await Promise.all([
+    getXmtpListenerHealth(env.DB, listenerConfigured),
+    env.DB.prepare(`
+      SELECT MAX(sequence) AS sequence
+      FROM xmtp_listener_changes
+      WHERE app_id = ? AND installation_id = ?
+    `).bind(registration.app_id, registration.installation_id).first<{ sequence: number | null }>(),
+    env.DB.prepare(`
+      SELECT cursor
+      FROM xmtp_listener_consumers
+      ORDER BY updated_at DESC
+      LIMIT 1
+    `).first<{ cursor: number }>(),
+    env.DB.prepare(`
+      SELECT 1 AS present
+      FROM xmtp_listener_dirty_routes
+      WHERE app_id = ? AND installation_id = ?
+    `).bind(registration.app_id, registration.installation_id).first<{ present: number }>(),
+    env.DB.prepare(`
+      SELECT status, attempts, push_status, payload_json, created_at, updated_at
+      FROM delivery_attempts
+      WHERE xmtp_subscription_id = ? AND event_type = 'xmtp.new_message'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).bind(registration.xmtp_subscription_id).first<DiagnosticAttemptRow>(),
+    env.DB.prepare(`
+      SELECT status, attempts, push_status, payload_json, created_at, updated_at
+      FROM delivery_attempts
+      WHERE xmtp_subscription_id = ? AND event_type = 'vapid.diagnostic'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).bind(registration.xmtp_subscription_id).first<DiagnosticAttemptRow>(),
+  ]);
+
+  const latestSequence = latestChange?.sequence ?? 0;
+  const routeStatus = health.listener.status !== 'ready'
+    ? 'unavailable'
+    : dirty || !registration.route_updated_at || (consumer?.cursor ?? 0) < latestSequence
+      ? 'pending'
+      : 'synced';
+  const groupTopicCount = registration.group_topic_count ?? 0;
+  const welcomeTopicCount = registration.welcome_topic_count ?? 0;
+  const coverage = groupTopicCount > 0 && welcomeTopicCount > 0
+    ? 'complete'
+    : groupTopicCount === 0 && welcomeTopicCount > 0
+      ? 'welcome_only'
+      : groupTopicCount > 0
+        ? 'missing_welcome'
+        : 'empty';
+
+  return {
+    version: 1,
+    checkedAt: nowIso(),
+    registration: {
+      status: 'active',
+      coverage,
+      registeredAt: registration.registered_at,
+      updatedAt: registration.updated_at,
+      groupTopicCount,
+      welcomeTopicCount,
+      hmacEpochCount: registration.hmac_epoch_count ?? 0,
+    },
+    route: {
+      status: routeStatus,
+      changePending: routeStatus === 'pending',
+      ...(registration.route_updated_at ? { updatedAt: registration.route_updated_at } : {}),
+    },
+    pipeline: {
+      deliveryReady: health.deliveryReady,
+      listenerStatus: health.listener.status,
+      bridgeStatus: health.bridge.status,
+    },
+    deliveries: {
+      xmtp: summarizeDeliveryAttempt(xmtpAttempt, 'xmtp'),
+      diagnostic: summarizeDeliveryAttempt(diagnosticAttempt, 'diagnostic'),
+    },
+  };
+}
+
+export class XmtpDiagnosticRateLimitError extends Error {
+  constructor(public readonly resetAt?: string) {
+    super('Diagnostic test rate limit exceeded');
+    this.name = 'XmtpDiagnosticRateLimitError';
+  }
+}
+
+export async function enqueueXmtpDiagnosticTest(
+  env: Env,
+  receipt: string,
+  scopedRateLimitAction?: string
+): Promise<{ queued: true; testId: string; checkedAt: string } | null> {
+  const registration = await findXmtpDiagnosticRegistration(env.DB, receipt);
+  if (!registration) return null;
+
+  const app = await getAppById(env.DB, registration.app_id);
+  if (!app) return null;
+  const appRateLimit = await checkAndIncrementRateLimit(
+    env.DB,
+    app.id,
+    'xmtp-diagnostic-test',
+    Math.min(app.rateLimit.maxNotificationsPerMinute, 30)
+  );
+  if (!appRateLimit.allowed) throw new XmtpDiagnosticRateLimitError(appRateLimit.resetAt);
+  if (scopedRateLimitAction) {
+    const scopedRateLimit = await checkAndIncrementRateLimit(
+      env.DB,
+      app.id,
+      scopedRateLimitAction,
+      6
+    );
+    if (!scopedRateLimit.allowed) {
+      throw new XmtpDiagnosticRateLimitError(scopedRateLimit.resetAt);
+    }
+  }
+
+  const since = new Date(Date.now() - 60_000).toISOString();
+  const recent = await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+    FROM delivery_attempts
+    WHERE xmtp_subscription_id = ?
+      AND event_type = 'vapid.diagnostic'
+      AND created_at >= ?
+  `).bind(registration.xmtp_subscription_id, since).first<{ count: number }>();
+  if ((recent?.count ?? 0) >= 3) throw new XmtpDiagnosticRateLimitError();
+
+  const testId = crypto.randomUUID();
+  const payload = { type: 'vapid.diagnostic', testId };
+  const deliveryAttemptId = await insertDeliveryAttempt(env.DB, {
+    appId: registration.app_id,
+    subscriptionId: registration.subscription_id,
+    xmtpSubscriptionId: registration.xmtp_subscription_id,
+    eventType: 'vapid.diagnostic',
+    payload,
+  });
+
+  try {
+    await env.PUSH_QUEUE.send({
+      deliveryAttemptId,
+      appId: registration.app_id,
+      subscriptionId: registration.subscription_id,
+      payload,
+      source: 'diagnostic',
+    });
+  } catch (error) {
+    await updateDeliveryAttempt(env.DB, deliveryAttemptId, {
+      status: 'failed',
+      error: error instanceof Error ? error.message : 'Unable to queue diagnostic push',
+    });
+    throw error;
+  }
+
+  return { queued: true, testId, checkedAt: nowIso() };
 }

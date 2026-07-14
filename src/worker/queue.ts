@@ -2,6 +2,13 @@ import { getPushJobContext, updateDeliveryAttempt } from './db';
 import { handleTerminalPushFailure, sendWebPush } from './push';
 import type { Env, PushQueueJob } from './types';
 
+export function pushDeliveryOptions(source: PushQueueJob['source']): {
+  ttl?: number;
+  urgency?: 'high';
+} {
+  return source === 'diagnostic' ? { ttl: 60, urgency: 'high' } : {};
+}
+
 export async function handleQueue(batch: MessageBatch<PushQueueJob>, env: Env): Promise<void> {
   for (const message of batch.messages) {
     const job = message.body;
@@ -18,6 +25,7 @@ export async function handleQueue(batch: MessageBatch<PushQueueJob>, env: Env): 
 
     const result = await sendWebPush(context.app, context.subscription, job.payload, {
       vapidSubject: env.VAPID_SUBJECT,
+      ...pushDeliveryOptions(job.source),
     });
 
     if (result.success) {
@@ -30,12 +38,12 @@ export async function handleQueue(batch: MessageBatch<PushQueueJob>, env: Env): 
     }
 
     if (result.terminal) {
-      await handleTerminalPushFailure(env.DB, job.subscriptionId);
       await updateDeliveryAttempt(env.DB, job.deliveryAttemptId, {
         status: 'expired',
         error: result.error,
         pushStatus: result.statusCode,
       });
+      await handleTerminalPushFailure(env.DB, job.subscriptionId);
       message.ack();
       continue;
     }

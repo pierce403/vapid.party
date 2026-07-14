@@ -1,6 +1,8 @@
 import {
   GenericXmtpDeleteSubscriptionRequestSchema,
   GenericXmtpSubscriptionRequestSchema,
+  XmtpPublicDeleteSubscriptionRequestSchema,
+  XmtpPublicSubscriptionRequestSchema,
   XmtpDeleteSubscriptionRequestSchema,
   XmtpDeliveryRequestSchema,
   XmtpSubscriptionRequestSchema,
@@ -41,6 +43,11 @@ export interface XmtpRegistrationResult {
   topicsRegistered: number;
   hmacKeysRegistered: number;
   created: boolean;
+  diagnostics?: {
+    receipt: string;
+    statusPath: '/api/xmtp/status';
+    testPath: '/api/xmtp/status/test';
+  };
 }
 
 export interface XmtpUnsubscribeResult {
@@ -48,7 +55,14 @@ export interface XmtpUnsubscribeResult {
 }
 
 export interface XmtpRegistrationStore {
-  upsertRegistration(input: NormalizedXmtpRegistration): Promise<XmtpRegistrationResult>;
+  upsertRegistration(
+    input: NormalizedXmtpRegistration,
+    options?: {
+      diagnosticReceipt?: string;
+      issueDiagnosticReceipt?: boolean;
+      immutableEndpointKeys?: boolean;
+    }
+  ): Promise<XmtpRegistrationResult>;
   disableRegistration(input: { endpoint: string; inboxId: string; installationId: string }): Promise<XmtpUnsubscribeResult>;
 }
 
@@ -59,6 +73,35 @@ export interface XmtpRelayStore {
     payload: PushPayload,
     idempotencyKey: string
   ): Promise<boolean>;
+}
+
+export function isAllowedPublicWebPushEndpoint(endpoint: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return false;
+  }
+
+  if (url.protocol !== 'https:' || url.port && url.port !== '443') return false;
+  if (url.username || url.password || url.hash) return false;
+
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === 'fcm.googleapis.com') {
+    return url.search === '' && /^\/(?:fcm\/send|wp)\/[^/]+$/.test(url.pathname);
+  }
+  if (hostname === 'updates.push.services.mozilla.com') {
+    return url.search === '' && /^\/wpush\/v\d+\/[^/]+$/.test(url.pathname);
+  }
+  if (hostname.endsWith('.push.apple.com')) {
+    return url.search === '' && /^\/[^/]+$/.test(url.pathname);
+  }
+  if (hostname === 'notify.windows.com' || hostname.endsWith('.notify.windows.com')) {
+    return (url.pathname === '/' || url.pathname === '/w/')
+      && url.searchParams.size === 1
+      && Boolean(url.searchParams.get('token'));
+  }
+  return false;
 }
 
 function addTopic(
@@ -190,6 +233,26 @@ export function normalizeGenericXmtpRegistration(input: unknown): NormalizedXmtp
   };
 }
 
+export function normalizePublicXmtpRegistration(input: unknown): NormalizedXmtpRegistration {
+  const parsed = XmtpPublicSubscriptionRequestSchema.parse(input);
+  const topics = new Map<string, NormalizedXmtpTopic>();
+  for (const topic of parsed.xmtp.topics) {
+    addTopic(topics, { topic: topic.topic, hmacKeys: topic.hmacKeys });
+  }
+
+  return {
+    endpoint: parsed.subscription.endpoint,
+    p256dh: parsed.subscription.keys.p256dh,
+    auth: parsed.subscription.keys.auth,
+    expirationTime: parsed.subscription.expirationTime,
+    inboxId: parsed.identity.inboxId,
+    installationId: parsed.identity.installationId,
+    inboxHandle: parsed.notification.inboxHandle,
+    preferences: parsed.preferences,
+    topics: [...topics.values()],
+  };
+}
+
 export function normalizeXmtpDelete(input: unknown): { endpoint: string; inboxId: string; installationId: string } {
   const parsed = XmtpDeleteSubscriptionRequestSchema.parse(input);
   if ('version' in parsed) {
@@ -204,6 +267,15 @@ export function normalizeXmtpDelete(input: unknown): { endpoint: string; inboxId
 
 export function normalizeGenericXmtpDelete(input: unknown): { endpoint: string; inboxId: string; installationId: string } {
   const parsed = GenericXmtpDeleteSubscriptionRequestSchema.parse(input);
+  return {
+    endpoint: parsed.endpoint,
+    inboxId: parsed.identity.inboxId,
+    installationId: parsed.identity.installationId,
+  };
+}
+
+export function normalizePublicXmtpDelete(input: unknown): { endpoint: string; inboxId: string; installationId: string } {
+  const parsed = XmtpPublicDeleteSubscriptionRequestSchema.parse(input);
   return {
     endpoint: parsed.endpoint,
     inboxId: parsed.identity.inboxId,
