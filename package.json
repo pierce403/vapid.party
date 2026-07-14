@@ -5,15 +5,12 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "dev:next": "next dev",
     "build": "wrangler deploy --dry-run --outdir dist/worker",
-    "build:next": "next build",
     "start": "wrangler dev --remote",
     "lint": "tsc --noEmit -p tsconfig.worker.json",
     "test": "vitest run",
     "db:migrate": "wrangler d1 migrations apply vapid-party --local",
-    "db:migrate:remote": "wrangler d1 migrations apply vapid-party --remote",
-    "db:migrate:postgres": "tsx scripts/migrate.ts"
+    "db:migrate:remote": "wrangler d1 migrations apply vapid-party --remote"
   },
   "keywords": [
     "vapid",
@@ -27,35 +24,19 @@
   "author": "",
   "license": "Apache-2.0",
   "dependencies": {
-    "next": "14.2.35",
-    "postgres": "^3.4.7",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "thirdweb": "^5.70.0",
-    "uuid": "^9.0.1",
     "web-push": "^3.6.7",
-    "winston": "^3.11.0",
-    "zod": "^3.23.8"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260702.1",
-    "@types/hapi__shot": "^4.1.6",
-    "@types/node": "^20.17.6",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@types/uuid": "^9.0.7",
+    "@cloudflare/workers-types": "^5.20260714.1",
+    "@types/node": "^22.0.0",
     "@types/web-push": "^3.6.3",
-    "autoprefixer": "^10.4.20",
-    "eslint": "^8.56.0",
-    "eslint-config-next": "^14.2.15",
-    "postcss": "^8.4.47",
-    "tailwindcss": "^3.4.14",
-    "tsx": "^4.19.2",
+    "miniflare": "4.20260708.1",
     "typescript": "^5.6.3",
     "vitest": "^3.2.7",
-    "wrangler": "^4.107.1"
+    "wrangler": "4.110.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   }
 }

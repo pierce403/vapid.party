@@ -5,9 +5,9 @@
 Stability: in-progress
 
 Description:
-- `vapid.party` is moving from a Vercel/Next API deployment to a Cloudflare Worker entrypoint.
+- `vapid.party` runs as a Cloudflare Worker rather than a Vercel/Next API deployment.
 - The Worker owns public API routing, CORS, health checks, generic Web Push endpoints, Converge XMTP endpoints, and queue consumption.
-- The existing Next app remains in the repository as legacy/dashboard code while the Cloudflare runtime becomes the deployable target.
+- Historical Next/dashboard files remain only as unbuilt reference material. They have no package scripts or installed dependencies and are excluded from the supported runtime and security graph.
 
 Properties:
 - Wrangler config lives in `wrangler.jsonc`.
@@ -15,6 +15,8 @@ Properties:
 - Static assets from `public/` are available through the Worker assets binding.
 - `npm run dev` starts Wrangler for local Worker development.
 - `npm run build` produces a Wrangler dry-run bundle instead of a Vercel build.
+- Node.js 22 or newer is required by the pinned Wrangler toolchain.
+- The installable package graph contains only Worker runtime and test/build dependencies; `npm audit --audit-level=low` reports zero findings.
 - Production Worker is deployed at `https://vapid-party.bcrt43.workers.dev` and `https://vapid.party`.
 - `vapid.party` is an active Cloudflare zone and the Worker custom domain is attached.
 
@@ -30,7 +32,7 @@ Test Criteria:
 Stability: in-progress
 
 Description:
-- Postgres persistence is being ported to D1.
+- The supported relay persists in D1. Postgres is required only by the future official XMTP listener, not by this Worker.
 - The schema keeps apps, VAPID key metadata, physical Web Push subscriptions,
   logical XMTP registrations, XMTP topics, per-epoch HMAC keys, idempotent
   delivery events, delivery attempts, rate logs, and relay cursors.

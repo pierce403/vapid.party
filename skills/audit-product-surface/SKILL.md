@@ -1,6 +1,6 @@
 ---
 name: audit-product-surface
-description: Audit vapid.party UI, README, OpenAPI, llms.txt, and dashboard copy against shipped backend behavior. Use when editing product copy, landing-page features, metrics, limits, quotas, subscriber counts, billing or upgrade language, API examples, or any surface that could imply data, enforcement, or features not backed by persisted state and code.
+description: Audit vapid.party README, OpenAPI, llms.txt, and public API copy against shipped Worker behavior. Use when editing product copy, metrics, limits, quotas, subscriber counts, billing or upgrade language, API examples, or any surface that could imply data, enforcement, or features not backed by persisted state and code.
 ---
 
 # Audit Product Surface
@@ -12,15 +12,14 @@ Keep the product surface truthful. Every count, limit, metric, feature claim, an
 ## Workflow
 
 1. Inventory changed surfaces:
-   - `app/page.tsx`, `components/`, and `app/dashboard/`
    - `README.md`
    - `public/openapi.yaml`
    - `public/llms.txt`
 2. Trace each claim to implementation:
-   - request validation: `lib/types.ts`
-   - persistence and counts: `lib/db.ts`
-   - auth and API responses: `lib/api-utils.ts` and `app/api/**/route.ts`
-   - delivery and rate limiting: `lib/notifications.ts`
+   - request validation: `src/worker/schemas.ts`
+   - persistence and counts: `src/worker/db.ts`
+   - auth and API responses: `src/worker/auth.ts` and `src/worker/api.ts`
+   - delivery and rate limiting: `src/worker/push.ts`, `src/worker/core.ts`, and `src/worker/queue.ts`
 3. Replace unsupported claims with precise wording, `--`, omission, or explicit future/planned language.
 4. Keep public examples aligned with actual request/response shapes.
 5. Run the relevant checks before closeout.

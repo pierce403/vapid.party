@@ -1,6 +1,6 @@
 ---
 name: change-api-contract
-description: Change vapid.party API behavior while keeping handlers, Zod schemas, database code, OpenAPI, llms.txt, README examples, and dashboard snippets aligned. Use when adding or modifying API routes, auth behavior, request fields, response fields, validation errors, rate limits, VAPID key behavior, subscription targeting, or public API examples.
+description: Change vapid.party Worker API behavior while keeping handlers, Zod schemas, D1 code, OpenAPI, llms.txt, and README examples aligned. Use when adding or modifying API routes, auth behavior, request fields, response fields, validation errors, rate limits, VAPID key behavior, subscription targeting, or public API examples.
 ---
 
 # Change API Contract
@@ -11,18 +11,17 @@ Treat API behavior as a contract spread across route handlers, schemas, persiste
 
 ## Workflow
 
-1. Locate the route in `app/api/**/route.ts`.
-2. Update request validation and shared types in `lib/types.ts`.
-3. Update persistence or query logic in `lib/db.ts` when fields, limits, or relationships change.
-4. Update auth helpers in `lib/api-utils.ts` only when auth behavior changes.
-5. Update delivery behavior in `lib/notifications.ts` for send, targeting, or push payload changes.
+1. Locate the route in `src/worker/api.ts`.
+2. Update request validation in `src/worker/schemas.ts` and shared types in `src/worker/types.ts`.
+3. Update persistence or query logic in `src/worker/db.ts` when fields, limits, or relationships change.
+4. Update auth helpers in `src/worker/auth.ts` only when auth behavior changes.
+5. Update delivery behavior in `src/worker/push.ts`, `src/worker/core.ts`, or `src/worker/queue.ts` for send, targeting, or push payload changes.
 6. Sync public docs:
    - `public/openapi.yaml`
    - `public/llms.txt`
    - `README.md`
-   - dashboard code snippets in `app/dashboard/page.tsx`
 7. Run focused tests or add them when behavior is not already covered.
-8. Run lint/build before closeout.
+8. Run audit, lint, tests, and build before closeout.
 
 ## Contract Checklist
 
@@ -39,7 +38,7 @@ Treat API behavior as a contract spread across route handlers, schemas, persiste
 
 ```bash
 npm run lint
+npm test
 npm run build
+npm audit --audit-level=low
 ```
-
-Run `npm test` when tests exist or when the change adds test coverage.

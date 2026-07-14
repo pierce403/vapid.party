@@ -36,8 +36,8 @@ These instructions apply to the entire repository.
 - Keep detailed procedures in `skills/<name>/SKILL.md`; use `curator` as the default skill for updating the skill library.
 
 ## Project overview
-- Cloudflare Worker Web Push relay; the Next.js app remains as legacy dashboard code.
-- Worker data lives in D1 with migrations under `migrations/d1`; legacy Next data uses Postgres.
+- Cloudflare Worker Web Push relay. Historical Next.js files are archival reference only and have no package scripts or installed dependencies.
+- Worker data lives in D1 with migrations under `migrations/d1`. PostgreSQL belongs only to the separately deployed official XMTP listener.
 - Auth is split between wallet bearer tokens for app management, `X-API-Key`
   for generic push, public Converge registration, and a secret bearer token for
   official XMTP notification-server delivery.
@@ -48,12 +48,8 @@ These instructions apply to the entire repository.
   validation, and Web Push delivery.
 - `migrations/d1/`: ordered production D1 migrations.
 - `tests/worker/`: contract tests plus a Miniflare D1 integration test.
-- `app/api/`: API route handlers; keep `runtime = 'nodejs'` for routes that use Node-only libraries.
-- `lib/types.ts`: Zod schemas and TypeScript API types; update this before or with API behavior changes.
-- `lib/db.ts`: table creation, mapping, CRUD, subscription counting, and rate-limit log operations.
-- `lib/notifications.ts`: web-push delivery, targeting, expired subscription cleanup, and per-minute send limiting.
 - `public/openapi.yaml` and `public/llms.txt`: machine-readable API docs that must stay in sync with shipped handlers.
-- `components/` and `app/dashboard/`: product surface; do not display unsupported metrics or limits.
+- `app/`, `components/`, `hooks/`, `lib/`, and the Postgres migration script are historical reference only. Do not add them back to the package graph unless the product explicitly restores that runtime and its security maintenance burden.
 
 ## Local workflows
 - Dev: `npm run dev`
@@ -66,7 +62,8 @@ These instructions apply to the entire repository.
 - `maxSubscriptions` is enforced on subscribe requests.
 - `maxNotificationsPerMinute` is enforced on send requests.
 - `maxNotificationsPerDay` exists in stored app config but is not currently enforced by a daily window.
-- `npm run build` fetches Google Fonts through `next/font` in `app/layout.tsx`; sandboxed builds may need network approval or self-hosted fonts.
+- Node.js 22+ is required by Wrangler 4.110.0 and the matching Miniflare/Worker-types toolchain.
+- `npm audit --audit-level=low` is a release gate and must remain at zero findings.
 - `npm test` runs Vitest, and the D1 test uses Miniflare/workerd. Sandboxes that
   prohibit a localhost socket must run it with the required process permission.
 - Explicit Converge unsubscribe deletes inbox topic/HMAC material immediately;

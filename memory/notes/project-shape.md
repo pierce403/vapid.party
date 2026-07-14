@@ -2,13 +2,13 @@
 
 ## Current App
 
-- Next.js 14 app-router project for a Web3-authenticated Web Push relay.
+- Cloudflare Worker project for a Web Push and XMTP-aware relay. Historical Next.js files are unbuilt reference only and are excluded from package scripts and dependencies.
 - App management uses wallet bearer auth; push subscription and send routes use `X-API-Key`.
-- Each app has its own VAPID keypair stored in Postgres.
-- `lib/types.ts` owns Zod request schemas and shared TypeScript API types.
-- `lib/db.ts` owns table creation, row mapping, CRUD, subscription counts, and rate-limit logs.
-- `lib/notifications.ts` owns web-push delivery, targeting, expired subscription cleanup, and per-minute send limiting.
-- `public/openapi.yaml`, `public/llms.txt`, README examples, and dashboard snippets are public API contract surfaces.
+- Each app has its own VAPID keypair stored in D1.
+- `src/worker/schemas.ts` owns Zod request schemas; `src/worker/types.ts` owns shared Worker types.
+- `src/worker/db.ts` owns D1 row mapping, CRUD, subscription counts, and rate-limit logs.
+- `src/worker/push.ts`, `src/worker/core.ts`, and `src/worker/queue.ts` own Web Push delivery, XMTP targeting, expired-subscription cleanup, and queued delivery.
+- `public/openapi.yaml`, `public/llms.txt`, and README examples are public API contract surfaces.
 
 ## Local Commands
 
@@ -21,7 +21,7 @@
 Verified during the 2026-07-08 structure pass:
 
 - `npm run lint`
-- `npm run build` (requires network access for `next/font` Google Fonts fetches)
+- `npm run build` (Wrangler dry-run bundle; requires Node.js 22+)
 
 ## Product-Honesty Constraints
 
@@ -33,7 +33,7 @@ Verified during the 2026-07-08 structure pass:
 
 ## Change Discipline
 
-- Keep API behavior, Zod schemas, OpenAPI docs, `llms.txt`, README examples, and dashboard snippets synchronized.
-- Preserve Node runtime for route handlers that depend on Node-only libraries like `web-push`.
+- Keep Worker API behavior, Zod schemas, OpenAPI docs, `llms.txt`, and README examples synchronized.
+- Preserve the Worker compatibility flags required by `web-push` and verify delivery code in Wrangler/Miniflare.
 - Run the relevant checks before committing and pushing finished work.
 - Prefer GitHub CLI/HTTPS auth for pushes; SSH signing can fail in this environment.

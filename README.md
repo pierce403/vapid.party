@@ -2,7 +2,7 @@
 
 Cloudflare-hosted Web Push relay with public XMTP-aware registration endpoints for Converge.
 
-The production target is a single Cloudflare Worker with D1, Queues, Durable Objects, and optional static assets. The legacy Next/Vercel code remains in the repository for reference/dashboard continuity, but the deployable runtime is now `src/worker`.
+The production target is a single Cloudflare Worker with D1, Queues, Durable Objects, and optional static assets. Historical Next/Vercel source remains only as an unbuilt reference: its scripts and dependencies are deliberately absent from the installable package graph. The supported runtime is `src/worker` on Node.js 22+ tooling.
 
 ## Status
 
@@ -47,6 +47,8 @@ npm install
 npm run db:migrate
 npm run dev
 ```
+
+`npm audit --audit-level=low` is a required release gate and must report zero findings.
 
 Useful checks:
 
