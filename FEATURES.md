@@ -169,7 +169,8 @@ Test Criteria:
 - [x] Real XMTP group delivery matched three HMAC epochs through the deployed Container
 - [x] The production canary verified own-message and `shouldPush: false` suppression
 - [x] A lifecycle regression test prevents activity expiry from stopping the listener
-- [ ] Production stays connected across the former ten-minute idle cutoff
+- [x] Production held one stream connection for 11 minutes 31 seconds across
+  the former ten-minute idle cutoff on 2026-07-15
 - [ ] Restart/disconnect behavior is observed over time
 
 ## Queue-Backed Web Push

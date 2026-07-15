@@ -94,8 +94,10 @@ These instructions apply to the entire repository.
 - Production has D1 migrations 0001 through 0004, the current Worker contract,
   Queue, and the singleton custom Go XMTP listener Container deployed. Public
   health reported `deliveryReady: true`, listener `ready`, and bridge `synced`
-  on 2026-07-14. `SubscribeAll` has no listener replay cursor, so push can still
-  have restart/disconnect gaps while normal XMTP client sync remains authoritative.
+  on 2026-07-14. On 2026-07-15 the same `streamConnectedAt` survived for 11
+  minutes 31 seconds across the former ten-minute idle cutoff. `SubscribeAll`
+  has no listener replay cursor, so push can still have restart/disconnect gaps
+  while normal XMTP client sync remains authoritative.
 - XMTP stream traffic is background work and does not renew the Container
   helper's `sleepAfter` timer. Preserve the listener's `onActivityExpired()`
   renewal override; the minute `startAndWaitForPorts()` cron starts and checks

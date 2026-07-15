@@ -15,6 +15,8 @@ reported `deliveryReady: true`, listener `ready`, bridge `synced`, and zero
 pending or failed registrations. A post-deployment production canary then
 verified a real XMTP welcome, group delivery, own-message suppression,
 `shouldPush: false`, and complete cleanup through a real Chrome subscription.
+On 2026-07-15 a lifecycle canary then held one XMTP stream connection for 11
+minutes 31 seconds across the former ten-minute Container idle cutoff.
 Web Push remains experimental while restart/disconnect behavior and mobile/PWA
 reliability are characterized.
 

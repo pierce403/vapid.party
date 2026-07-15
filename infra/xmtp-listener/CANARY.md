@@ -28,10 +28,12 @@ changes.
 
 ## Container Lifecycle Watchdog
 
-1. Record `streamConnectedAt`, Container placement time, and current uptime.
+1. Record `streamConnectedAt`, Container placement time, and current uptime when
+   nonzero Container telemetry is available.
 2. Leave the instance untouched for at least 11 minutes. Confirm
-   `streamConnectedAt` does not reset, uptime exceeds 600 seconds, and public
-   health remains listener `ready`, bridge `synced`, and `deliveryReady: true`.
+   `streamConnectedAt` does not reset, its observed stream age exceeds 600
+   seconds, and public health remains listener `ready`, bridge `synced`, and
+   `deliveryReady: true`. Cross-check Container uptime when telemetry is nonzero.
 3. Stop the Container without manually restarting it. Confirm the minute cron
    restores the singleton within the next interval plus startup time, then
    confirm its snapshot cursor catches up and `/readyz` returns `200`.
@@ -89,3 +91,15 @@ The post-deployment canary passed on 2026-07-14 at 22:34 UTC:
 The feature remains experimental because this one-shot proof does not provide a
 durable `SubscribeAll` replay cursor or characterize long-running restart,
 disconnect, installed-PWA, and mobile behavior.
+
+The lifecycle-only canary passed on 2026-07-15 at 18:33 UTC:
+
+- Worker version: `0ffba223-4776-4e20-9c77-301f6c15dfef`.
+- Public health kept `streamConnectedAt` at
+  `2026-07-15T18:22:02.514319839Z` through the final sample at
+  `2026-07-15T18:33:33.752Z`, while `lastCheckedAt` advanced and the listener
+  remained ready, synced, and delivery-ready.
+- No request was sent to the Container during the observation. The public
+  health route read the Worker's coarse D1 status only.
+- The lifecycle regression is fixed, but host replacement and upstream
+  disconnect coverage remain open.
