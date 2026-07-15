@@ -52,6 +52,18 @@ Defaults are production-safe for the first deployment:
 The Worker injects the two URLs, both secrets, the release version, and a stable
 instance ID. Do not put either bearer token in `wrangler.jsonc` or the image.
 
+## Container Lifecycle
+
+The Worker-side Container class renews activity when its idle timer expires so
+the long-running `SubscribeAll` process is not stopped as an idle HTTP service.
+A minute cron starts a missing singleton and waits for its liveness port. This
+watchdog does not replace `/readyz`, which continues to measure XMTP stream and
+control-plane readiness.
+
+The watchdog persists no envelopes, ciphertext, message bodies, or replay
+cursor. Container replacement rebuilds the routing index from D1 registration
+metadata and reconnects to the live stream.
+
 ## Health Semantics
 
 - `GET /livez` means the process and HTTP server are alive. Container liveness

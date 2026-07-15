@@ -26,6 +26,19 @@ changes.
 5. Stop and restart the container. It must full-snapshot at one cursor, apply
    all subsequent deltas, and return ready without losing current routes.
 
+## Container Lifecycle Watchdog
+
+1. Record `streamConnectedAt`, Container placement time, and current uptime.
+2. Leave the instance untouched for at least 11 minutes. Confirm
+   `streamConnectedAt` does not reset, uptime exceeds 600 seconds, and public
+   health remains listener `ready`, bridge `synced`, and `deliveryReady: true`.
+3. Stop the Container without manually restarting it. Confirm the minute cron
+   restores the singleton within the next interval plus startup time, then
+   confirm its snapshot cursor catches up and `/readyz` returns `200`.
+
+This canary proves the deterministic idle-stop path is disabled. It does not
+prove zero gaps across Cloudflare host replacement or upstream disconnects.
+
 ## End-To-End Delivery
 
 1. From a different installation, send one ordinary message into the registered

@@ -96,6 +96,10 @@ These instructions apply to the entire repository.
   health reported `deliveryReady: true`, listener `ready`, and bridge `synced`
   on 2026-07-14. `SubscribeAll` has no listener replay cursor, so push can still
   have restart/disconnect gaps while normal XMTP client sync remains authoritative.
+- XMTP stream traffic is background work and does not renew the Container
+  helper's `sleepAfter` timer. Preserve the listener's `onActivityExpired()`
+  renewal override; the minute `startAndWaitForPorts()` cron starts and checks
+  the process but its already-running fast path does not renew activity.
 - XMTP v3 group message topics contain a 16-byte group id (`g-` plus 32 hex
   characters). Welcome topics contain the 32-byte installation id (`w-` plus
   64 hex characters). Never apply one identifier length to both topic kinds.

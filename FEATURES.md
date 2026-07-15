@@ -160,11 +160,16 @@ Properties:
   after the Worker accepts the minimal event.
 - The Worker temporarily accepts the previous official HTTP `SendRequest` shape
   for migration compatibility; the production Container uses the minimal event.
+- Container activity expiry renews the long-running listener instead of taking
+  the default stop path. A minute cron reasserts startup for the singleton after
+  a real process or host exit.
 
 Test Criteria:
 - [x] Real XMTP installation welcome reached Converge through the deployed Container
 - [x] Real XMTP group delivery matched three HMAC epochs through the deployed Container
 - [x] The production canary verified own-message and `shouldPush: false` suppression
+- [x] A lifecycle regression test prevents activity expiry from stopping the listener
+- [ ] Production stays connected across the former ten-minute idle cutoff
 - [ ] Restart/disconnect behavior is observed over time
 
 ## Queue-Backed Web Push

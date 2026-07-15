@@ -7,4 +7,10 @@ export class XmtpListenerContainer extends Container<Env> {
   pingEndpoint = 'livez';
   sleepAfter = '10m';
   enableInternet = true;
+
+  override async onActivityExpired(): Promise<void> {
+    // SubscribeAll is intentional background activity. Keep this singleton awake;
+    // the minute cron separately starts and checks the process after real exits.
+    this.renewActivityTimeout();
+  }
 }

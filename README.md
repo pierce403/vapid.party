@@ -63,6 +63,12 @@ The container:
 The listener never stores PostgreSQL state and never sends XMTP ciphertext,
 sender identity, or message content to the Worker.
 
+The Container lifecycle treats the long-running `SubscribeAll` stream as
+intentional background work: activity expiry renews the singleton instead of
+stopping it. A minute cron starts a missing process and rechecks its liveness
+port. That cron is a recovery backstop, not a readiness signal; use
+`GET /api/health` and `/readyz` for stream and control-plane readiness.
+
 ## Readiness
 
 `GET /api/health` is public and returns Worker health plus a coarse XMTP path
