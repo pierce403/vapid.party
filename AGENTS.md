@@ -82,6 +82,8 @@ These instructions apply to the entire repository.
   concurrency-safe enforcement layer; API checks provide earlier responses.
 - Node.js 22+ is required by Wrangler 4.110.0 and the matching Miniflare/Worker-types toolchain.
 - `npm audit --audit-level=low` is a release gate and must remain at zero findings.
+- `npm audit` does not cover `infra/xmtp-listener/go.mod`; reconcile open Go
+  Dependabot alerts separately, then rerun the listener race tests and `go vet`.
 - `npm test` runs Vitest, and the D1 test uses Miniflare/workerd. Sandboxes that
   prohibit a localhost socket must run it with the required process permission.
 - Explicit Converge unsubscribe deletes inbox topic/HMAC material immediately;
