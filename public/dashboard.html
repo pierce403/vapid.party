@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#081119" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta
+      name="description"
+      content="Private app usage and settings for vapid.party."
+    />
+    <title>Private dashboard | vapid.party</title>
+    <script src="/dashboard.js"></script>
+    <link rel="stylesheet" href="/site.css" />
+  </head>
+  <body class="dashboard-body">
+    <header class="dashboard-header">
+      <nav class="site-nav shell" aria-label="Primary navigation">
+        <a class="brand" href="/">vapid<span>.</span>party</a>
+        <div class="nav-links">
+          <a class="nav-leaderboard" href="/#leaderboard">Leaderboard</a>
+          <a class="nav-docs" href="/openapi.yaml">OpenAPI</a>
+          <button class="nav-button" type="button" data-forget hidden>Forget this app</button>
+        </div>
+      </nav>
+    </header>
+
+    <main class="dashboard-main shell">
+      <section class="access-card" data-access aria-labelledby="access-title" hidden>
+        <p class="section-kicker">Private capability</p>
+        <h1 id="access-title">Open a dashboard.</h1>
+        <p>
+          Paste the app ID and app secret you saved when the app was created.
+          The secret stays in this tab.
+        </p>
+        <form data-access-form novalidate>
+          <div class="field-group">
+            <label for="access-app-id">App ID</label>
+            <input
+              id="access-app-id"
+              name="appId"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </div>
+          <div class="field-group">
+            <label for="access-secret">App secret</label>
+            <input
+              id="access-secret"
+              name="appSecret"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </div>
+          <button class="button button-primary button-block" type="submit">Open dashboard</button>
+          <p class="form-status" data-access-status role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section class="dashboard-loading" data-dashboard-loading aria-live="polite">
+        <span class="status-indicator" aria-hidden="true"></span>
+        <span data-loading-message>Loading app usage…</span>
+        <button class="button button-small" type="button" data-retry-dashboard hidden>Try again</button>
+      </section>
+
+      <section data-dashboard hidden>
+        <div class="dashboard-titlebar">
+          <div>
+            <p class="section-kicker">Private app dashboard</p>
+            <h1 data-app-name>—</h1>
+            <p class="dashboard-id">App ID <code data-app-id>—</code></p>
+          </div>
+          <div class="dashboard-meta">
+            <span class="domain-badge" data-domain-badge>Domain not last-verified</span>
+            <span data-generated-at>Usage time unavailable</span>
+          </div>
+        </div>
+
+        <p class="dashboard-alert" data-dashboard-alert role="status" aria-live="polite"></p>
+
+        <dl class="metrics-grid" aria-label="App usage">
+          <div class="metric-card">
+            <dt>Active subscriptions</dt>
+            <dd data-stat-subscriptions>—</dd>
+          </div>
+          <div class="metric-card">
+            <dt>Public XMTP enrollment</dt>
+            <dd>Unavailable</dd>
+          </div>
+          <div class="metric-card">
+            <dt>Provider accepted · today UTC</dt>
+            <dd data-stat-accepted-today>—</dd>
+          </div>
+          <div class="metric-card">
+            <dt>Provider accepted · 7 UTC dates</dt>
+            <dd data-stat-accepted-week>—</dd>
+          </div>
+        </dl>
+
+        <div class="dashboard-grid">
+          <section class="dashboard-panel" aria-labelledby="delivery-detail-title">
+            <p class="section-kicker">Operational detail</p>
+            <h2 id="delivery-detail-title">Seven-date delivery window</h2>
+            <dl class="detail-list">
+              <div><dt>Queued</dt><dd data-stat-queued>—</dd></div>
+              <div><dt>Failed</dt><dd data-stat-failed>—</dd></div>
+              <div><dt>Expired endpoints</dt><dd data-stat-expired>—</dd></div>
+            </dl>
+            <p class="panel-note" data-retention-note>
+              Provider acceptance does not prove that a browser displayed a notification.
+            </p>
+          </section>
+
+          <section class="dashboard-panel" aria-labelledby="keys-title">
+            <p class="section-kicker">Browser configuration</p>
+            <h2 id="keys-title">Public app values</h2>
+            <p>These values are safe to use in generic Web Push enrollment. The app secret is not.</p>
+            <div class="field-group">
+              <label for="dashboard-app-id">App ID</label>
+              <div class="copy-control">
+                <input id="dashboard-app-id" data-public-app-id type="text" readonly />
+                <button class="button button-small" type="button" data-copy="app-id">Copy</button>
+              </div>
+            </div>
+            <div class="field-group">
+              <label for="dashboard-vapid-key">Public VAPID key</label>
+              <div class="copy-control">
+                <input id="dashboard-vapid-key" data-public-vapid-key type="text" readonly />
+                <button class="button button-small" type="button" data-copy="vapid-key">Copy</button>
+              </div>
+            </div>
+            <p class="copy-status" data-public-copy-status role="status" aria-live="polite"></p>
+          </section>
+        </div>
+
+        <div class="dashboard-grid dashboard-settings">
+          <section class="dashboard-panel" aria-labelledby="profile-title">
+            <p class="section-kicker">Public identity</p>
+            <h2 id="profile-title">App profile</h2>
+            <form data-profile-form novalidate>
+              <div class="field-group">
+                <label for="profile-name">App name</label>
+                <input id="profile-name" name="name" maxlength="255" required />
+              </div>
+              <div class="field-group">
+                <label for="profile-description">Short description</label>
+                <textarea id="profile-description" name="description" maxlength="500" rows="4"></textarea>
+                <p class="field-help">Shown publicly only when you opt into the leaderboard.</p>
+              </div>
+              <button class="button" type="submit">Save profile</button>
+              <p class="form-status" data-profile-status role="status" aria-live="polite"></p>
+            </form>
+          </section>
+
+          <section class="dashboard-panel" aria-labelledby="domain-title">
+            <p class="section-kicker">DNS binding</p>
+            <h2 id="domain-title">Bind and check a domain</h2>
+            <p>
+              Publish a TXT record binding this domain to the exact app ID and VAPID
+              public key, then check it here. The result is a last-verified snapshot,
+              not continuous ownership monitoring, and must be refreshed within seven
+              days for leaderboard eligibility. DNS never grants dashboard access.
+            </p>
+            <form data-domain-form novalidate>
+              <div class="field-group">
+                <label for="profile-domain">Domain</label>
+                <input
+                  id="profile-domain"
+                  name="domain"
+                  type="text"
+                  maxlength="253"
+                  placeholder="example.com"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <p class="field-help">Hostname only; no scheme, path, port, wildcard, or IP address.</p>
+              </div>
+              <div class="button-row">
+                <button class="button" type="submit">Save domain</button>
+                <button class="button button-quiet" type="button" data-remove-domain hidden>
+                  Remove domain
+                </button>
+              </div>
+              <p class="form-status" data-domain-status role="status" aria-live="polite"></p>
+            </form>
+
+            <div class="dns-record" data-dns-record hidden>
+              <p class="dns-state" data-dns-state>Not last-verified</p>
+              <div class="field-group">
+                <label for="dns-record-name">TXT name</label>
+                <div class="copy-control">
+                  <input id="dns-record-name" data-dns-name type="text" readonly />
+                  <button class="button button-small" type="button" data-copy="dns-name">Copy</button>
+                </div>
+              </div>
+              <div class="field-group">
+                <label for="dns-record-value">TXT value</label>
+                <div class="copy-control">
+                  <input id="dns-record-value" data-dns-value type="text" readonly />
+                  <button class="button button-small" type="button" data-copy="dns-value">Copy</button>
+                </div>
+              </div>
+              <button class="button button-primary" type="button" data-verify-domain>
+                Check DNS record
+              </button>
+              <p class="copy-status" data-dns-copy-status role="status" aria-live="polite"></p>
+            </div>
+          </section>
+        </div>
+
+        <section class="dashboard-panel leaderboard-settings" aria-labelledby="listing-title">
+          <div>
+            <p class="section-kicker">Free promotion</p>
+            <h2 id="listing-title">Join the public leaderboard</h2>
+            <p>
+              Opt in to publish the app name, description, last-verified domain, and real
+              provider-accepted sends across today plus the six prior UTC dates. Activity
+              is not an endorsement, and DNS verification is not continuous.
+            </p>
+          </div>
+          <form data-listing-form>
+            <label class="checkbox-label">
+              <input type="checkbox" name="leaderboardOptIn" data-listing-checkbox />
+              <span>List this app publicly</span>
+            </label>
+            <button class="button" type="submit">Save listing choice</button>
+            <p class="form-status" data-listing-status role="status" aria-live="polite"></p>
+          </form>
+        </section>
+
+        <section class="dashboard-panel credential-panel" aria-labelledby="secret-title">
+          <div>
+            <p class="section-kicker">Credential safety</p>
+            <h2 id="secret-title">Rotate the app secret</h2>
+            <p>
+              Rotation invalidates the current secret immediately. The replacement is
+              shown once and cannot be recovered.
+            </p>
+          </div>
+          <div>
+            <button class="button" type="button" data-rotate-secret>Rotate secret</button>
+            <div class="rotated-secret" data-rotated-secret hidden>
+              <label for="new-app-secret">New app secret</label>
+              <div class="secret-control">
+                <input
+                  id="new-app-secret"
+                  data-new-app-secret
+                  type="password"
+                  readonly
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button class="button button-small" type="button" data-toggle-new-secret>Show</button>
+                <button class="button button-small" type="button" data-copy="new-secret">Copy</button>
+              </div>
+            </div>
+            <p class="form-status" data-rotate-status role="status" aria-live="polite"></p>
+          </div>
+        </section>
+
+        <section class="dashboard-panel danger-panel" aria-labelledby="delete-title">
+          <div>
+            <p class="section-kicker">Danger zone</p>
+            <h2 id="delete-title">Delete this app</h2>
+            <p>Deletion permanently removes the app and its subscriptions. This cannot be undone.</p>
+          </div>
+          <form data-delete-form novalidate>
+            <div class="field-group">
+              <label for="delete-confirmation">Type the app ID to confirm</label>
+              <input id="delete-confirmation" name="confirmation" autocomplete="off" spellcheck="false" />
+            </div>
+            <button class="button button-danger" type="submit" disabled data-delete-button>
+              Delete app permanently
+            </button>
+            <p class="form-status" data-delete-status role="status" aria-live="polite"></p>
+          </form>
+        </section>
+      </section>
+
+      <section class="access-card" data-deleted hidden tabindex="-1" aria-labelledby="deleted-title">
+        <p class="section-kicker">App deleted</p>
+        <h1 id="deleted-title">The app is gone.</h1>
+        <p>Its dashboard capability has been cleared from this tab.</p>
+        <a class="button button-primary" href="/#create-app">Create another app</a>
+      </section>
+    </main>
+
+    <footer>
+      <div class="footer-inner shell">
+        <p>Private capabilities stay in this browser tab.</p>
+        <p><a href="/">Back to vapid.party</a></p>
+      </div>
+    </footer>
+  </body>
+</html>

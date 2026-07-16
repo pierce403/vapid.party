@@ -75,8 +75,42 @@ describe('per-delivery Web Push credentials', () => {
       { ttl: 60, urgency: 'high' }
     );
     expect(vi.mocked(webPush.sendNotification).mock.calls[0][2]).toMatchObject({
+      timeout: 45_000,
       TTL: 60,
       urgency: 'high',
     });
+  });
+
+  it('exposes a bounded Retry-After delay from provider failures', async () => {
+    vi.mocked(webPush.sendNotification).mockRejectedValueOnce({
+      statusCode: 429,
+      message: 'rate limited',
+      headers: { 'retry-after': '900' },
+    });
+
+    await expect(sendWebPush(
+      app('retry-after'),
+      subscription('retry-after'),
+      { type: 'test' }
+    )).resolves.toMatchObject({
+      success: false,
+      statusCode: 429,
+      retryAfterSeconds: 300,
+    });
+  });
+
+  it('ignores malformed Retry-After values', async () => {
+    vi.mocked(webPush.sendNotification).mockRejectedValueOnce({
+      statusCode: 503,
+      message: 'unavailable',
+      headers: { 'Retry-After': 'not-a-date' },
+    });
+
+    const result = await sendWebPush(
+      app('bad-retry-after'),
+      subscription('bad-retry-after'),
+      { type: 'test' }
+    );
+    expect(result.retryAfterSeconds).toBeUndefined();
   });
 });

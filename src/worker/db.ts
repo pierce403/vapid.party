@@ -1,6 +1,9 @@
 import type {
+  AppPublicProfile,
   AppRecord,
+  AppUsageStats,
   Env,
+  LeaderboardEntry,
   PushPayload,
   PushQueueJob,
   RateLimitConfig,
@@ -21,10 +24,28 @@ import {
   markXmtpListenerRouteDirty,
   recordXmtpListenerChange,
 } from './listener-registry';
-import { bytesToBase64Url, bytesToHex, timingSafeEqualString } from './encoding';
+import { bytesToBase64Url, bytesToHex, sha256Hex, timingSafeEqualString } from './encoding';
 import { generateApiKey, generateVapidKeys } from './vapid';
+import { APP_DOMAIN_VERIFICATION_FRESHNESS_MS } from './domain';
 
 type JsonValue = Record<string, unknown> | unknown[];
+
+const PUBLIC_APP_RATE_LIMIT: RateLimitConfig = {
+  maxNotificationsPerMinute: 60,
+  maxNotificationsPerDay: 10_000,
+  // App deletion and shared-endpoint cleanup currently emit one listener
+  // tombstone per logical XMTP route. Keep the frictionless tier within D1's
+  // paid per-invocation query budget until that maintenance becomes a Workflow.
+  maxSubscriptions: 150,
+};
+
+const XMTP_APP_CAPACITY_ROWS = 5_000;
+const XMTP_GLOBAL_CAPACITY_ROWS = 25_000;
+const XMTP_GLOBAL_CAPACITY_LOCK = {
+  appId: '__vapid_party_global__',
+  scope: '__xmtp_capacity__',
+  resourceId: '__all__',
+};
 
 export class XmtpAppIsolationPendingError extends Error {
   constructor() {
@@ -38,6 +59,57 @@ export class XmtpEndpointKeyConflictError extends Error {
     super('An active Web Push endpoint cannot be reused with different subscription keys');
     this.name = 'XmtpEndpointKeyConflictError';
   }
+}
+
+export class XmtpInstallationIdentityConflictError extends Error {
+  constructor() {
+    super('This XMTP installation is already registered to another inbox for this app');
+    this.name = 'XmtpInstallationIdentityConflictError';
+  }
+}
+
+export function isAppSubscriptionLimitError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth += 1) {
+    if (typeof current === 'string') {
+      return current.includes('app_subscription_limit');
+    }
+    if (!(current instanceof Error)) return false;
+    if (current.message.includes('app_subscription_limit')) return true;
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function errorChainIncludes(error: unknown, marker: string): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth += 1) {
+    if (typeof current === 'string') return current.includes(marker);
+    if (!(current instanceof Error)) return false;
+    if (current.message.includes(marker)) return true;
+    current = (current as Error & { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+export function isXmtpAppCapacityLimitError(error: unknown): boolean {
+  return errorChainIncludes(error, 'xmtp_app_capacity_limit');
+}
+
+export function isXmtpGlobalCapacityLimitError(error: unknown): boolean {
+  return errorChainIncludes(error, 'xmtp_global_capacity_limit');
+}
+
+export function isXmtpHmacKeySizeError(error: unknown): boolean {
+  return errorChainIncludes(error, 'xmtp_hmac_key_size');
+}
+
+export function isPublicAppCapacityLimitError(error: unknown): boolean {
+  return errorChainIncludes(error, 'public_app_capacity_limit');
+}
+
+export function isPublicSubscriptionCapacityLimitError(error: unknown): boolean {
+  return errorChainIncludes(error, 'public_subscription_capacity_limit');
 }
 
 interface AppRow {
@@ -66,6 +138,26 @@ interface SubscriptionRow {
   updated_at: string;
   expires_at: string | null;
   disabled_at: string | null;
+  management_token_hash?: string | null;
+}
+
+interface AppPublicProfileRow {
+  app_id: string;
+  description: string;
+  domain: string | null;
+  domain_verified_at: string | null;
+  domain_last_checked_at: string | null;
+  domain_verification_status: 'unverified' | 'verified' | 'mismatch';
+  domain_verified_vapid_key: string | null;
+  leaderboard_opt_in: number;
+  updated_at: string;
+}
+
+interface UsageCountRow {
+  queued: number | null;
+  sent: number | null;
+  failed: number | null;
+  expired: number | null;
 }
 
 interface TopicMatchRow {
@@ -95,7 +187,7 @@ interface XmtpDiagnosticRegistrationRow {
 }
 
 interface DiagnosticAttemptRow {
-  status: 'queued' | 'sent' | 'failed' | 'expired';
+  status: 'queued' | 'processing' | 'sent' | 'failed' | 'expired';
   attempts: number;
   push_status: number | null;
   payload_json: string;
@@ -133,15 +225,21 @@ function generateDiagnosticReceipt(): string {
 }
 
 async function hashDiagnosticReceipt(receipt: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(receipt));
-  return bytesToHex(new Uint8Array(digest));
+  return sha256Hex(receipt);
 }
 
-function diagnosticPaths(receipt: string): XmtpRegistrationResult['diagnostics'] {
+function generateManagementToken(): string {
+  return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+function diagnosticPaths(
+  receipt: string,
+  basePath = '/api/xmtp'
+): XmtpRegistrationResult['diagnostics'] {
   return {
     receipt,
-    statusPath: '/api/xmtp/status',
-    testPath: '/api/xmtp/status/test',
+    statusPath: `${basePath}/status`,
+    testPath: `${basePath}/status/test`,
   };
 }
 
@@ -177,13 +275,48 @@ function mapSubscription(row: SubscriptionRow): SubscriptionRecord {
   };
 }
 
+function mapPublicProfile(row: AppPublicProfileRow | null): AppPublicProfile {
+  return {
+    description: row?.description ?? '',
+    domain: row?.domain ?? undefined,
+    domainVerifiedAt: row?.domain_verified_at ?? undefined,
+    domainLastCheckedAt: row?.domain_last_checked_at ?? undefined,
+    domainVerificationStatus: row?.domain_verification_status ?? 'unverified',
+    leaderboardOptIn: row?.leaderboard_opt_in === 1,
+    updatedAt: row?.updated_at ?? nowIso(),
+  };
+}
+
 export async function getAppById(db: D1Database, id: string): Promise<AppRecord | null> {
   const row = await db.prepare('SELECT * FROM apps WHERE id = ?').bind(id).first<AppRow>();
   return row ? mapApp(row) : null;
 }
 
 export async function getAppByApiKey(db: D1Database, apiKey: string): Promise<AppRecord | null> {
-  const row = await db.prepare('SELECT * FROM apps WHERE api_key = ?').bind(apiKey).first<AppRow>();
+  const row = await db.prepare(`
+    SELECT apps.*
+    FROM apps
+    WHERE apps.api_key = ?
+      AND NOT EXISTS (
+        SELECT 1 FROM app_credentials
+        WHERE app_credentials.app_id = apps.id
+          AND app_credentials.revoked_at IS NULL
+      )
+  `).bind(apiKey).first<AppRow>();
+  return row ? mapApp(row) : null;
+}
+
+export async function getAppByCredentialHash(
+  db: D1Database,
+  secretHash: string
+): Promise<AppRecord | null> {
+  const row = await db.prepare(`
+    SELECT apps.*
+    FROM app_credentials
+    JOIN apps ON apps.id = app_credentials.app_id
+    WHERE app_credentials.secret_hash = ?
+      AND app_credentials.revoked_at IS NULL
+  `).bind(secretHash).first<AppRow>();
   return row ? mapApp(row) : null;
 }
 
@@ -225,6 +358,212 @@ export async function createApp(
   const app = await getAppById(db, id);
   if (!app) throw new Error('Created app could not be loaded');
   return app;
+}
+
+export async function createPublicApp(
+  db: D1Database,
+  input: {
+    name: string;
+    description?: string;
+    domain?: string;
+    leaderboardOptIn?: boolean;
+  }
+): Promise<{ app: AppRecord; appSecret: string }> {
+  const id = crypto.randomUUID();
+  const appSecret = generateApiKey();
+  const secretHash = await sha256Hex(appSecret);
+  const vapidKeys = await generateVapidKeys();
+  const timestamp = nowIso();
+
+  await db.batch([
+    db.prepare(`
+      INSERT INTO apps (
+        id, name, owner_wallet, api_key, vapid_public_key, vapid_private_key,
+        metadata, rate_limit, created_at, updated_at
+      ) VALUES (?, ?, 'public', ?, ?, ?, '{}', ?, ?, ?)
+    `).bind(
+      id,
+      input.name,
+      `disabled:${crypto.randomUUID()}`,
+      vapidKeys.publicKey,
+      vapidKeys.privateKey,
+      JSON.stringify(PUBLIC_APP_RATE_LIMIT),
+      timestamp,
+      timestamp
+    ),
+    db.prepare(`
+      INSERT INTO app_credentials (id, app_id, secret_hash, created_at)
+      VALUES (?, ?, ?, ?)
+    `).bind(crypto.randomUUID(), id, secretHash, timestamp),
+    db.prepare(`
+      INSERT INTO app_public_profiles (
+        app_id, description, domain, leaderboard_opt_in, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(
+      id,
+      input.description ?? '',
+      input.domain ?? null,
+      input.leaderboardOptIn ? 1 : 0,
+      timestamp,
+      timestamp
+    ),
+  ]);
+
+  const app = await getAppById(db, id);
+  if (!app) throw new Error('Created public app could not be loaded');
+  return { app, appSecret };
+}
+
+export async function rotatePublicAppSecret(
+  db: D1Database,
+  appId: string,
+  currentAppSecret: string
+): Promise<string | null> {
+  const appSecret = generateApiKey();
+  const timestamp = nowIso();
+  const result = await db.prepare(`
+    UPDATE app_credentials
+    SET id = ?, secret_hash = ?, created_at = ?, revoked_at = NULL
+    WHERE app_id = ? AND secret_hash = ? AND revoked_at IS NULL
+  `).bind(
+    crypto.randomUUID(),
+    await sha256Hex(appSecret),
+    timestamp,
+    appId,
+    await sha256Hex(currentAppSecret)
+  ).run();
+  // The compare-and-swap makes concurrent already-authenticated rotations
+  // deterministic: exactly one caller receives the new live capability.
+  return result.meta.changes === 1 ? appSecret : null;
+}
+
+export async function getAppPublicProfile(
+  db: D1Database,
+  appId: string
+): Promise<AppPublicProfile> {
+  const row = await db.prepare(`
+    SELECT * FROM app_public_profiles WHERE app_id = ?
+  `).bind(appId).first<AppPublicProfileRow>();
+  return mapPublicProfile(row);
+}
+
+export async function isPublicApp(db: D1Database, appId: string): Promise<boolean> {
+  const row = await db.prepare(`
+    SELECT 1 AS present FROM app_public_profiles WHERE app_id = ?
+  `).bind(appId).first<{ present: number }>();
+  return Boolean(row);
+}
+
+export async function updatePublicApp(
+  db: D1Database,
+  appId: string,
+  updates: {
+    name?: string;
+    description?: string;
+    domain?: string | null;
+    leaderboardOptIn?: boolean;
+  }
+): Promise<{ app: AppRecord; profile: AppPublicProfile } | null> {
+  const app = await getAppById(db, appId);
+  if (!app) return null;
+  const current = await getAppPublicProfile(db, appId);
+  const nextDomain = updates.domain === undefined ? current.domain : updates.domain ?? undefined;
+  const domainChanged = nextDomain !== current.domain;
+  const timestamp = nowIso();
+
+  await db.batch([
+    db.prepare('UPDATE apps SET name = ?, updated_at = ? WHERE id = ?')
+      .bind(updates.name ?? app.name, timestamp, appId),
+    db.prepare(`
+      INSERT INTO app_public_profiles (
+        app_id, description, domain, domain_verified_at,
+        leaderboard_opt_in, created_at, updated_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+      ON CONFLICT(app_id) DO UPDATE SET
+        description = excluded.description,
+        domain = excluded.domain,
+        domain_verified_at = CASE
+          WHEN app_public_profiles.domain = excluded.domain
+          THEN app_public_profiles.domain_verified_at
+          ELSE NULL
+        END,
+        domain_last_checked_at = CASE
+          WHEN app_public_profiles.domain = excluded.domain
+          THEN app_public_profiles.domain_last_checked_at
+          ELSE NULL
+        END,
+        domain_verification_status = CASE
+          WHEN app_public_profiles.domain = excluded.domain
+          THEN app_public_profiles.domain_verification_status
+          ELSE 'unverified'
+        END,
+        domain_verified_vapid_key = CASE
+          WHEN app_public_profiles.domain = excluded.domain
+          THEN app_public_profiles.domain_verified_vapid_key
+          ELSE NULL
+        END,
+        leaderboard_opt_in = excluded.leaderboard_opt_in,
+        updated_at = excluded.updated_at
+    `).bind(
+      appId,
+      updates.description ?? current.description,
+      nextDomain ?? null,
+      updates.leaderboardOptIn === undefined
+        ? (current.leaderboardOptIn ? 1 : 0)
+        : (updates.leaderboardOptIn ? 1 : 0),
+      timestamp,
+      timestamp
+    ),
+  ]);
+
+  const updatedApp = await getAppById(db, appId);
+  if (!updatedApp) return null;
+  const profile = await getAppPublicProfile(db, appId);
+  if (domainChanged && profile.domainVerifiedAt) {
+    throw new Error('Domain verification was not cleared after a domain change');
+  }
+  return { app: updatedApp, profile };
+}
+
+export async function recordAppDomainVerification(
+  db: D1Database,
+  appId: string,
+  domain: string,
+  status: 'verified' | 'mismatch',
+  vapidPublicKey?: string
+): Promise<AppPublicProfile | null> {
+  const timestamp = nowIso();
+  const results = await db.batch([
+    db.prepare(`
+      UPDATE app_public_profiles
+      SET domain_verified_at = NULL,
+          domain_last_checked_at = ?,
+          domain_verification_status = 'mismatch',
+          domain_verified_vapid_key = NULL,
+          updated_at = ?
+      WHERE ? = 'verified' AND domain = ? AND app_id <> ?
+    `).bind(timestamp, timestamp, status, domain, appId),
+    db.prepare(`
+      UPDATE app_public_profiles
+      SET domain_verified_at = CASE WHEN ? = 'verified' THEN ? ELSE NULL END,
+          domain_last_checked_at = ?,
+          domain_verification_status = ?,
+          domain_verified_vapid_key = CASE WHEN ? = 'verified' THEN ? ELSE NULL END,
+          updated_at = ?
+      WHERE app_id = ? AND domain = ?
+    `).bind(
+      status,
+      timestamp,
+      timestamp,
+      status,
+      status,
+      vapidPublicKey ?? null,
+      timestamp,
+      appId,
+      domain
+    ),
+  ]);
+  return results[1]?.meta.changes === 1 ? getAppPublicProfile(db, appId) : null;
 }
 
 export async function updateApp(
@@ -300,10 +639,72 @@ export async function regenerateApiKey(db: D1Database, id: string): Promise<stri
 
 export async function countSubscriptions(db: D1Database, appId: string): Promise<number> {
   const row = await db
-    .prepare('SELECT COUNT(*) AS count FROM subscriptions WHERE app_id = ? AND disabled_at IS NULL')
+    .prepare(`
+      SELECT COUNT(*) AS count FROM subscriptions
+      WHERE app_id = ? AND disabled_at IS NULL
+        AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    `)
     .bind(appId)
     .first<{ count: number }>();
   return row?.count ?? 0;
+}
+
+export interface SubscriptionManagementState {
+  id: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  managementTokenHash?: string;
+}
+
+export async function getSubscriptionManagementState(
+  db: D1Database,
+  appId: string,
+  endpoint: string
+): Promise<SubscriptionManagementState | null> {
+  const row = await db.prepare(`
+    SELECT id, endpoint, p256dh, auth, management_token_hash
+    FROM subscriptions
+    WHERE app_id = ? AND endpoint = ? AND disabled_at IS NULL
+      AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  `).bind(appId, endpoint).first<{
+    id: string;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    management_token_hash: string | null;
+  }>();
+  if (!row) return null;
+  return {
+    id: row.id,
+    endpoint: row.endpoint,
+    p256dh: row.p256dh,
+    auth: row.auth,
+    managementTokenHash: row.management_token_hash ?? undefined,
+  };
+}
+
+export async function issueSubscriptionManagementToken(
+  db: D1Database,
+  appId: string,
+  subscriptionId: string
+): Promise<string> {
+  const token = generateManagementToken();
+  const result = await db.prepare(`
+    UPDATE subscriptions
+    SET management_token_hash = ?, updated_at = ?
+    WHERE id = ? AND app_id = ? AND disabled_at IS NULL
+      AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+  `).bind(await sha256Hex(token), nowIso(), subscriptionId, appId).run();
+  if (result.meta.changes !== 1) throw new Error('Subscription capability could not be issued');
+  return token;
+}
+
+export async function subscriptionManagementTokenMatches(
+  token: string,
+  expectedHash: string
+): Promise<boolean> {
+  return timingSafeEqualString(await sha256Hex(token), expectedHash);
 }
 
 export async function upsertSubscription(
@@ -322,7 +723,9 @@ export async function upsertSubscription(
 ): Promise<SubscriptionRecord> {
   const id = crypto.randomUUID();
   const timestamp = nowIso();
-  const expiresAt = input.expirationTime ? new Date(input.expirationTime).toISOString() : null;
+  const expiresAt = input.expirationTime === null || input.expirationTime === undefined
+    ? null
+    : new Date(input.expirationTime).toISOString();
 
   await db.prepare(`
     INSERT INTO subscriptions (id, app_id, endpoint, p256dh, auth, user_id, channel_id, metadata, expires_at, created_at, updated_at, disabled_at)
@@ -365,12 +768,79 @@ export async function upsertSubscription(
   return mapSubscription(row);
 }
 
+export async function upsertPublicSubscription(
+  db: D1Database,
+  appId: string,
+  input: {
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    userId?: string;
+    channelId?: string;
+    metadata?: Record<string, unknown>;
+    expirationTime?: number | null;
+  }
+): Promise<{ subscription: SubscriptionRecord; managementToken: string }> {
+  const id = crypto.randomUUID();
+  const managementToken = generateManagementToken();
+  const timestamp = nowIso();
+  const expiresAt = input.expirationTime === null || input.expirationTime === undefined
+    ? null
+    : new Date(input.expirationTime).toISOString();
+  await db.prepare(`
+    INSERT INTO subscriptions (
+      id, app_id, endpoint, p256dh, auth, user_id, channel_id, metadata,
+      expires_at, created_at, updated_at, disabled_at, management_token_hash
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+    ON CONFLICT(app_id, endpoint) DO UPDATE SET
+      user_id = excluded.user_id,
+      channel_id = excluded.channel_id,
+      metadata = excluded.metadata,
+      expires_at = excluded.expires_at,
+      management_token_hash = excluded.management_token_hash,
+      updated_at = excluded.updated_at,
+      disabled_at = NULL
+    WHERE subscriptions.p256dh = excluded.p256dh
+      AND subscriptions.auth = excluded.auth
+      AND subscriptions.management_token_hash IS NOT NULL
+  `).bind(
+    id,
+    appId,
+    input.endpoint,
+    input.p256dh,
+    input.auth,
+    input.userId ?? null,
+    input.channelId ?? null,
+    json(input.metadata),
+    expiresAt,
+    timestamp,
+    timestamp,
+    await sha256Hex(managementToken)
+  ).run();
+
+  const row = await db.prepare(`
+    SELECT * FROM subscriptions WHERE app_id = ? AND endpoint = ?
+  `).bind(appId, input.endpoint).first<SubscriptionRow>();
+  if (!row) throw new Error('Public subscription upsert could not be loaded');
+  if (
+    row.p256dh !== input.p256dh
+    || row.auth !== input.auth
+    || !row.management_token_hash
+    || !await subscriptionManagementTokenMatches(managementToken, row.management_token_hash)
+  ) throw new XmtpEndpointKeyConflictError();
+  return { subscription: mapSubscription(row), managementToken };
+}
+
 export async function getSubscriptionsByApp(
   db: D1Database,
   appId: string,
-  filters: { userId?: string; channelId?: string } = {}
+  filters: { userId?: string; channelId?: string; limit?: number } = {}
 ): Promise<SubscriptionRecord[]> {
-  const clauses = ['app_id = ?', 'disabled_at IS NULL'];
+  const clauses = [
+    'app_id = ?',
+    'disabled_at IS NULL',
+    "(expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+  ];
   const values: unknown[] = [appId];
 
   if (filters.userId) {
@@ -383,8 +853,10 @@ export async function getSubscriptionsByApp(
     values.push(filters.channelId);
   }
 
+  const limitClause = filters.limit ? ' LIMIT ?' : '';
+  if (filters.limit) values.push(Math.max(1, Math.floor(filters.limit)));
   const result = await db
-    .prepare(`SELECT * FROM subscriptions WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC`)
+    .prepare(`SELECT * FROM subscriptions WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC${limitClause}`)
     .bind(...values)
     .all<SubscriptionRow>();
 
@@ -397,13 +869,27 @@ export async function getSubscriptionsByIds(
   ids: string[]
 ): Promise<SubscriptionRecord[]> {
   if (ids.length === 0) return [];
-  const placeholders = ids.map(() => '?').join(', ');
-  const result = await db
-    .prepare(`SELECT * FROM subscriptions WHERE app_id = ? AND id IN (${placeholders}) AND disabled_at IS NULL`)
-    .bind(appId, ...ids)
-    .all<SubscriptionRow>();
+  // D1 permits at most 100 bound parameters per statement. Reserve one for
+  // appId and chunk the remaining identifiers without allowing duplicates to
+  // enqueue the same physical endpoint more than once.
+  const uniqueIds = [...new Set(ids)];
+  const chunks: string[][] = [];
+  for (let index = 0; index < uniqueIds.length; index += 99) {
+    chunks.push(uniqueIds.slice(index, index + 99));
+  }
+  const results = await Promise.all(chunks.map(async (chunk) => {
+    const placeholders = chunk.map(() => '?').join(', ');
+    return db
+      .prepare(`
+        SELECT * FROM subscriptions
+        WHERE app_id = ? AND id IN (${placeholders}) AND disabled_at IS NULL
+          AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      `)
+      .bind(appId, ...chunk)
+      .all<SubscriptionRow>();
+  }));
 
-  return result.results.map(mapSubscription);
+  return results.flatMap((result) => result.results.map(mapSubscription));
 }
 
 export async function disableSubscription(db: D1Database, id: string): Promise<void> {
@@ -469,23 +955,239 @@ export async function checkAndIncrementRateLimit(
   db: D1Database,
   appId: string,
   action: string,
-  limit: number
+  limit: number,
+  options: { amount?: number; window?: 'minute' | 'day' } = {}
 ): Promise<{ allowed: boolean; current: number; limit: number; resetAt: string }> {
+  const amount = Math.max(1, Math.floor(options.amount ?? 1));
   const windowStart = new Date();
-  windowStart.setSeconds(0, 0);
+  if (options.window === 'day') windowStart.setUTCHours(0, 0, 0, 0);
+  else windowStart.setSeconds(0, 0);
   const windowIso = windowStart.toISOString();
 
   const row = await db.prepare(`
     INSERT INTO rate_limit_logs (id, app_id, action, count, window_start)
-    VALUES (?, ?, ?, 1, ?)
-    ON CONFLICT(app_id, action, window_start) DO UPDATE SET count = count + 1
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(app_id, action, window_start) DO UPDATE SET count = count + excluded.count
     WHERE rate_limit_logs.count <= ?
     RETURNING count
-  `).bind(crypto.randomUUID(), appId, action, windowIso, limit).first<{ count: number }>();
+  `).bind(
+    crypto.randomUUID(),
+    appId,
+    action,
+    amount,
+    windowIso,
+    limit
+  ).first<{ count: number }>();
 
-  const current = row?.count ?? limit + 1;
-  const reset = new Date(windowStart.getTime() + 60_000).toISOString();
+  const current = row?.count ?? limit + amount;
+  const reset = new Date(
+    windowStart.getTime() + (options.window === 'day' ? 24 * 60 * 60_000 : 60_000)
+  ).toISOString();
   return { allowed: current <= limit, current, limit, resetAt: reset };
+}
+
+export async function publicRequestScopeHash(
+  request: Request,
+  env: Pick<Env, 'INTERNAL_INGEST_TOKEN'>
+): Promise<string> {
+  const connectingIp = request.headers.get('cf-connecting-ip');
+  if (!connectingIp || connectingIp.length > 128 || !env.INTERNAL_INGEST_TOKEN) {
+    return 'unscoped';
+  }
+  return (await sha256Hex(`${env.INTERNAL_INGEST_TOKEN}\u0000${connectingIp}`)).slice(0, 32);
+}
+
+export async function checkAndIncrementPublicRateLimit(
+  db: D1Database,
+  scopeHash: string,
+  action: string,
+  limit: number,
+  options: { amount?: number; window?: 'minute' | 'day' } = {}
+): Promise<{ allowed: boolean; current: number; limit: number; resetAt: string }> {
+  const amount = Math.max(1, Math.floor(options.amount ?? 1));
+  const windowStart = new Date();
+  if (options.window === 'day') windowStart.setUTCHours(0, 0, 0, 0);
+  else windowStart.setSeconds(0, 0);
+  const windowIso = windowStart.toISOString();
+  const row = await db.prepare(`
+    INSERT INTO public_rate_limits (scope_hash, action, window_start, count)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(scope_hash, action, window_start) DO UPDATE SET count = count + excluded.count
+    WHERE public_rate_limits.count <= ?
+    RETURNING count
+  `).bind(scopeHash, action, windowIso, amount, limit).first<{ count: number }>();
+  const current = row?.count ?? limit + amount;
+  return {
+    allowed: current <= limit,
+    current,
+    limit,
+    resetAt: new Date(
+      windowStart.getTime() + (options.window === 'day' ? 24 * 60 * 60_000 : 60_000)
+    ).toISOString(),
+  };
+}
+
+function usageCounts(row: UsageCountRow | null): {
+  queued: number;
+  providerAccepted: number;
+  failed: number;
+  expired: number;
+} {
+  return {
+    queued: Number(row?.queued ?? 0),
+    providerAccepted: Number(row?.sent ?? 0),
+    failed: Number(row?.failed ?? 0),
+    expired: Number(row?.expired ?? 0),
+  };
+}
+
+function utcDayOffset(days: number): string {
+  const date = new Date();
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+export async function getAppUsageStats(
+  db: D1Database,
+  app: AppRecord
+): Promise<AppUsageStats> {
+  const today = utcDayOffset(0);
+  const firstDay = utcDayOffset(-6);
+  const [profile, subscriptionCount, xmtp, todayUsage, sevenDayUsage] = await Promise.all([
+    getAppPublicProfile(db, app.id),
+    countSubscriptions(db, app.id),
+    db.prepare(`
+      WITH active_identities AS (
+        SELECT DISTINCT xi.id
+        FROM xmtp_identities xi
+        JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
+        JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
+        WHERE xi.app_id = ?
+          AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      )
+      SELECT
+        (SELECT COUNT(*) FROM xmtp_subscriptions xs
+          JOIN xmtp_identities xi ON xi.id = xs.identity_id
+          JOIN subscriptions s ON s.id = xs.subscription_id
+          WHERE xi.app_id = ? AND xs.active = 1 AND s.disabled_at IS NULL
+            AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ) AS registrations,
+        COUNT(DISTINCT CASE
+          WHEN xt.topic LIKE '/xmtp/mls/1/g-%/proto' THEN xt.id
+        END) AS group_topics,
+        COUNT(DISTINCT CASE
+          WHEN xt.topic LIKE '/xmtp/mls/1/w-%/proto' THEN xt.id
+        END) AS welcome_topics,
+        COUNT(DISTINCT hk.id) AS hmac_epochs
+      FROM active_identities ai
+      LEFT JOIN xmtp_topics xt ON xt.identity_id = ai.id
+      LEFT JOIN xmtp_topic_hmac_keys hk ON hk.topic_id = xt.id
+    `).bind(app.id, app.id).first<{
+      registrations: number | null;
+      group_topics: number | null;
+      welcome_topics: number | null;
+      hmac_epochs: number | null;
+    }>(),
+    db.prepare(`
+      SELECT
+        SUM(queued_count) AS queued,
+        SUM(sent_count) AS sent,
+        SUM(failed_count) AS failed,
+        SUM(expired_count) AS expired
+      FROM app_usage_daily
+      WHERE app_id = ? AND day = ?
+        AND event_type IN ('generic.push', 'xmtp.new_message')
+    `).bind(app.id, today).first<UsageCountRow>(),
+    db.prepare(`
+      SELECT
+        SUM(queued_count) AS queued,
+        SUM(sent_count) AS sent,
+        SUM(failed_count) AS failed,
+        SUM(expired_count) AS expired
+      FROM app_usage_daily
+      WHERE app_id = ? AND day >= ? AND day <= ?
+        AND event_type IN ('generic.push', 'xmtp.new_message')
+    `).bind(app.id, firstDay, today).first<UsageCountRow>(),
+  ]);
+
+  return {
+    app: {
+      id: app.id,
+      name: app.name,
+      publicVapidKey: app.vapidPublicKey,
+      createdAt: app.createdAt,
+    },
+    profile,
+    subscriptions: {
+      active: subscriptionCount,
+      xmtpRegistrations: Number(xmtp?.registrations ?? 0),
+    },
+    xmtp: {
+      groupTopics: Number(xmtp?.group_topics ?? 0),
+      welcomeTopics: Number(xmtp?.welcome_topics ?? 0),
+      hmacEpochs: Number(xmtp?.hmac_epochs ?? 0),
+    },
+    usage: {
+      todayUtc: usageCounts(todayUsage),
+      last7DaysUtc: usageCounts(sevenDayUsage),
+    },
+    retentionDays: 8,
+  };
+}
+
+export async function getPublicLeaderboard(
+  db: D1Database,
+  limit = 50
+): Promise<LeaderboardEntry[]> {
+  const today = utcDayOffset(0);
+  const firstDay = utcDayOffset(-6);
+  const verificationFreshAfter = new Date(
+    Date.now() - APP_DOMAIN_VERIFICATION_FRESHNESS_MS
+  ).toISOString();
+  const result = await db.prepare(`
+    WITH accepted AS (
+      SELECT app_id, SUM(sent_count) AS sent
+      FROM app_usage_daily
+      WHERE day >= ? AND day <= ?
+        AND event_type IN ('generic.push', 'xmtp.new_message')
+      GROUP BY app_id
+    )
+    SELECT
+      apps.id AS app_id,
+      apps.name,
+      profiles.description,
+      profiles.domain,
+      profiles.domain_verified_at,
+      COALESCE(accepted.sent, 0) AS sent
+    FROM app_public_profiles profiles
+    JOIN apps ON apps.id = profiles.app_id
+    LEFT JOIN accepted ON accepted.app_id = apps.id
+    WHERE profiles.leaderboard_opt_in = 1
+      AND profiles.domain_verification_status = 'verified'
+      AND profiles.domain IS NOT NULL
+      AND profiles.domain_verified_at IS NOT NULL
+      AND profiles.domain_last_checked_at >= ?
+      AND profiles.domain_verified_vapid_key = apps.vapid_public_key
+    ORDER BY sent DESC, profiles.domain ASC, apps.id ASC
+    LIMIT ?
+  `).bind(firstDay, today, verificationFreshAfter, limit).all<{
+    app_id: string;
+    name: string;
+    description: string;
+    domain: string;
+    domain_verified_at: string;
+    sent: number;
+  }>();
+
+  return result.results.map((row, index) => ({
+    rank: index + 1,
+    appId: row.app_id,
+    name: row.name,
+    description: row.description,
+    verifiedDomain: row.domain,
+    domainVerifiedAt: row.domain_verified_at,
+    providerAcceptedLast7Days: Number(row.sent),
+  }));
 }
 
 export async function ensureConvergeApp(env: Env): Promise<AppRecord | null> {
@@ -541,6 +1243,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       diagnosticReceipt?: string;
       issueDiagnosticReceipt?: boolean;
       immutableEndpointKeys?: boolean;
+      diagnosticBasePath?: string;
     } = {
       issueDiagnosticReceipt: true,
     }
@@ -550,8 +1253,27 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       throw new Error('XMTP VAPID app is not configured');
     }
 
-    const { identityId, dirtyVersion } = await this.upsertIdentity(input);
-    const subscription = await upsertSubscription(this.env.DB, app.id, {
+    // Topic replacement is a transaction, but identity, endpoint, and logical
+    // route writes intentionally span several D1 operations. Serialize the
+    // global capacity decision before any of those mutations so a hard trigger
+    // rejection cannot leave a partial registration behind. The per-app API
+    // lock still protects subscription quotas; this lock closes cross-app
+    // races against the singleton listener's total memory budget.
+    const capacityLockToken = await acquireXmtpMutationLock(
+      this.env.DB,
+      XMTP_GLOBAL_CAPACITY_LOCK.appId,
+      XMTP_GLOBAL_CAPACITY_LOCK.scope,
+      XMTP_GLOBAL_CAPACITY_LOCK.resourceId
+    );
+    if (!capacityLockToken) {
+      throw new Error('xmtp_global_capacity_limit: capacity mutation is busy');
+    }
+
+    try {
+      await this.assertXmtpCapacity(app.id, input.installationId, input.topics);
+
+      const { identityId, dirtyVersion } = await this.upsertIdentity(input);
+      const subscription = await upsertSubscription(this.env.DB, app.id, {
       endpoint: input.endpoint,
       p256dh: input.p256dh,
       auth: input.auth,
@@ -646,14 +1368,29 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       }
     }
 
-    return {
-      subscriptionId: subscription.id,
-      identityId,
-      topicsRegistered: input.topics.length,
-      hmacKeysRegistered: input.topics.reduce((count, topic) => count + topic.hmacKeys.length, 0),
-      created: !existing,
-      ...(diagnosticReceipt ? { diagnostics: diagnosticPaths(diagnosticReceipt) } : {}),
-    };
+      return {
+        subscriptionId: subscription.id,
+        identityId,
+        topicsRegistered: input.topics.length,
+        hmacKeysRegistered: input.topics.reduce((count, topic) => count + topic.hmacKeys.length, 0),
+        created: !existing,
+        ...(diagnosticReceipt
+          ? { diagnostics: diagnosticPaths(diagnosticReceipt, options.diagnosticBasePath) }
+          : {}),
+      };
+    } finally {
+      try {
+        await releaseXmtpMutationLock(
+          this.env.DB,
+          XMTP_GLOBAL_CAPACITY_LOCK.appId,
+          XMTP_GLOBAL_CAPACITY_LOCK.scope,
+          XMTP_GLOBAL_CAPACITY_LOCK.resourceId,
+          capacityLockToken
+        );
+      } catch (error) {
+        console.error('xmtp_capacity_lock_release_failed', error);
+      }
+    }
   }
 
   async disableRegistration(input: { endpoint: string; inboxId: string; installationId: string }): Promise<XmtpUnsubscribeResult> {
@@ -749,6 +1486,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
         ON li.app_id = xi.app_id AND li.installation_id = xi.installation_id
       WHERE xi.installation_id = ? AND xt.topic = ?
         AND li.delivery_token = ?
+        AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     `).bind(installationId, topic, deliveryToken).all<TopicMatchRow>();
 
     return result.results.map((row) => ({
@@ -771,6 +1509,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     idempotencyKey: string
   ): Promise<boolean> {
     const eventId = crypto.randomUUID();
+    let deliveryAttemptId: string | undefined;
     const claimed = await this.env.DB.prepare(`
       INSERT OR IGNORE INTO xmtp_delivery_events (
         id, installation_id, topic, idempotency_key, subscription_id
@@ -786,7 +1525,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     if (claimed.meta.changes === 0) return false;
 
     try {
-      const deliveryAttemptId = await insertDeliveryAttempt(this.env.DB, {
+      deliveryAttemptId = await insertDeliveryAttempt(this.env.DB, {
         appId: match.appId,
         subscriptionId: match.subscriptionId,
         xmtpSubscriptionId: match.xmtpSubscriptionId,
@@ -801,11 +1540,65 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
         subscriptionId: match.subscriptionId,
         payload,
         source: 'xmtp',
-      });
+      }, { contentType: 'json' });
       return true;
     } catch (error) {
+      if (deliveryAttemptId) {
+        // Release the idempotency claim only after the unpublished attempt and
+        // its queued usage increment are atomically removed. If cleanup fails,
+        // retaining the claim is safer than admitting a retry alongside stale
+        // state for a job that never reached the Queue.
+        await discardQueuedDeliveryAttempts(this.env.DB, [deliveryAttemptId]);
+      }
       await this.env.DB.prepare('DELETE FROM xmtp_delivery_events WHERE id = ?').bind(eventId).run();
       throw error;
+    }
+  }
+
+  private async assertXmtpCapacity(
+    appId: string,
+    installationId: string,
+    topics: NormalizedXmtpRegistration['topics']
+  ): Promise<void> {
+    const requestedRows = topics.reduce(
+      (count, topic) => count + 1 + topic.hmacKeys.length,
+      0
+    );
+    const current = await this.env.DB.prepare(`
+      SELECT
+        COALESCE((
+          SELECT row_count FROM xmtp_app_capacity WHERE app_id = ?
+        ), 0) AS app_count,
+        COALESCE((
+          SELECT row_count FROM xmtp_global_capacity WHERE id = 1
+        ), 0) AS global_count,
+        (
+          SELECT COUNT(*)
+          FROM xmtp_topics topic
+          JOIN xmtp_identities identity ON identity.id = topic.identity_id
+          WHERE identity.app_id = ? AND identity.installation_id = ?
+        ) + (
+          SELECT COUNT(*)
+          FROM xmtp_topic_hmac_keys hmac
+          JOIN xmtp_topics topic ON topic.id = hmac.topic_id
+          JOIN xmtp_identities identity ON identity.id = topic.identity_id
+          WHERE identity.app_id = ? AND identity.installation_id = ?
+        ) AS replaced_count
+    `).bind(
+      appId,
+      appId,
+      installationId,
+      appId,
+      installationId
+    ).first<{ app_count: number; global_count: number; replaced_count: number }>();
+    const replacedRows = Number(current?.replaced_count ?? 0);
+    const projectedAppRows = Number(current?.app_count ?? 0) - replacedRows + requestedRows;
+    const projectedGlobalRows = Number(current?.global_count ?? 0) - replacedRows + requestedRows;
+    if (projectedAppRows > XMTP_APP_CAPACITY_ROWS) {
+      throw new Error('xmtp_app_capacity_limit');
+    }
+    if (projectedGlobalRows > XMTP_GLOBAL_CAPACITY_ROWS) {
+      throw new Error('xmtp_global_capacity_limit');
     }
   }
 
@@ -816,8 +1609,18 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
     const app = await this.resolveApp();
     if (!app) throw new Error('XMTP VAPID app is not configured');
     const existing = await this.env.DB.prepare(`
-      SELECT id FROM xmtp_identities WHERE app_id = ? AND inbox_id = ? AND installation_id = ?
-    `).bind(app.id, input.inboxId, input.installationId).first<{ id: string }>();
+      SELECT id, inbox_id
+      FROM xmtp_identities
+      WHERE app_id = ? AND installation_id = ?
+    `).bind(app.id, input.installationId).first<{ id: string; inbox_id: string }>();
+
+    // An installation is a single listener route inside an app. Reject an
+    // inbox mismatch before marking the route dirty or touching endpoint,
+    // topic, or outbox state. The app-scoped lookup deliberately continues to
+    // allow another app to register the same installation.
+    if (existing && existing.inbox_id !== input.inboxId) {
+      throw new XmtpInstallationIdentityConflictError();
+    }
 
     if (!existing) {
       const table = await this.env.DB.prepare(`
@@ -840,23 +1643,37 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       input.installationId
     );
     const id = existing?.id ?? crypto.randomUUID();
-    await this.env.DB.prepare(`
-      INSERT INTO xmtp_identities (id, app_id, inbox_id, installation_id, address, inbox_handle, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT DO UPDATE SET
-        address = excluded.address,
-        inbox_handle = COALESCE(excluded.inbox_handle, xmtp_identities.inbox_handle),
-        updated_at = excluded.updated_at
-    `).bind(
-      id,
-      app.id,
-      input.inboxId,
-      input.installationId,
-      input.address ?? null,
-      input.inboxHandle ?? null,
-      nowIso(),
-      nowIso()
-    ).run();
+    try {
+      await this.env.DB.prepare(`
+        INSERT INTO xmtp_identities (id, app_id, inbox_id, installation_id, address, inbox_handle, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(app_id, inbox_id, installation_id) DO UPDATE SET
+          address = excluded.address,
+          inbox_handle = COALESCE(excluded.inbox_handle, xmtp_identities.inbox_handle),
+          updated_at = excluded.updated_at
+      `).bind(
+        id,
+        app.id,
+        input.inboxId,
+        input.installationId,
+        input.address ?? null,
+        input.inboxHandle ?? null,
+        nowIso(),
+        nowIso()
+      ).run();
+    } catch (error) {
+      // A concurrent first claim can race the read above. Migration 0006's
+      // app/installation unique index rejects the loser; translate only that
+      // now-observable inbox mismatch into the same stable 409 contract.
+      const raced = await this.env.DB.prepare(`
+        SELECT inbox_id FROM xmtp_identities
+        WHERE app_id = ? AND installation_id = ?
+      `).bind(app.id, input.installationId).first<{ inbox_id: string }>();
+      if (raced && raced.inbox_id !== input.inboxId) {
+        throw new XmtpInstallationIdentityConflictError();
+      }
+      throw error;
+    }
 
     return { identityId: id, dirtyVersion };
   }
@@ -915,22 +1732,100 @@ export async function insertDeliveryAttempt(
   }
 ): Promise<string> {
   const id = crypto.randomUUID();
-  await db.prepare(`
-    INSERT INTO delivery_attempts (
-      id, app_id, subscription_id, xmtp_subscription_id,
-      xmtp_topic_id, event_type, status, payload_json
-    )
-    VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)
-  `).bind(
-    id,
-    input.appId,
-    input.subscriptionId,
-    input.xmtpSubscriptionId ?? null,
-    input.xmtpTopicId ?? null,
-    input.eventType,
-    JSON.stringify(input.payload)
-  ).run();
+  const timestamp = nowIso();
+  const persistedPayload = input.eventType === 'vapid.diagnostic'
+    && typeof input.payload.testId === 'string'
+    ? { testId: input.payload.testId }
+    : {};
+  await db.batch([
+    db.prepare(`
+      INSERT INTO delivery_attempts (
+        id, app_id, subscription_id, xmtp_subscription_id,
+        xmtp_topic_id, event_type, status, payload_json, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+    `).bind(
+      id,
+      input.appId,
+      input.subscriptionId,
+      input.xmtpSubscriptionId ?? null,
+      input.xmtpTopicId ?? null,
+      input.eventType,
+      JSON.stringify(persistedPayload),
+      timestamp,
+      timestamp
+    ),
+    db.prepare(`
+      INSERT INTO app_usage_daily (app_id, day, event_type, queued_count, updated_at)
+      VALUES (?, ?, ?, 1, ?)
+      ON CONFLICT(app_id, day, event_type) DO UPDATE SET
+        queued_count = queued_count + 1,
+        updated_at = excluded.updated_at
+    `).bind(input.appId, timestamp.slice(0, 10), input.eventType, timestamp),
+  ]);
   return id;
+}
+
+export async function discardQueuedDeliveryAttempts(
+  db: D1Database,
+  ids: string[]
+): Promise<void> {
+  const uniqueIds = [...new Set(ids)];
+  if (uniqueIds.length === 0) return;
+
+  const chunks: string[][] = [];
+  const groupedCounts = new Map<string, {
+    appId: string;
+    day: string;
+    eventType: string;
+    count: number;
+  }>();
+  for (let index = 0; index < uniqueIds.length; index += 99) {
+    const chunk = uniqueIds.slice(index, index + 99);
+    chunks.push(chunk);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const groups = await db.prepare(`
+      SELECT
+        app_id,
+        substr(created_at, 1, 10) AS day,
+        event_type,
+        COUNT(*) AS count
+      FROM delivery_attempts
+      WHERE status = 'queued' AND id IN (${placeholders})
+      GROUP BY app_id, substr(created_at, 1, 10), event_type
+    `).bind(...chunk).all<{
+      app_id: string;
+      day: string;
+      event_type: string;
+      count: number;
+    }>();
+    for (const group of groups.results) {
+      const key = `${group.app_id}\u0000${group.day}\u0000${group.event_type}`;
+      const current = groupedCounts.get(key);
+      groupedCounts.set(key, {
+        appId: group.app_id,
+        day: group.day,
+        eventType: group.event_type,
+        count: (current?.count ?? 0) + Number(group.count),
+      });
+    }
+  }
+
+  const timestamp = nowIso();
+  await db.batch([
+    ...[...groupedCounts.values()].map((group) => db.prepare(`
+        UPDATE app_usage_daily
+        SET queued_count = MAX(0, queued_count - ?), updated_at = ?
+        WHERE app_id = ? AND day = ? AND event_type = ?
+      `).bind(group.count, timestamp, group.appId, group.day, group.eventType)),
+    ...chunks.map((chunk) => {
+      const placeholders = chunk.map(() => '?').join(', ');
+      return db.prepare(`
+        DELETE FROM delivery_attempts
+        WHERE status = 'queued' AND id IN (${placeholders})
+      `).bind(...chunk);
+    }),
+  ]);
 }
 
 export async function getPushJobContext(
@@ -939,7 +1834,11 @@ export async function getPushJobContext(
 ): Promise<{ app: AppRecord; subscription: SubscriptionRecord } | null> {
   const [app, subscriptionRow] = await Promise.all([
     getAppById(db, job.appId),
-    db.prepare('SELECT * FROM subscriptions WHERE id = ? AND app_id = ? AND disabled_at IS NULL')
+    db.prepare(`
+      SELECT * FROM subscriptions
+      WHERE id = ? AND app_id = ? AND disabled_at IS NULL
+        AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    `)
       .bind(job.subscriptionId, job.appId)
       .first<SubscriptionRow>(),
   ]);
@@ -948,20 +1847,319 @@ export async function getPushJobContext(
   return { app, subscription: mapSubscription(subscriptionRow) };
 }
 
+const PUSH_DELIVERY_LEASE_MS = 4 * 60_000;
+const MIN_PUSH_LEASE_RETRY_SECONDS = 30;
+const MAX_PUSH_LEASE_RETRY_SECONDS = 300;
+
+export type PushDeliveryAttemptClaim =
+  | { outcome: 'claimed'; generation: number }
+  | { outcome: 'busy'; retryAfterSeconds: number }
+  | { outcome: 'ignored'; terminalStatus?: 'sent' | 'failed' | 'expired' };
+
+/**
+ * Atomically validates and leases one queued delivery attempt. `attempts` is
+ * the lease generation, while `updated_at` is its expiry clock. A stale worker
+ * can therefore neither release nor complete a generation reclaimed after its
+ * lease expires.
+ */
+export async function claimPushDeliveryAttempt(
+  db: D1Database,
+  job: PushQueueJob
+): Promise<PushDeliveryAttemptClaim> {
+  const claimedAt = nowIso();
+  const staleBefore = new Date(Date.now() - PUSH_DELIVERY_LEASE_MS).toISOString();
+  const claimed = await db.prepare(`
+    UPDATE delivery_attempts
+    SET status = 'processing',
+        attempts = attempts + 1,
+        updated_at = ?
+    WHERE id = ? AND app_id = ? AND subscription_id = ?
+      AND (
+        status = 'queued'
+        OR (status = 'processing' AND updated_at <= ?)
+      )
+    RETURNING attempts
+  `).bind(
+    claimedAt,
+    job.deliveryAttemptId,
+    job.appId,
+    job.subscriptionId,
+    staleBefore
+  ).first<{ attempts: number }>();
+
+  if (claimed) {
+    return { outcome: 'claimed', generation: Number(claimed.attempts) };
+  }
+
+  const row = await db.prepare(`
+    SELECT app_id, subscription_id, status, updated_at
+    FROM delivery_attempts
+    WHERE id = ?
+  `).bind(job.deliveryAttemptId).first<{
+    app_id: string;
+    subscription_id: string;
+    status: string;
+    updated_at: string;
+  }>();
+
+  if (!row || row.app_id !== job.appId || row.subscription_id !== job.subscriptionId) {
+    return { outcome: 'ignored' };
+  }
+  if (row.status === 'processing') {
+    const leaseExpiresAt = Date.parse(row.updated_at) + PUSH_DELIVERY_LEASE_MS;
+    const remainingSeconds = Number.isFinite(leaseExpiresAt)
+      ? Math.ceil((leaseExpiresAt - Date.now()) / 1000)
+      : MIN_PUSH_LEASE_RETRY_SECONDS;
+    return {
+      outcome: 'busy',
+      retryAfterSeconds: Math.max(
+        MIN_PUSH_LEASE_RETRY_SECONDS,
+        Math.min(MAX_PUSH_LEASE_RETRY_SECONDS, remainingSeconds)
+      ),
+    };
+  }
+  if (row.status === 'queued') {
+    // The row changed between the failed compare-and-swap and this read. Retry
+    // the Queue message instead of losing an otherwise eligible attempt.
+    return { outcome: 'busy', retryAfterSeconds: MIN_PUSH_LEASE_RETRY_SECONDS };
+  }
+  if (row.status === 'sent' || row.status === 'failed' || row.status === 'expired') {
+    return { outcome: 'ignored', terminalStatus: row.status };
+  }
+  return { outcome: 'ignored' };
+}
+
+function deliveryAttemptErrorCategory(
+  status: 'queued' | 'sent' | 'failed' | 'expired',
+  pushStatus?: number
+): string | null {
+  if (status === 'expired') return 'subscription_expired';
+  if (status !== 'failed') return null;
+  if (pushStatus === 429) return 'provider_rate_limited';
+  if (pushStatus !== undefined && pushStatus >= 500) return 'provider_unavailable';
+  if (pushStatus !== undefined && pushStatus >= 400) return 'provider_rejected';
+  return 'relay_failure';
+}
+
+/** Release only the generation that observed the retryable provider failure. */
+export async function releasePushDeliveryAttempt(
+  db: D1Database,
+  job: PushQueueJob,
+  generation: number,
+  pushStatus?: number
+): Promise<boolean> {
+  const timestamp = nowIso();
+  const predicate = `
+    id = ? AND app_id = ? AND subscription_id = ?
+    AND status = 'processing' AND attempts = ?
+  `;
+  const results = await db.batch([
+    db.prepare(`
+      INSERT INTO app_usage_daily (app_id, day, event_type, failed_count, updated_at)
+      SELECT app_id, ?, event_type, 1, ?
+      FROM delivery_attempts
+      WHERE ${predicate}
+      ON CONFLICT(app_id, day, event_type) DO UPDATE SET
+        failed_count = failed_count + 1,
+        updated_at = excluded.updated_at
+    `).bind(
+      timestamp.slice(0, 10),
+      timestamp,
+      job.deliveryAttemptId,
+      job.appId,
+      job.subscriptionId,
+      generation
+    ),
+    db.prepare(`
+      UPDATE delivery_attempts
+      SET status = 'queued',
+          last_error = ?,
+          push_status = ?,
+          updated_at = ?
+      WHERE ${predicate}
+    `).bind(
+      deliveryAttemptErrorCategory('failed', pushStatus),
+      pushStatus ?? null,
+      timestamp,
+      job.deliveryAttemptId,
+      job.appId,
+      job.subscriptionId,
+      generation
+    ),
+  ]);
+  return Number(results[1]?.meta.changes ?? 0) === 1;
+}
+
+/**
+ * Records a terminal outcome exactly once for the owning lease generation.
+ * Generic attempts may be deleted in the same transaction after their daily
+ * aggregate is updated; a stale Queue replay then observes a missing attempt.
+ */
+export async function completePushDeliveryAttempt(
+  db: D1Database,
+  job: PushQueueJob,
+  generation: number,
+  update: {
+    status: 'sent' | 'failed' | 'expired';
+    pushStatus?: number;
+    deleteAttempt?: boolean;
+  }
+): Promise<boolean> {
+  const timestamp = nowIso();
+  const usageColumn = update.status === 'sent'
+    ? 'sent_count'
+    : update.status === 'failed'
+      ? 'failed_count'
+      : 'expired_count';
+  const predicate = `
+    id = ? AND app_id = ? AND subscription_id = ?
+    AND status = 'processing' AND attempts = ?
+  `;
+  const mutation = update.deleteAttempt
+    ? db.prepare(`DELETE FROM delivery_attempts WHERE ${predicate}`).bind(
+        job.deliveryAttemptId,
+        job.appId,
+        job.subscriptionId,
+        generation
+      )
+    : db.prepare(`
+        UPDATE delivery_attempts
+        SET status = ?,
+            last_error = ?,
+            push_status = ?,
+            updated_at = ?
+        WHERE ${predicate}
+      `).bind(
+        update.status,
+        deliveryAttemptErrorCategory(update.status, update.pushStatus),
+        update.pushStatus ?? null,
+        timestamp,
+        job.deliveryAttemptId,
+        job.appId,
+        job.subscriptionId,
+        generation
+      );
+  const results = await db.batch([
+    db.prepare(`
+      INSERT INTO app_usage_daily (app_id, day, event_type, ${usageColumn}, updated_at)
+      SELECT app_id, ?, event_type, 1, ?
+      FROM delivery_attempts
+      WHERE ${predicate}
+      ON CONFLICT(app_id, day, event_type) DO UPDATE SET
+        ${usageColumn} = ${usageColumn} + 1,
+        updated_at = excluded.updated_at
+    `).bind(
+      timestamp.slice(0, 10),
+      timestamp,
+      job.deliveryAttemptId,
+      job.appId,
+      job.subscriptionId,
+      generation
+    ),
+    mutation,
+  ]);
+  return Number(results[1]?.meta.changes ?? 0) === 1;
+}
+
+const STALE_PUSH_ATTEMPT_AGE_MS = 2 * 60 * 60_000;
+const STALE_PUSH_ATTEMPT_LIMIT = 5_000;
+
+/**
+ * Reconcile source messages that aged out without another consumer invocation.
+ * The two-hour boundary exceeds the one-hour source Queue retention by a grace
+ * period. Selection, aggregate increments, and terminal transitions share one
+ * D1 batch transaction, so repeated cron runs count each row at most once.
+ */
+export async function reconcileStalePushDeliveryAttempts(
+  db: D1Database,
+  options: { before?: string; limit?: number } = {}
+): Promise<{ reconciled: number }> {
+  const timestamp = nowIso();
+  const before = options.before
+    ?? new Date(Date.now() - STALE_PUSH_ATTEMPT_AGE_MS).toISOString();
+  const limit = Math.max(
+    1,
+    Math.min(STALE_PUSH_ATTEMPT_LIMIT, Math.floor(options.limit ?? STALE_PUSH_ATTEMPT_LIMIT))
+  );
+  const staleSelection = `
+    SELECT id
+    FROM delivery_attempts
+    WHERE status IN ('queued', 'processing') AND updated_at <= ?
+    ORDER BY updated_at, id
+    LIMIT ?
+  `;
+  const results = await db.batch([
+    db.prepare(`
+      UPDATE delivery_attempts
+      SET status = 'reconciling', updated_at = ?
+      WHERE id IN (${staleSelection})
+    `).bind(timestamp, before, limit),
+    db.prepare(`
+      INSERT INTO app_usage_daily (
+        app_id, day, event_type, failed_count, updated_at
+      )
+      SELECT attempts.app_id, ?, attempts.event_type, COUNT(*), ?
+      FROM delivery_attempts attempts
+      WHERE attempts.status = 'reconciling' AND attempts.updated_at = ?
+      GROUP BY attempts.app_id, attempts.event_type
+      ON CONFLICT(app_id, day, event_type) DO UPDATE SET
+        failed_count = failed_count + excluded.failed_count,
+        updated_at = excluded.updated_at
+    `).bind(timestamp.slice(0, 10), timestamp, timestamp),
+    db.prepare(`
+      DELETE FROM delivery_attempts
+      WHERE status = 'reconciling' AND updated_at = ?
+        AND event_type = 'generic.push'
+    `).bind(timestamp),
+    db.prepare(`
+      UPDATE delivery_attempts
+      SET status = 'failed',
+          last_error = 'relay_failure',
+          push_status = NULL,
+          updated_at = ?
+      WHERE status = 'reconciling' AND updated_at = ?
+    `).bind(timestamp, timestamp),
+  ]);
+  return { reconciled: Number(results[0]?.meta.changes ?? 0) };
+}
+
 export async function updateDeliveryAttempt(
   db: D1Database,
   id: string,
   update: { status: 'queued' | 'sent' | 'failed' | 'expired'; error?: string; pushStatus?: number }
 ): Promise<void> {
-  await db.prepare(`
-    UPDATE delivery_attempts
-    SET status = ?,
-        attempts = attempts + 1,
-        last_error = ?,
-        push_status = ?,
-        updated_at = ?
-    WHERE id = ?
-  `).bind(update.status, update.error ?? null, update.pushStatus ?? null, nowIso(), id).run();
+  const timestamp = nowIso();
+  const errorCategory = deliveryAttemptErrorCategory(update.status, update.pushStatus);
+  const usageColumn = update.status === 'sent'
+    ? 'sent_count'
+    : update.status === 'failed'
+      ? 'failed_count'
+      : update.status === 'expired'
+        ? 'expired_count'
+        : null;
+  const transitionPredicate = "status NOT IN ('sent', 'expired')";
+  const statements: D1PreparedStatement[] = [];
+  if (usageColumn) {
+    statements.push(db.prepare(`
+      INSERT INTO app_usage_daily (app_id, day, event_type, ${usageColumn}, updated_at)
+      SELECT app_id, ?, event_type, 1, ?
+      FROM delivery_attempts
+      WHERE id = ? AND ${transitionPredicate}
+      ON CONFLICT(app_id, day, event_type) DO UPDATE SET
+        ${usageColumn} = ${usageColumn} + 1,
+        updated_at = excluded.updated_at
+    `).bind(timestamp.slice(0, 10), timestamp, id));
+  }
+  statements.push(db.prepare(`
+      UPDATE delivery_attempts
+      SET status = ?,
+          attempts = attempts + 1,
+          last_error = ?,
+          push_status = ?,
+          updated_at = ?
+      WHERE id = ? AND ${transitionPredicate}
+    `).bind(update.status, errorCategory, update.pushStatus ?? null, timestamp, id));
+  await db.batch(statements);
 }
 
 export async function hasActiveSubscriptionEndpoint(
@@ -973,6 +2171,7 @@ export async function hasActiveSubscriptionEndpoint(
     SELECT 1 AS present
     FROM subscriptions
     WHERE app_id = ? AND endpoint = ? AND disabled_at IS NULL
+      AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   `).bind(appId, endpoint).first<{ present: number }>();
   return Boolean(row);
 }
@@ -986,6 +2185,7 @@ export async function getActiveSubscriptionEndpointKeys(
     SELECT p256dh, auth
     FROM subscriptions
     WHERE app_id = ? AND endpoint = ? AND disabled_at IS NULL
+      AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   `).bind(appId, endpoint).first<{ p256dh: string; auth: string }>();
 }
 
@@ -999,6 +2199,7 @@ export async function countActiveXmtpRegistrations(
     JOIN xmtp_identities xi ON xi.id = xs.identity_id
     JOIN subscriptions s ON s.id = xs.subscription_id
     WHERE xi.app_id = ? AND xs.active = 1 AND s.disabled_at IS NULL
+      AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   `).bind(appId).first<{ count: number }>();
   return row?.count ?? 0;
 }
@@ -1019,6 +2220,7 @@ export async function hasActiveXmtpRegistration(
       AND xi.installation_id = ?
       AND xs.active = 1
       AND s.disabled_at IS NULL
+      AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   `).bind(
     appId,
     input.endpoint,
@@ -1054,6 +2256,7 @@ export async function getActiveXmtpRegistrationState(
       AND xi.installation_id = ?
       AND xs.active = 1
       AND s.disabled_at IS NULL
+      AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     LIMIT 1
   `).bind(appId, input.inboxId, input.installationId).first<{
     endpoint: string;
@@ -1082,20 +2285,34 @@ export async function acquireXmtpRegistrationMutationLock(
   appId: string,
   input: { inboxId: string; installationId: string }
 ): Promise<string | null> {
+  return acquireXmtpMutationLock(
+    db,
+    appId,
+    '__xmtp_installation__',
+    input.installationId
+  );
+}
+
+async function acquireXmtpMutationLock(
+  db: D1Database,
+  appId: string,
+  lockScope: string,
+  resourceId: string
+): Promise<string | null> {
   const lockToken = crypto.randomUUID();
   const now = nowIso();
   await db.prepare(`
     DELETE FROM xmtp_registration_mutation_locks
     WHERE app_id = ? AND inbox_id = ? AND installation_id = ? AND expires_at <= ?
-  `).bind(appId, input.inboxId, input.installationId, now).run();
+  `).bind(appId, lockScope, resourceId, now).run();
   const result = await db.prepare(`
     INSERT OR IGNORE INTO xmtp_registration_mutation_locks (
       app_id, inbox_id, installation_id, lock_token, expires_at
     ) VALUES (?, ?, ?, ?, ?)
   `).bind(
     appId,
-    input.inboxId,
-    input.installationId,
+    lockScope,
+    resourceId,
     lockToken,
     new Date(Date.now() + 30_000).toISOString()
   ).run();
@@ -1108,10 +2325,26 @@ export async function releaseXmtpRegistrationMutationLock(
   input: { inboxId: string; installationId: string },
   lockToken: string
 ): Promise<void> {
+  return releaseXmtpMutationLock(
+    db,
+    appId,
+    '__xmtp_installation__',
+    input.installationId,
+    lockToken
+  );
+}
+
+async function releaseXmtpMutationLock(
+  db: D1Database,
+  appId: string,
+  lockScope: string,
+  resourceId: string,
+  lockToken: string
+): Promise<void> {
   await db.prepare(`
     DELETE FROM xmtp_registration_mutation_locks
     WHERE app_id = ? AND inbox_id = ? AND installation_id = ? AND lock_token = ?
-  `).bind(appId, input.inboxId, input.installationId, lockToken).run();
+  `).bind(appId, lockScope, resourceId, lockToken).run();
 }
 
 async function endpointMutationLockInput(endpoint: string): Promise<{
@@ -1129,10 +2362,12 @@ export async function acquireXmtpEndpointMutationLock(
   appId: string,
   endpoint: string
 ): Promise<string | null> {
-  return acquireXmtpRegistrationMutationLock(
+  const input = await endpointMutationLockInput(endpoint);
+  return acquireXmtpMutationLock(
     db,
     appId,
-    await endpointMutationLockInput(endpoint)
+    input.inboxId,
+    input.installationId
   );
 }
 
@@ -1142,10 +2377,41 @@ export async function releaseXmtpEndpointMutationLock(
   endpoint: string,
   lockToken: string
 ): Promise<void> {
+  const input = await endpointMutationLockInput(endpoint);
+  return releaseXmtpMutationLock(
+    db,
+    appId,
+    input.inboxId,
+    input.installationId,
+    lockToken
+  );
+}
+
+const APP_SUBSCRIPTION_MUTATION_LOCK = {
+  inboxId: '__app_subscription_quota__',
+  installationId: '__all__',
+};
+
+export async function acquireAppSubscriptionMutationLock(
+  db: D1Database,
+  appId: string
+): Promise<string | null> {
+  return acquireXmtpRegistrationMutationLock(
+    db,
+    appId,
+    APP_SUBSCRIPTION_MUTATION_LOCK
+  );
+}
+
+export async function releaseAppSubscriptionMutationLock(
+  db: D1Database,
+  appId: string,
+  lockToken: string
+): Promise<void> {
   return releaseXmtpRegistrationMutationLock(
     db,
     appId,
-    await endpointMutationLockInput(endpoint),
+    APP_SUBSCRIPTION_MUTATION_LOCK,
     lockToken
   );
 }
@@ -1167,24 +2433,197 @@ export async function scopedPublicRateLimitAction(
   return `${action}:${bytesToHex(new Uint8Array(digest)).slice(0, 24)}`;
 }
 
-export async function compactOperationalHistory(db: D1Database): Promise<void> {
+// The public relay admits at most 2,000 provider attempts per minute and
+// 100,000 per UTC day. A 5,000-row maintenance batch drains the maximum
+// sustained eligible arrival rate while remaining explicitly bounded.
+const OPERATIONAL_COMPACTION_BATCH_SIZE = 5_000;
+
+export interface ExpiredSubscriptionCompactionResult {
+  deletedGenericSubscriptions: number;
+  deletedXmtpSubscription: boolean;
+  backlogLikely: boolean;
+  oldestExpiredAt?: string;
+}
+
+export async function compactExpiredSubscriptions(
+  db: D1Database
+): Promise<ExpiredSubscriptionCompactionResult> {
+  const timestamp = nowIso();
+  const generic = await db.prepare(`
+    DELETE FROM subscriptions WHERE id IN (
+      SELECT subscription.id
+      FROM subscriptions subscription
+      WHERE subscription.disabled_at IS NULL
+        AND subscription.expires_at IS NOT NULL
+        AND subscription.expires_at <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM xmtp_subscriptions registration
+          WHERE registration.subscription_id = subscription.id
+            AND registration.active = 1
+        )
+      ORDER BY subscription.expires_at
+      LIMIT ?
+    )
+  `).bind(timestamp, OPERATIONAL_COMPACTION_BATCH_SIZE).run();
+
+  const candidate = await db.prepare(`
+    SELECT subscription.id, subscription.app_id
+    FROM subscriptions subscription
+    WHERE subscription.disabled_at IS NULL
+      AND subscription.expires_at IS NOT NULL
+      AND subscription.expires_at <= ?
+      AND EXISTS (
+        SELECT 1 FROM xmtp_subscriptions registration
+        WHERE registration.subscription_id = subscription.id AND registration.active = 1
+      )
+    ORDER BY subscription.expires_at
+    LIMIT 1
+  `).bind(timestamp).first<{ id: string; app_id: string }>();
+
+  let deletedXmtpSubscription = false;
+  if (candidate) {
+    const lockToken = await acquireAppSubscriptionMutationLock(db, candidate.app_id);
+    if (lockToken) {
+      try {
+        const stillExpired = await db.prepare(`
+          SELECT 1 AS present FROM subscriptions
+          WHERE id = ? AND app_id = ? AND disabled_at IS NULL
+            AND expires_at IS NOT NULL AND expires_at <= ?
+        `).bind(candidate.id, candidate.app_id, nowIso()).first<{ present: number }>();
+        if (stillExpired) {
+          await disableSubscription(db, candidate.id);
+          deletedXmtpSubscription = true;
+        }
+      } finally {
+        await releaseAppSubscriptionMutationLock(db, candidate.app_id, lockToken);
+      }
+    }
+  }
+
+  const remaining = await db.prepare(`
+    SELECT MIN(expires_at) AS oldest
+    FROM subscriptions
+    WHERE disabled_at IS NULL AND expires_at IS NOT NULL AND expires_at <= ?
+  `).bind(nowIso()).first<{ oldest: string | null }>();
+  const backlogLikely = Number(generic.meta.changes ?? 0) >= OPERATIONAL_COMPACTION_BATCH_SIZE
+    || Boolean(remaining?.oldest);
+
+  return {
+    deletedGenericSubscriptions: Number(generic.meta.changes ?? 0),
+    deletedXmtpSubscription,
+    backlogLikely,
+    ...(remaining?.oldest ? { oldestExpiredAt: remaining.oldest } : {}),
+  };
+}
+
+export interface OperationalCompactionResult {
+  batchLimit: number;
+  deletedRows: number;
+  backlogLikely: boolean;
+  oldestEligibleAt?: string;
+}
+
+export async function compactOperationalHistory(
+  db: D1Database
+): Promise<OperationalCompactionResult> {
   const rateLimitBefore = new Date(Date.now() - 2 * 24 * 60 * 60_000).toISOString();
   const diagnosticBefore = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
   const deliveryBefore = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+  const usageBeforeDay = utcDayOffset(-7);
 
-  await db.batch([
-    db.prepare('DELETE FROM rate_limit_logs WHERE window_start < ?').bind(rateLimitBefore),
+  const results = await db.batch([
     db.prepare(`
-      DELETE FROM delivery_attempts
-      WHERE event_type = 'vapid.diagnostic' AND created_at < ?
-    `).bind(diagnosticBefore),
+      DELETE FROM rate_limit_logs WHERE rowid IN (
+        SELECT rowid FROM rate_limit_logs
+        WHERE window_start < ? ORDER BY window_start LIMIT ?
+      )
+    `).bind(rateLimitBefore, OPERATIONAL_COMPACTION_BATCH_SIZE),
     db.prepare(`
-      DELETE FROM delivery_attempts
-      WHERE event_type <> 'vapid.diagnostic' AND created_at < ?
-    `).bind(deliveryBefore),
-    db.prepare('DELETE FROM xmtp_delivery_events WHERE created_at < ?').bind(deliveryBefore),
-    db.prepare('DELETE FROM xmtp_registration_mutation_locks WHERE expires_at <= ?').bind(nowIso()),
+      DELETE FROM public_rate_limits WHERE rowid IN (
+        SELECT rowid FROM public_rate_limits
+        WHERE created_at < ? ORDER BY created_at LIMIT ?
+      )
+    `).bind(rateLimitBefore, OPERATIONAL_COMPACTION_BATCH_SIZE),
+    db.prepare(`
+      DELETE FROM delivery_attempts WHERE rowid IN (
+        SELECT rowid FROM delivery_attempts
+        WHERE event_type = 'vapid.diagnostic' AND created_at < ?
+        ORDER BY created_at LIMIT ?
+      )
+    `).bind(diagnosticBefore, OPERATIONAL_COMPACTION_BATCH_SIZE),
+    db.prepare(`
+      DELETE FROM delivery_attempts WHERE rowid IN (
+        SELECT rowid FROM delivery_attempts
+        WHERE event_type <> 'vapid.diagnostic' AND created_at < ?
+        ORDER BY created_at LIMIT ?
+      )
+    `).bind(deliveryBefore, OPERATIONAL_COMPACTION_BATCH_SIZE),
+    db.prepare(`
+      DELETE FROM xmtp_delivery_events WHERE rowid IN (
+        SELECT rowid FROM xmtp_delivery_events
+        WHERE created_at < ? ORDER BY created_at LIMIT ?
+      )
+    `).bind(deliveryBefore, OPERATIONAL_COMPACTION_BATCH_SIZE),
+    db.prepare(`
+      DELETE FROM app_usage_daily WHERE rowid IN (
+        SELECT rowid FROM app_usage_daily
+        WHERE day < ? ORDER BY day LIMIT ?
+      )
+    `).bind(usageBeforeDay, OPERATIONAL_COMPACTION_BATCH_SIZE),
+    db.prepare(`
+      DELETE FROM xmtp_registration_mutation_locks WHERE rowid IN (
+        SELECT rowid FROM xmtp_registration_mutation_locks
+        WHERE expires_at <= ? ORDER BY expires_at LIMIT ?
+      )
+    `).bind(nowIso(), OPERATIONAL_COMPACTION_BATCH_SIZE),
   ]);
+
+  const changes = results.map((result) => Number(result.meta.changes ?? 0));
+  const backlogLikely = changes.some((count) => count >= OPERATIONAL_COMPACTION_BATCH_SIZE);
+  let oldestEligibleAt: string | undefined;
+  if (backlogLikely) {
+    // Keep these as separate bounded statements. Workerd's SQLite compiler can
+    // reject a compound aggregate after a large trigger-heavy delete even when
+    // the UNION itself is small.
+    const oldestResults = await db.batch([
+      db.prepare(`
+        SELECT MIN(window_start) AS candidate FROM rate_limit_logs WHERE window_start < ?
+      `).bind(rateLimitBefore),
+      db.prepare(`
+        SELECT MIN(created_at) AS candidate FROM public_rate_limits WHERE created_at < ?
+      `).bind(rateLimitBefore),
+      db.prepare(`
+        SELECT MIN(created_at) AS candidate FROM delivery_attempts
+        WHERE event_type = 'vapid.diagnostic' AND created_at < ?
+      `).bind(diagnosticBefore),
+      db.prepare(`
+        SELECT MIN(created_at) AS candidate FROM delivery_attempts
+        WHERE event_type <> 'vapid.diagnostic' AND created_at < ?
+      `).bind(deliveryBefore),
+      db.prepare(`
+        SELECT MIN(created_at) AS candidate FROM xmtp_delivery_events WHERE created_at < ?
+      `).bind(deliveryBefore),
+      db.prepare(`
+        SELECT MIN(day) AS candidate FROM app_usage_daily WHERE day < ?
+      `).bind(usageBeforeDay),
+      db.prepare(`
+        SELECT MIN(expires_at) AS candidate FROM xmtp_registration_mutation_locks
+        WHERE expires_at <= ?
+      `).bind(nowIso()),
+    ]);
+    oldestEligibleAt = oldestResults
+      .flatMap((result) => result.results as Array<{ candidate: string | null }>)
+      .map((row) => row.candidate)
+      .filter((candidate): candidate is string => Boolean(candidate))
+      .sort()[0];
+  }
+
+  return {
+    batchLimit: OPERATIONAL_COMPACTION_BATCH_SIZE,
+    deletedRows: changes.reduce((total, count) => total + count, 0),
+    backlogLikely,
+    ...(oldestEligibleAt ? { oldestEligibleAt } : {}),
+  };
 }
 
 async function findXmtpDiagnosticRegistration(
@@ -1212,6 +2651,7 @@ async function findXmtpDiagnosticRegistration(
     WHERE xs.diagnostic_token_hash = ?
       AND xs.active = 1
       AND s.disabled_at IS NULL
+      AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
   `).bind(tokenHash).first<XmtpDiagnosticRegistrationRow>();
 }
 
@@ -1239,8 +2679,13 @@ function summarizeDeliveryAttempt(
 ): Record<string, unknown> {
   if (!row) return { status: 'none' };
 
+  // `processing` is an internal Queue lease state, not part of the public
+  // diagnostics contract. Expose it as queued while the provider call is in
+  // flight or while a crashed consumer's lease waits to expire.
+  const status = row.status === 'processing' ? 'queued' : row.status;
+
   return {
-    status: row.status,
+    status,
     ...(kind === 'xmtp' ? { lastMatchedAt: row.created_at } : { queuedAt: row.created_at }),
     ...(row.attempts > 0 ? { lastAttemptAt: row.updated_at } : {}),
     ...(row.status === 'sent' ? { providerAcceptedAt: row.updated_at } : {}),
@@ -1255,10 +2700,11 @@ function summarizeDeliveryAttempt(
 
 export async function getXmtpDiagnosticStatus(
   env: Env,
-  receipt: string
+  receipt: string,
+  expectedAppId?: string
 ): Promise<Record<string, unknown> | null> {
   const registration = await findXmtpDiagnosticRegistration(env.DB, receipt);
-  if (!registration) return null;
+  if (!registration || (expectedAppId && registration.app_id !== expectedAppId)) return null;
 
   const listenerConfigured = Boolean(
     env.XMTP_LISTENER && env.XMTP_LISTENER_SYNC_TOKEN && env.INTERNAL_INGEST_TOKEN
@@ -1352,10 +2798,11 @@ export class XmtpDiagnosticRateLimitError extends Error {
 export async function enqueueXmtpDiagnosticTest(
   env: Env,
   receipt: string,
-  scopedRateLimitAction?: string
+  scopedRateLimitAction?: string,
+  expectedAppId?: string
 ): Promise<{ queued: true; testId: string; checkedAt: string } | null> {
   const registration = await findXmtpDiagnosticRegistration(env.DB, receipt);
-  if (!registration) return null;
+  if (!registration || (expectedAppId && registration.app_id !== expectedAppId)) return null;
 
   const app = await getAppById(env.DB, registration.app_id);
   if (!app) return null;

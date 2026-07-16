@@ -10,7 +10,8 @@ These instructions apply to the entire repository.
 
 ## Responsibilities
 - Keep the Web Push relay honest about shipped behavior.
-- Preserve operator/API-key auth boundaries and per-app VAPID key isolation.
+- Preserve public app-secret, enrollment-ticket, management-token, operator
+  API-key, and internal bearer boundaries plus per-app VAPID key isolation.
 - Keep API handlers, Zod schemas, OpenAPI docs, LLM docs, README examples, and UI copy aligned.
 - Verify changes with the relevant local workflow before landing.
 
@@ -41,10 +42,13 @@ These instructions apply to the entire repository.
   `migrations/d1`. The always-on XMTP v3 listener is a singleton Cloudflare
   Container with an atomic in-memory routing index; do not add PostgreSQL or a
   separate public listener service.
-- App provisioning is operator-only. Runtime auth is split between `X-API-Key`
-  for generic app routes, restricted public Converge registration, and separate
-  secret bearer tokens for listener control/status and delivery ingest.
-- VAPID keypairs are generated per app and stored with app records.
+- Anonymous app creation returns one raw `vp_` app secret once and stores only
+  its SHA-256 digest. Pre-provisioned operator apps retain their API-key flow.
+- Runtime auth is split between app credentials, endpoint-bound enrollment
+  tickets, per-subscription management tokens, restricted public Converge
+  registration, and separate listener-control and delivery-ingest bearers.
+- VAPID keypairs are generated per app and remain server-managed; only the
+  public VAPID key is published to browser clients.
 
 ## Project shape
 - `src/worker/`: primary deployed Worker API, D1 store, Queue producer/consumer,
@@ -67,7 +71,15 @@ These instructions apply to the entire repository.
 ## Known sharp edges
 - `maxSubscriptions` is enforced on subscribe requests.
 - `maxNotificationsPerMinute` is enforced on send requests.
-- `maxNotificationsPerDay` exists in stored app config but is not currently enforced by a daily window.
+- `maxNotificationsPerDay` is enforced with a UTC-day window.
+- Anonymous apps support generic Web Push only. Every app-scoped public XMTP
+  route must remain `403` until installation ownership can be proved.
+- Public generic sends are bounded to 100 recipients, a 3,000-byte JSON
+  payload, and an estimated 240,000-byte single Queue batch. Shared public
+  relay ceilings are 2,000 selected deliveries/minute and 100,000/day.
+- Hard anonymous-state ceilings are 25,000 public apps, 250,000 public
+  subscription rows, and 150 subscriptions per public app. D1 triggers are the
+  concurrency-safe enforcement layer; API checks provide earlier responses.
 - Node.js 22+ is required by Wrangler 4.110.0 and the matching Miniflare/Worker-types toolchain.
 - `npm audit --audit-level=low` is a release gate and must remain at zero findings.
 - `npm test` runs Vitest, and the D1 test uses Miniflare/workerd. Sandboxes that
@@ -76,8 +88,8 @@ These instructions apply to the entire repository.
   it keeps a physical endpoint only while another active logical inbox shares it.
 - Public Converge registration accepts only strict nested version 1. Keep the
   FCM/Mozilla/Apple/WNS endpoint allowlist, 400-topic/800-row cost ceiling,
-  1024-character key bound, and uint32 epoch bound aligned across Zod, OpenAPI,
-  README, FEATURES, and `public/llms.txt`.
+  decoded 1..256-byte HMAC key bound, and uint32 epoch bound aligned across
+  Zod, OpenAPI, README, FEATURES, and `public/llms.txt`.
 - A diagnostic receipt is a 256-bit bearer management capability whose raw
   value is returned only in a no-store response and never persisted or logged.
   Valid receipts survive endpoint replacement for lost-response retry safety.
@@ -87,12 +99,16 @@ These instructions apply to the entire repository.
 - Topic replacement is a transactional D1 batch, but the entire registration
   mutation is not atomic. Preserve dirty-route repair and do not document
   stronger guarantees.
+- Listener topic plus HMAC state is capped at 5,000 rows per app and 25,000
+  rows globally. Snapshot and delta pages are capped at 10 routes.
 - XMTP listener routes are keyed by `(appId, installationId)`. Never union HMAC
   keys or fan out registrations across apps, even for a shared installation or
   topic. Listener-to-Worker delivery is a minimal authenticated hint and must
   never include XMTP ciphertext, sender identity, or message content.
-- Production has D1 migrations 0001 through 0004, the current Worker contract,
-  Queue, and the singleton custom Go XMTP listener Container deployed. Public
+- Production has D1 migrations 0001 through 0005, the pre-public-app Worker
+  contract, Queue, and the singleton custom Go XMTP listener Container
+  deployed. Migration 0006 and its Worker are release-ready but not live until
+  the production rollout and canary complete. Public
   health reported `deliveryReady: true`, listener `ready`, and bridge `synced`
   on 2026-07-14. On 2026-07-15 the same `streamConnectedAt` survived for 11
   minutes 31 seconds across the former ten-minute idle cutoff. `SubscribeAll`
@@ -105,4 +121,9 @@ These instructions apply to the entire repository.
 - XMTP v3 group message topics contain a 16-byte group id (`g-` plus 32 hex
   characters). Welcome topics contain the 32-byte installation id (`w-` plus
   64 hex characters). Never apply one identifier length to both topic kinds.
+- Generic notification payloads and provider error bodies are never retained
+  in D1. Source Queue and dead-letter Queue retention must each be verified at
+  3,600 seconds; the two windows can occur sequentially. Queue delivery is
+  at-least-once, so preserve tuple-bound processing leases, generation-safe
+  completion, retry classification, and two-hour stale-attempt reconciliation.
 - For GitHub auth, prefer `gh`/HTTPS over SSH. If SSH signing fails, run `gh auth setup-git` and use an HTTPS origin.

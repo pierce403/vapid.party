@@ -3,13 +3,35 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestNewControlClientCapsProgrammaticPageSizes(t *testing.T) {
+	t.Parallel()
+
+	client := newControlClient(config{
+		ControlPlaneBaseURL: "https://vapid.party",
+		SyncToken:           "sync-secret",
+		SnapshotPageSize:    100,
+		DeltaPageSize:       100,
+		HTTPTimeout:         time.Second,
+	})
+	if client.snapshotSize != 10 || client.deltaSize != 10 {
+		t.Fatalf(
+			"control page sizes = snapshot %d, delta %d; want 10, 10",
+			client.snapshotSize,
+			client.deltaSize,
+		)
+	}
+}
 
 func TestControlClientPaginatesAuthenticatesAndAcceptsAdditiveFields(t *testing.T) {
 	t.Parallel()
@@ -144,5 +166,96 @@ func TestFetchDeltasRejectsNonAdvancingPagination(t *testing.T) {
 	client := &controlClient{baseURL: server.URL, token: "secret", deltaSize: 100, httpClient: server.Client()}
 	if _, _, err := client.FetchDeltas(context.Background(), "10"); err == nil {
 		t.Fatal("FetchDeltas() accepted a non-advancing hasMore response")
+	}
+}
+
+func TestFetchDeltasForcesSnapshotReloadAtAggregateChangeBudget(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		response.Header().Set("Content-Type", "application/json")
+		after := request.URL.Query().Get("after")
+		var cursor string
+		switch after {
+		case "10":
+			cursor = "11"
+		case "11":
+			cursor = "12"
+		case "12":
+			cursor = "13"
+		default:
+			t.Errorf("unexpected delta cursor %q", after)
+			response.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fmt.Fprintf(response, `{
+			"version":1,
+			"cursor":%q,
+			"hasMore":true,
+			"changes":[{
+				"sequence":%q,
+				"appId":"converge",
+				"installationId":%q,
+				"deliveryToken":"token-a",
+				"registration":null
+			}]
+		}`, cursor, cursor, testInstallationID)
+	}))
+	defer server.Close()
+
+	client := &controlClient{
+		baseURL:             server.URL,
+		token:               "secret",
+		deltaSize:           1,
+		deltaChangeBudget:   2,
+		deltaResponseBudget: 1 << 20,
+		httpClient:          server.Client(),
+	}
+	_, changes, err := client.FetchDeltas(context.Background(), "10")
+	if !errors.Is(err, errDeltaSyncBudgetExceeded) {
+		t.Fatalf("FetchDeltas() error = %v; want delta budget error", err)
+	}
+	if changes != nil {
+		t.Fatalf("FetchDeltas() retained %d partial changes after budget failure", len(changes))
+	}
+	if !shouldReloadSnapshot(err) {
+		t.Fatal("delta budget error did not request a fresh snapshot")
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("delta requests = %d; want 3", got)
+	}
+}
+
+func TestFetchDeltasForcesSnapshotReloadAtAggregateByteBudget(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(response, `{
+			"version":1,
+			"cursor":"11",
+			"hasMore":false,
+			"changes":[],
+			"futureField":%q
+		}`, strings.Repeat("x", 512))
+	}))
+	defer server.Close()
+
+	client := &controlClient{
+		baseURL:             server.URL,
+		token:               "secret",
+		deltaSize:           1,
+		deltaChangeBudget:   10,
+		deltaResponseBudget: 128,
+		httpClient:          server.Client(),
+	}
+	_, _, err := client.FetchDeltas(context.Background(), "10")
+	if !errors.Is(err, errDeltaSyncBudgetExceeded) {
+		t.Fatalf("FetchDeltas() error = %v; want delta byte budget error", err)
+	}
+	if !shouldReloadSnapshot(err) {
+		t.Fatal("delta byte budget error did not request a fresh snapshot")
 	}
 }

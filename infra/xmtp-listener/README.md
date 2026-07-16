@@ -14,9 +14,12 @@ delivery hints to the Worker's internal ingest endpoint.
 
 1. The container authenticates to the Worker and reads a cursor-watermarked,
    paginated full snapshot from D1.
-2. It reads all deltas after that cursor, validates the entire result, and
-   atomically replaces its in-memory index.
-3. It polls idempotent D1 deltas. A `409` or `410` reloads the full snapshot.
+2. It reads deltas after that cursor, validates the result, and atomically
+   replaces its in-memory index.
+3. It polls idempotent D1 deltas. A `409`, `410`, or bounded aggregate delta
+   budget exhaustion discards the partial delta set and reloads a full
+   snapshot. A single poll retains at most 1,000 changes or 8 MiB of decoded
+   control responses.
 4. Each matching XMTP envelope is evaluated independently for every app route.
    HMAC keys are never combined across apps, even when two apps register the
    same installation and topic.
@@ -42,6 +45,8 @@ Defaults are production-safe for the first deployment:
 
 - `XMTP_GRPC_ADDRESS=grpc.production.xmtp.network:443`
 - `LISTEN_ADDRESS=:8080`
+- `SNAPSHOT_PAGE_SIZE=10` (maximum `10`)
+- `DELTA_PAGE_SIZE=10` (maximum `10`)
 - `CONTROL_POLL_INTERVAL=15s`
 - `CONTROL_MAX_STALENESS=2m`
 - `STREAM_STARTUP_GRACE=2m`

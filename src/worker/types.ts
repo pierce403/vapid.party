@@ -34,6 +34,57 @@ export interface SubscriptionRecord {
   disabledAt?: string;
 }
 
+export interface AppPublicProfile {
+  description: string;
+  domain?: string;
+  domainVerifiedAt?: string;
+  domainLastCheckedAt?: string;
+  domainVerificationStatus: 'unverified' | 'verified' | 'mismatch';
+  leaderboardOptIn: boolean;
+  updatedAt: string;
+}
+
+export interface UsageCounts {
+  queued: number;
+  providerAccepted: number;
+  failed: number;
+  expired: number;
+}
+
+export interface AppUsageStats {
+  app: {
+    id: string;
+    name: string;
+    publicVapidKey: string;
+    createdAt: string;
+  };
+  profile: AppPublicProfile;
+  subscriptions: {
+    active: number;
+    xmtpRegistrations: number;
+  };
+  xmtp: {
+    groupTopics: number;
+    welcomeTopics: number;
+    hmacEpochs: number;
+  };
+  usage: {
+    todayUtc: UsageCounts;
+    last7DaysUtc: UsageCounts;
+  };
+  retentionDays: 8;
+}
+
+export interface LeaderboardEntry {
+  rank: number;
+  appId: string;
+  name: string;
+  description: string;
+  verifiedDomain?: string;
+  domainVerifiedAt?: string;
+  providerAcceptedLast7Days: number;
+}
+
 export interface XmtpTopicMatch {
   topicId: string;
   xmtpSubscriptionId: string;

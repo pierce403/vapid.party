@@ -1,6 +1,6 @@
 import type { AppRecord, Env } from './types';
-import { ensureConvergeApp, getAppByApiKey } from './db';
-import { timingSafeEqualString } from './encoding';
+import { ensureConvergeApp, getAppByApiKey, getAppByCredentialHash } from './db';
+import { sha256Hex, timingSafeEqualString } from './encoding';
 
 export const PUBLIC_CONVERGE_ROUTES = new Set([
   'GET /api/xmtp/vapid-public-key',
@@ -52,7 +52,8 @@ export function hasXmtpListenerSyncAuth(
 export async function authenticateApiKey(request: Request, env: Env): Promise<AppRecord | null> {
   const apiKey = request.headers.get('x-api-key');
   if (!apiKey) return null;
-  let app = await getAppByApiKey(env.DB, apiKey);
+  let app = await getAppByCredentialHash(env.DB, await sha256Hex(apiKey));
+  if (!app) app = await getAppByApiKey(env.DB, apiKey);
   if (!app && env.CONVERGE_API_KEY && timingSafeEqualString(apiKey, env.CONVERGE_API_KEY)) {
     app = await ensureConvergeApp(env);
   }

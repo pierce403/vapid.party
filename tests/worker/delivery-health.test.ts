@@ -64,7 +64,7 @@ describe('XMTP delivery health', () => {
 });
 
 describe('removed wallet management surface', () => {
-  it('does not trust unsigned wallet bearer payloads for app administration', async () => {
+  it('keeps the removed wallet registration and list routes unavailable', async () => {
     const forgedPayload = btoa(JSON.stringify({ sub: '0x0000000000000000000000000000000000000001' }))
       .replace(/=/g, '')
       .replace(/\+/g, '-')
@@ -76,14 +76,6 @@ describe('removed wallet management surface', () => {
         headers: { Authorization: authorization },
       }),
       new Request('https://vapid.party/api/apps', {
-        headers: { Authorization: authorization },
-      }),
-      new Request('https://vapid.party/api/apps/converge', {
-        method: 'DELETE',
-        headers: { Authorization: authorization },
-      }),
-      new Request('https://vapid.party/api/apps/converge/regenerate-key', {
-        method: 'POST',
         headers: { Authorization: authorization },
       }),
     ];

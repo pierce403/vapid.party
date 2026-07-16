@@ -15,10 +15,10 @@ const Base64OrBase64UrlString = z.string().min(1).max(1024).transform((value, ct
 
 const P256dhKey = Base64OrBase64UrlString.superRefine((value, ctx) => {
   const bytes = base64UrlToBytes(value);
-  if (!bytes || bytes.length !== 65) {
+  if (!bytes || bytes.length !== 65 || bytes[0] !== 0x04) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'keys.p256dh must decode to 65 bytes',
+      message: 'keys.p256dh must be a 65-byte uncompressed P-256 public key',
     });
   }
 });
@@ -32,6 +32,32 @@ const AuthKey = Base64OrBase64UrlString.superRefine((value, ctx) => {
     });
   }
 });
+
+const XmtpHmacKeyMaterial = Base64OrBase64UrlString.superRefine((value, ctx) => {
+  const bytes = base64UrlToBytes(value);
+  if (!bytes || bytes.length < 1 || bytes.length > 256) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'XMTP HMAC keys must decode to between 1 and 256 bytes',
+    });
+  }
+});
+
+const PushExpirationTime = z.number()
+  .finite()
+  .int()
+  .min(0)
+  .max(8_640_000_000_000_000)
+  .nullable()
+  .optional()
+  .superRefine((value, ctx) => {
+    if (value !== null && value !== undefined && value <= Date.now()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'expirationTime must be in the future or null',
+      });
+    }
+  });
 
 const AbsoluteUrl = z.string().url();
 const WebPushEndpoint = z.string().url().max(4096);
@@ -50,6 +76,24 @@ export const RegisterAppSchema = z.object({
     iconUrl: z.string().url().optional(),
   }).strict().optional(),
 }).strict();
+
+const AppDomainSchema = z.string().trim().min(1).max(253);
+
+export const PublicAppCreateSchema = z.object({
+  name: z.string().trim().min(1).max(255),
+  description: z.string().trim().max(500).optional(),
+  domain: AppDomainSchema.optional(),
+  leaderboardOptIn: z.boolean().optional().default(false),
+}).strict();
+
+export const PublicAppUpdateSchema = z.object({
+  name: z.string().trim().min(1).max(255).optional(),
+  description: z.string().trim().max(500).optional(),
+  domain: AppDomainSchema.nullable().optional(),
+  leaderboardOptIn: z.boolean().optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, {
+  message: 'Provide at least one app field to update',
+});
 
 export const UpdateAppSchema = z.object({
   name: z.string().min(1).max(255).optional(),
@@ -71,13 +115,22 @@ export const PushSubscriptionSchema = z.object({
     p256dh: P256dhKey,
     auth: AuthKey,
   }).strict(),
-  expirationTime: z.number().nullable().optional(),
+  expirationTime: PushExpirationTime,
 }).strict();
 
 export const SubscribeSchema = PushSubscriptionSchema.extend({
   userId: z.string().max(255).optional(),
   channelId: z.string().max(255).optional(),
   metadata: z.record(z.unknown()).optional(),
+}).strict();
+
+// Anonymous enrollment cannot choose trusted routing labels. The app can map
+// the returned subscription id to its own authenticated user and then target
+// that id from its server.
+export const PublicSubscribeSchema = PushSubscriptionSchema;
+
+export const PublicSubscriptionDeleteSchema = z.object({
+  endpoint: WebPushEndpoint,
 }).strict();
 
 export const SendNotificationSchema = z.object({
@@ -90,17 +143,17 @@ export const SendNotificationSchema = z.object({
     url: AbsoluteUrlOrPath.optional(),
     data: z.record(z.unknown()).optional(),
     actions: z.array(z.object({
-      action: z.string(),
-      title: z.string(),
-      icon: z.string().optional(),
-    }).strict()).optional(),
-    tag: z.string().optional(),
+      action: z.string().min(1).max(64),
+      title: z.string().min(1).max(128),
+      icon: AbsoluteUrlOrPath.optional(),
+    }).strict()).max(4).optional(),
+    tag: z.string().max(128).optional(),
     requireInteraction: z.boolean().optional(),
     silent: z.boolean().optional(),
   }).strict(),
-  userId: z.string().optional(),
-  channelId: z.string().optional(),
-  subscriptionIds: z.array(z.string()).optional(),
+  userId: z.string().max(255).optional(),
+  channelId: z.string().max(255).optional(),
+  subscriptionIds: z.array(z.string().max(128)).max(100).optional(),
 }).strict();
 
 export const XmtpPreferencesSchema = z.object({
@@ -117,12 +170,12 @@ const XmtpEpochSchema = z.union([
 
 export const XmtpHmacKeySchema = z.object({
   epoch: XmtpEpochSchema,
-  key: Base64OrBase64UrlString,
+  key: XmtpHmacKeyMaterial,
 }).strict();
 
 export const XmtpTopicSchema = z.object({
   topic: z.string().min(1).max(512),
-  hmacKey: Base64OrBase64UrlString.optional(),
+  hmacKey: XmtpHmacKeyMaterial.optional(),
   hmacKeys: z.array(XmtpHmacKeySchema).max(16).optional(),
   algorithm: z.enum(['hmac-sha256', 'sha256']).default('hmac-sha256'),
   conversationId: z.string().min(1).max(255).optional(),
@@ -131,9 +184,9 @@ export const XmtpTopicSchema = z.object({
 const XmtpHmacKeysSchema = z.union([
   z.array(XmtpTopicSchema),
   z.record(z.union([
-    Base64OrBase64UrlString,
+    XmtpHmacKeyMaterial,
     z.object({
-      hmacKey: Base64OrBase64UrlString,
+      hmacKey: XmtpHmacKeyMaterial,
       algorithm: z.enum(['hmac-sha256', 'sha256']).default('hmac-sha256').optional(),
       conversationId: z.string().min(1).max(255).optional(),
     }).strict(),
@@ -147,7 +200,7 @@ const XmtpLegacySubscriptionRequestSchema = z.object({
     p256dh: P256dhKey,
     auth: AuthKey,
   }).strict().optional(),
-  expirationTime: z.number().nullable().optional(),
+  expirationTime: PushExpirationTime,
   inboxId: z.string().min(1).max(255),
   installationId: z.string().min(1).max(255),
   address: z.string().min(1).max(255).optional(),
@@ -369,6 +422,8 @@ export const XmtpListenerStatusSchema = z.object({
 
 export type RegisterAppInput = z.infer<typeof RegisterAppSchema>;
 export type UpdateAppInput = z.infer<typeof UpdateAppSchema>;
+export type PublicAppCreateInput = z.infer<typeof PublicAppCreateSchema>;
+export type PublicAppUpdateInput = z.infer<typeof PublicAppUpdateSchema>;
 export type SubscribeInput = z.infer<typeof SubscribeSchema>;
 export type SendNotificationInput = z.infer<typeof SendNotificationSchema>;
 export type XmtpSubscriptionRequestInput = z.infer<typeof XmtpSubscriptionRequestSchema>;

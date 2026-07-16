@@ -45,8 +45,8 @@ export interface XmtpRegistrationResult {
   created: boolean;
   diagnostics?: {
     receipt: string;
-    statusPath: '/api/xmtp/status';
-    testPath: '/api/xmtp/status/test';
+    statusPath: string;
+    testPath: string;
   };
 }
 
@@ -61,6 +61,7 @@ export interface XmtpRegistrationStore {
       diagnosticReceipt?: string;
       issueDiagnosticReceipt?: boolean;
       immutableEndpointKeys?: boolean;
+      diagnosticBasePath?: string;
     }
   ): Promise<XmtpRegistrationResult>;
   disableRegistration(input: { endpoint: string; inboxId: string; installationId: string }): Promise<XmtpUnsubscribeResult>;

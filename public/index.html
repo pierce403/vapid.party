@@ -6,16 +6,16 @@
     <meta name="theme-color" content="#081119" />
     <meta
       name="description"
-      content="vapid.party is a Cloudflare-only XMTP and Web Push relay that delivers minimal, privacy-preserving activity hints."
+      content="Create a generic Web Push app without an account, get an isolated VAPID public key, and send browser notifications through Cloudflare."
     />
-    <meta property="og:title" content="vapid.party | XMTP to Web Push relay" />
+    <meta property="og:title" content="vapid.party | Public Web Push infrastructure" />
     <meta
       property="og:description"
-      content="Cloudflare-only delivery infrastructure for minimal XMTP activity hints."
+      content="No-account generic Web Push apps with Cloudflare-only delivery, private stats, and an opt-in public leaderboard."
     />
     <meta property="og:image" content="https://vapid.party/relay-network.webp" />
     <meta property="og:type" content="website" />
-    <title>vapid.party | XMTP to Web Push relay</title>
+    <title>vapid.party | Public Web Push infrastructure</title>
     <link rel="stylesheet" href="/site.css" />
   </head>
   <body>
@@ -33,20 +33,28 @@
       <nav class="site-nav shell" aria-label="Primary navigation">
         <a class="brand" href="/">vapid<span>.</span>party</a>
         <div class="nav-links">
-          <a href="/openapi.yaml">OpenAPI</a>
+          <a href="#create-app">Create app</a>
+          <a class="nav-leaderboard" href="#leaderboard">Leaderboard</a>
+          <a href="/dashboard">Dashboard</a>
+          <a class="nav-docs" href="/openapi.yaml">OpenAPI</a>
           <a class="nav-llms" href="/llms.txt">LLMs</a>
-          <a href="https://github.com/pierce403/vapid.party" rel="noreferrer">GitHub</a>
+          <a class="nav-github" href="https://github.com/pierce403/vapid.party" rel="noreferrer">GitHub</a>
         </div>
       </nav>
 
       <div class="hero-body shell">
         <div class="hero-copy">
-          <p class="eyebrow">XMTP &rarr; Web Push</p>
+          <p class="eyebrow">Public Web Push</p>
           <h1>vapid.party</h1>
           <p class="lede">
-            A Cloudflare-only relay that turns live XMTP events into minimal Web Push
-            hints, without putting message content in the delivery path.
+            Create an isolated generic Web Push app without an account, enroll browsers,
+            and send notifications through a Cloudflare-only relay. General-public XMTP
+            enrollment is not available yet.
           </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#create-app">Create an app</a>
+            <a class="button button-ghost" href="#leaderboard">See public apps</a>
+          </div>
         </div>
       </div>
 
@@ -93,15 +101,136 @@
     </header>
 
     <main>
+      <section class="create-section" id="create-app" aria-labelledby="create-title">
+        <div class="create-layout shell">
+          <div class="create-copy">
+            <p class="section-kicker">Start building</p>
+            <h2 id="create-title">Create an app in seconds.</h2>
+            <p>
+              No account, email, wallet, or payment details. Every app uses its own
+              server-managed VAPID keypair and receives one private app secret.
+            </p>
+            <ul class="feature-checks">
+              <li>Public browser enrollment never needs the app secret</li>
+              <li>Sending, private stats, and settings stay secret-gated</li>
+              <li>DNS verification and the public leaderboard are optional</li>
+              <li>XMTP remains limited to existing Converge and operator integrations</li>
+            </ul>
+          </div>
+
+          <div class="create-card">
+            <form data-create-form novalidate>
+              <div class="field-group">
+                <label for="create-name">App name</label>
+                <input
+                  id="create-name"
+                  name="name"
+                  type="text"
+                  maxlength="255"
+                  autocomplete="organization"
+                  required
+                />
+                <p class="field-help">You can change this later from the private dashboard.</p>
+              </div>
+              <button class="button button-primary button-block" type="submit" data-create-submit>
+                Create app
+              </button>
+              <p class="form-status" data-create-status role="status" aria-live="polite"></p>
+            </form>
+
+            <section class="secret-result" data-create-result hidden tabindex="-1" aria-labelledby="secret-title">
+              <p class="success-label">App created</p>
+              <h3 id="secret-title">Save your app secret now.</h3>
+              <p>
+                This is the only time vapid.party will show it. Anyone with this secret
+                can send notifications, change the app profile, and view private usage.
+                It cannot be recovered.
+              </p>
+
+              <div class="field-group">
+                <label for="created-app-id">App ID</label>
+                <input id="created-app-id" data-created-app-id type="text" readonly />
+              </div>
+              <div class="field-group">
+                <label for="created-vapid-key">Public VAPID key</label>
+                <input id="created-vapid-key" data-created-vapid-key type="text" readonly />
+              </div>
+              <div class="field-group">
+                <label for="created-app-secret">App secret</label>
+                <div class="secret-control">
+                  <input
+                    id="created-app-secret"
+                    data-created-app-secret
+                    type="password"
+                    readonly
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                  <button class="button button-small" type="button" data-toggle-secret>Show</button>
+                  <button class="button button-small" type="button" data-copy-secret>Copy</button>
+                </div>
+                <p class="copy-status" data-copy-status role="status" aria-live="polite"></p>
+              </div>
+              <button class="button button-primary button-block" type="button" data-open-dashboard>
+                Open private dashboard
+              </button>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section class="leaderboard-section" id="leaderboard" aria-labelledby="leaderboard-title">
+        <div class="shell">
+          <div class="section-intro leaderboard-intro">
+            <div>
+              <p class="section-kicker">Apps in motion</p>
+              <h2 id="leaderboard-title">A public stage for builders.</h2>
+            </div>
+            <p class="section-summary">
+              Opt-in apps with a DNS binding last verified within seven days, ranked by
+              real push-provider acceptances across today and the six prior UTC dates.
+              Last verification is not continuous ownership proof, and provider
+              acceptance does not prove notification display.
+            </p>
+          </div>
+
+          <div class="leaderboard-frame" data-leaderboard-frame aria-busy="true">
+            <p class="table-status" data-leaderboard-status role="status" aria-live="polite">
+              Loading public apps…
+            </p>
+            <div class="table-scroll" data-leaderboard-table hidden>
+              <table>
+                <caption class="sr-only">Opted-in apps with recently verified DNS bindings</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Rank</th>
+                    <th scope="col">App</th>
+                    <th scope="col">Last-verified domain</th>
+                    <th scope="col">Provider accepted · 7 days</th>
+                  </tr>
+                </thead>
+                <tbody data-leaderboard-body></tbody>
+              </table>
+            </div>
+            <div class="leaderboard-empty" data-leaderboard-empty hidden>
+              <h3>No apps have opted in yet.</h3>
+              <p>Check a DNS binding from your dashboard and be the first on the board.</p>
+            </div>
+            <p class="leaderboard-updated" data-leaderboard-updated></p>
+          </div>
+        </div>
+      </section>
+
       <section class="pipeline shell" aria-labelledby="pipeline-title">
         <div class="section-intro">
           <div>
-            <p class="section-kicker">Delivery pipeline</p>
+            <p class="section-kicker">Existing XMTP integrations</p>
             <h2 id="pipeline-title">One small signal across a focused path.</h2>
           </div>
           <p class="section-summary">
-            vapid.party keeps XMTP matching, app routing, and browser delivery inside
-            a Cloudflare Worker, D1, Queue, and singleton Container deployment.
+            The restricted Converge and operator XMTP integrations keep matching, app
+            routing, and browser delivery inside a Cloudflare Worker, D1, Queue, and
+            singleton Container. Newly created public apps use generic Web Push only.
           </p>
         </div>
 
@@ -128,6 +257,8 @@
           <p>
             XMTP SubscribeAll has no durable replay cursor. A listener restart or disconnect can
             miss a push hint; the receiving XMTP inbox remains the source of truth.
+            General-public XMTP enrollment also remains unavailable until installation
+            ownership can be proven.
           </p>
         </aside>
 
@@ -180,6 +311,7 @@
           <h2 id="resources-title">Public specs, plain text.</h2>
         </div>
         <div class="resource-links">
+          <a class="resource-link" href="/dashboard">Private app dashboard</a>
           <a class="resource-link" href="/openapi.yaml">OpenAPI specification</a>
           <a class="resource-link" href="/llms.txt">LLM reference</a>
           <a
@@ -193,7 +325,7 @@
 
     <footer>
       <div class="footer-inner shell">
-        <p>Cloudflare-only XMTP alert infrastructure.</p>
+        <p>Cloudflare-only generic Web Push with restricted XMTP integrations.</p>
         <p><a href="/api/health">Raw health JSON</a></p>
       </div>
     </footer>

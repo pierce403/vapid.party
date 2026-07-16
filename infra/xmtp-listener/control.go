@@ -14,7 +14,13 @@ import (
 	"time"
 )
 
-const maxControlResponseBytes = 16 << 20
+const (
+	maxControlResponseBytes = 16 << 20
+	maxDeltaChanges         = 1_000
+	maxDeltaResponseBytes   = 8 << 20
+)
+
+var errDeltaSyncBudgetExceeded = errors.New("delta sync budget exceeded")
 
 type snapshotPage struct {
 	Version       int            `json:"version"`
@@ -47,11 +53,13 @@ type listenerStatus struct {
 }
 
 type controlClient struct {
-	baseURL      string
-	token        string
-	snapshotSize int
-	deltaSize    int
-	httpClient   *http.Client
+	baseURL             string
+	token               string
+	snapshotSize        int
+	deltaSize           int
+	deltaChangeBudget   int
+	deltaResponseBudget int64
+	httpClient          *http.Client
 }
 
 type controlHTTPError struct {
@@ -65,12 +73,38 @@ func (e *controlHTTPError) Error() string {
 
 func newControlClient(cfg config) *controlClient {
 	return &controlClient{
-		baseURL:      cfg.ControlPlaneBaseURL,
-		token:        cfg.SyncToken,
-		snapshotSize: cfg.SnapshotPageSize,
-		deltaSize:    cfg.DeltaPageSize,
-		httpClient:   &http.Client{Timeout: cfg.HTTPTimeout},
+		baseURL:             cfg.ControlPlaneBaseURL,
+		token:               cfg.SyncToken,
+		snapshotSize:        boundedControlPageSize(cfg.SnapshotPageSize),
+		deltaSize:           boundedControlPageSize(cfg.DeltaPageSize),
+		deltaChangeBudget:   maxDeltaChanges,
+		deltaResponseBudget: maxDeltaResponseBytes,
+		httpClient:          &http.Client{Timeout: cfg.HTTPTimeout},
 	}
+}
+
+func boundedControlPageSize(size int) int {
+	if size < 1 {
+		return defaultControlPageSize
+	}
+	if size > maxControlPageSize {
+		return maxControlPageSize
+	}
+	return size
+}
+
+func positiveIntOrDefault(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+
+func positiveInt64OrDefault(value, fallback int64) int64 {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 func (c *controlClient) FetchSnapshot(ctx context.Context) (string, []registration, error) {
@@ -82,12 +116,12 @@ func (c *controlClient) FetchSnapshot(ctx context.Context) (string, []registrati
 	seenTokens := make(map[string]struct{})
 
 	for pageNumber := 0; pageNumber < 10_000; pageNumber++ {
-		query := url.Values{"limit": {strconv.Itoa(c.snapshotSize)}}
+		query := url.Values{"limit": {strconv.Itoa(boundedControlPageSize(c.snapshotSize))}}
 		if pageToken != "" {
 			query.Set("pageToken", pageToken)
 		}
 		var page snapshotPage
-		if err := c.getJSON(ctx, "/api/internal/xmtp/listener/snapshot", query, &page); err != nil {
+		if _, err := c.getJSON(ctx, "/api/internal/xmtp/listener/snapshot", query, &page); err != nil {
 			return "", nil, err
 		}
 		if page.Version != 1 || page.Cursor == "" {
@@ -117,19 +151,42 @@ func (c *controlClient) FetchDeltas(ctx context.Context, after string) (string, 
 	}
 	cursor := after
 	var changes []deltaChange
+	totalResponseBytes := int64(0)
+	changeBudget := positiveIntOrDefault(c.deltaChangeBudget, maxDeltaChanges)
+	responseBudget := positiveInt64OrDefault(c.deltaResponseBudget, maxDeltaResponseBytes)
 
 	for pageNumber := 0; pageNumber < 10_000; pageNumber++ {
+		pageSize := boundedControlPageSize(c.deltaSize)
 		query := url.Values{
 			"after": {cursor},
-			"limit": {strconv.Itoa(c.deltaSize)},
+			"limit": {strconv.Itoa(pageSize)},
 		}
 		var page deltaPage
-		if err := c.getJSON(ctx, "/api/internal/xmtp/listener/deltas", query, &page); err != nil {
+		responseBytes, err := c.getJSON(ctx, "/api/internal/xmtp/listener/deltas", query, &page)
+		if err != nil {
 			return "", nil, err
 		}
 		if page.Version != 1 || page.Cursor == "" {
 			return "", nil, errors.New("delta response has an unsupported version or empty cursor")
 		}
+		if len(page.Changes) > pageSize {
+			return "", nil, fmt.Errorf(
+				"%w: response returned %d changes for a page size of %d",
+				errDeltaSyncBudgetExceeded,
+				len(page.Changes),
+				pageSize,
+			)
+		}
+		if responseBytes > responseBudget-totalResponseBytes ||
+			len(page.Changes) > changeBudget-len(changes) {
+			return "", nil, fmt.Errorf(
+				"%w: more than %d changes or %d response bytes",
+				errDeltaSyncBudgetExceeded,
+				changeBudget,
+				responseBudget,
+			)
+		}
+		totalResponseBytes += responseBytes
 		changes = append(changes, page.Changes...)
 		if !page.HasMore {
 			return page.Cursor, changes, nil
@@ -170,29 +227,39 @@ func (c *controlClient) ReportStatus(ctx context.Context, status listenerStatus)
 	return err
 }
 
-func (c *controlClient) getJSON(ctx context.Context, path string, query url.Values, output any) error {
+func (c *controlClient) getJSON(
+	ctx context.Context,
+	path string,
+	query url.Values,
+	output any,
+) (int64, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path+"?"+query.Encode(), nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	request.Header.Set("Authorization", "Bearer "+c.token)
 	request.Header.Set("Accept", "application/json")
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return readControlHTTPError(response)
+		return 0, readControlHTTPError(response)
 	}
-	decoder := json.NewDecoder(io.LimitReader(response.Body, maxControlResponseBytes))
+	limited := &io.LimitedReader{R: response.Body, N: maxControlResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
 	if err := decoder.Decode(output); err != nil {
-		return fmt.Errorf("decode control response: %w", err)
+		return 0, fmt.Errorf("decode control response: %w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("control response contains trailing JSON")
+		return 0, errors.New("control response contains trailing JSON")
 	}
-	return nil
+	responseBytes := int64(maxControlResponseBytes+1) - limited.N
+	if responseBytes > maxControlResponseBytes {
+		return 0, errors.New("control response exceeds the size limit")
+	}
+	return responseBytes, nil
 }
 
 func readControlHTTPError(response *http.Response) error {
@@ -205,6 +272,9 @@ func readControlHTTPError(response *http.Response) error {
 }
 
 func shouldReloadSnapshot(err error) bool {
+	if errors.Is(err, errDeltaSyncBudgetExceeded) {
+		return true
+	}
 	var httpError *controlHTTPError
 	return errors.As(err, &httpError) && (httpError.StatusCode == http.StatusConflict || httpError.StatusCode == http.StatusGone)
 }

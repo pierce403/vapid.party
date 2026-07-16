@@ -1,7 +1,7 @@
 import { bytesToBase64Url, bytesToHex, base64UrlToBytes } from './encoding';
 
 export function generateApiKey(): string {
-  const bytes = new Uint8Array(24);
+  const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
   return `vp_${bytesToHex(bytes)}`;
 }

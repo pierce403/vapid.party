@@ -50,6 +50,11 @@ export function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+export async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return bytesToHex(new Uint8Array(digest));
+}
+
 export function timingSafeEqualString(a: string, b: string): boolean {
   const maxLength = Math.max(a.length, b.length);
   let diff = a.length ^ b.length;

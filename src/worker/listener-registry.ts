@@ -5,8 +5,8 @@ import type {
 } from './types';
 import type { XmtpListenerStatusInput } from './schemas';
 
-const DEFAULT_PAGE_LIMIT = 100;
-const MAX_PAGE_LIMIT = 100;
+const DEFAULT_PAGE_LIMIT = 10;
+const MAX_PAGE_LIMIT = 10;
 const HEARTBEAT_FRESH_MS = 3 * 60_000;
 const ACTIVE_CONSUMER_MS = 10 * 60_000;
 const CHANGE_RETENTION_MS = 24 * 60 * 60_000;
@@ -74,6 +74,11 @@ export interface XmtpListenerDeltas {
 
 export interface XmtpListenerHealth {
   deliveryReady: boolean;
+  capacity?: {
+    topicAndHmacRows: number;
+    maxTopicAndHmacRows: number;
+    maxTopicAndHmacRowsPerApp: number;
+  };
   listener: {
     configured: boolean;
     status: 'ready' | 'not_ready' | 'not_configured' | 'unknown';
@@ -108,6 +113,13 @@ export function parseListenerPageLimit(value: string | null): number {
     throw new Error(`limit must be between 1 and ${MAX_PAGE_LIMIT}`);
   }
   return parsed;
+}
+
+function capListenerPageLimit(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error('limit must be a positive safe integer');
+  }
+  return Math.min(value, MAX_PAGE_LIMIT);
 }
 
 function encodePageToken(token: SnapshotPageToken): string {
@@ -145,9 +157,12 @@ async function getLatestSequence(db: D1Database): Promise<number> {
   return row?.latest_sequence ?? 0;
 }
 
-function standardBase64(input: string): string {
+function standardBase64(input: string): string | null {
   const bytes = base64UrlToBytes(input);
-  if (!bytes) throw new Error('Stored XMTP HMAC key is not valid base64');
+  // Never let one malformed legacy row poison the singleton listener's full
+  // snapshot. Migration 0006 and request validation enforce the same bound for
+  // new writes; this remains a defense-in-depth control-plane filter.
+  if (!bytes || bytes.length < 1 || bytes.length > 256) return null;
   return bytesToBase64(bytes);
 }
 
@@ -166,41 +181,66 @@ async function loadRegistrations(
 ): Promise<Map<string, XmtpListenerRegistration>> {
   if (routes.length === 0) return new Map();
 
-  const installationIds = [...new Set(routes.map((route) => route.installationId))];
-  const allowedRoutes = new Set(routes.map((route) => `${route.appId}\u0000${route.installationId}`));
-  const placeholders = installationIds.map(() => '?').join(', ');
-  const [installations, topics] = await Promise.all([
-    db.prepare(`
-      SELECT li.app_id, li.installation_id, li.delivery_token
-      FROM xmtp_listener_installations li
-      WHERE li.installation_id IN (${placeholders})
-        AND EXISTS (
-          SELECT 1
-          FROM xmtp_identities xi
-          JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
-          JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
-          WHERE xi.app_id = li.app_id AND xi.installation_id = li.installation_id
-        )
-    `).bind(...installationIds).all<InstallationRow>(),
-    db.prepare(`
-      SELECT DISTINCT
-        xi.installation_id,
-        xi.app_id,
-        xt.topic,
-        hk.epoch,
-        hk.hmac_key
-      FROM xmtp_identities xi
-      JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
-      JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
-      JOIN xmtp_topics xt ON xt.identity_id = xi.id
-      LEFT JOIN xmtp_topic_hmac_keys hk ON hk.topic_id = xt.id
-      WHERE xi.installation_id IN (${placeholders})
-      ORDER BY xi.app_id, xi.installation_id, xt.topic, hk.epoch
-    `).bind(...installationIds).all<TopicRow>(),
-  ]);
+  const uniqueRoutes = [...new Map(routes.map((route) => [
+    `${route.appId}\u0000${route.installationId}`,
+    route,
+  ])).values()];
+  const allowedRoutes = new Set(
+    uniqueRoutes.map((route) => `${route.appId}\u0000${route.installationId}`)
+  );
+  const routeChunks: typeof uniqueRoutes[] = [];
+  // Each pair uses two bindings; 50 pairs stays at D1's 100-parameter limit.
+  for (let index = 0; index < uniqueRoutes.length; index += 50) {
+    routeChunks.push(uniqueRoutes.slice(index, index + 50));
+  }
+  const loaded = await Promise.all(routeChunks.map(async (chunk) => {
+    const installationClause = chunk
+      .map(() => '(li.app_id = ? AND li.installation_id = ?)')
+      .join(' OR ');
+    const topicClause = chunk
+      .map(() => '(xi.app_id = ? AND xi.installation_id = ?)')
+      .join(' OR ');
+    const values = chunk.flatMap((route) => [route.appId, route.installationId]);
+    const [installations, topics] = await Promise.all([
+      db.prepare(`
+        SELECT li.app_id, li.installation_id, li.delivery_token
+        FROM xmtp_listener_installations li
+        WHERE (${installationClause})
+          AND EXISTS (
+            SELECT 1
+            FROM xmtp_identities xi
+            JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
+            JOIN subscriptions s ON s.id = xs.subscription_id
+              AND s.disabled_at IS NULL
+              AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            WHERE xi.app_id = li.app_id AND xi.installation_id = li.installation_id
+          )
+      `).bind(...values).all<InstallationRow>(),
+      db.prepare(`
+        SELECT DISTINCT
+          xi.installation_id,
+          xi.app_id,
+          xt.topic,
+          hk.epoch,
+          hk.hmac_key
+        FROM xmtp_identities xi
+        JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
+        JOIN subscriptions s ON s.id = xs.subscription_id
+          AND s.disabled_at IS NULL
+          AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        JOIN xmtp_topics xt ON xt.identity_id = xi.id
+        LEFT JOIN xmtp_topic_hmac_keys hk ON hk.topic_id = xt.id
+        WHERE (${topicClause})
+        ORDER BY xi.app_id, xi.installation_id, xt.topic, hk.epoch
+      `).bind(...values).all<TopicRow>(),
+    ]);
+    return { installations: installations.results, topics: topics.results };
+  }));
+  const installationRows = loaded.flatMap((chunk) => chunk.installations);
+  const topicRows = loaded.flatMap((chunk) => chunk.topics);
 
   const registrations = new Map<string, XmtpListenerRegistration>();
-  for (const row of installations.results) {
+  for (const row of installationRows) {
     const key = `${row.app_id}\u0000${row.installation_id}`;
     if (!allowedRoutes.has(key)) continue;
     registrations.set(key, {
@@ -212,7 +252,7 @@ async function loadRegistrations(
   }
 
   const topicMaps = new Map<string, Map<string, XmtpListenerTopic>>();
-  for (const row of topics.results) {
+  for (const row of topicRows) {
     const routeKey = `${row.app_id}\u0000${row.installation_id}`;
     if (!allowedRoutes.has(routeKey)) continue;
     const registration = registrations.get(routeKey);
@@ -233,9 +273,11 @@ async function loadRegistrations(
     if (row.epoch !== null && row.hmac_key !== null) {
       const epoch = hmacEpoch(row.epoch);
       if (epoch === null) continue;
+      const encodedKey = standardBase64(row.hmac_key);
+      if (!encodedKey) continue;
       const key = {
         thirtyDayPeriodsSinceEpoch: epoch,
-        key: standardBase64(row.hmac_key),
+        key: encodedKey,
       };
       if (!topic.hmacKeys.some(
         (candidate) => candidate.thirtyDayPeriodsSinceEpoch === key.thirtyDayPeriodsSinceEpoch &&
@@ -329,7 +371,9 @@ export async function reconcileXmtpListenerDirtyRoutes(
         SELECT 1
         FROM xmtp_identities xi
         JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
-        JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
+        JOIN subscriptions s ON s.id = xs.subscription_id
+          AND s.disabled_at IS NULL
+          AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         WHERE xi.app_id = ? AND xi.installation_id = ?
       ) AS active
     `).bind(route.app_id, route.installation_id).first<{ active: number }>();
@@ -348,6 +392,10 @@ export async function getXmtpListenerSnapshot(
   db: D1Database,
   input: { limit: number; pageToken?: string }
 ): Promise<XmtpListenerSnapshot> {
+  // Internal callers do not pass through the HTTP parser. Keep the D1 result
+  // and the listener's atomic decode unit bounded even if one supplies an old
+  // or overly generous limit.
+  const limit = capListenerPageLimit(input.limit);
   const page = input.pageToken ? decodePageToken(input.pageToken) : undefined;
   const cursor = page ? parseCursor(page.cursor, 'pageToken cursor') : await getLatestSequence(db);
   const lastAppId = page?.lastAppId ?? '';
@@ -358,14 +406,16 @@ export async function getXmtpListenerSnapshot(
     FROM xmtp_listener_installations li
     JOIN xmtp_identities xi ON xi.app_id = li.app_id AND xi.installation_id = li.installation_id
     JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
-    JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
+    JOIN subscriptions s ON s.id = xs.subscription_id
+      AND s.disabled_at IS NULL
+      AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     WHERE li.app_id > ? OR (li.app_id = ? AND li.installation_id > ?)
     ORDER BY li.app_id, li.installation_id
     LIMIT ?
-  `).bind(lastAppId, lastAppId, lastInstallationId, input.limit + 1).all<InstallationRow>();
+  `).bind(lastAppId, lastAppId, lastInstallationId, limit + 1).all<InstallationRow>();
 
-  const hasMore = rows.results.length > input.limit;
-  const selected = rows.results.slice(0, input.limit);
+  const hasMore = rows.results.length > limit;
+  const selected = rows.results.slice(0, limit);
   const registrations = await loadRegistrations(
     db,
     selected.map((row) => ({ appId: row.app_id, installationId: row.installation_id }))
@@ -394,6 +444,7 @@ export async function getXmtpListenerDeltas(
   db: D1Database,
   input: { after: string; limit: number }
 ): Promise<XmtpListenerDeltas> {
+  const limit = capListenerPageLimit(input.limit);
   const after = parseCursor(input.after, 'after');
   const result = await db.prepare(`
     SELECT c.sequence, c.app_id, c.installation_id, li.delivery_token
@@ -403,10 +454,10 @@ export async function getXmtpListenerDeltas(
     WHERE c.sequence > ?
     ORDER BY c.sequence
     LIMIT ?
-  `).bind(after, input.limit + 1).all<ChangeRow>();
+  `).bind(after, limit + 1).all<ChangeRow>();
 
-  const hasMore = result.results.length > input.limit;
-  const selected = result.results.slice(0, input.limit);
+  const hasMore = result.results.length > limit;
+  const selected = result.results.slice(0, limit);
   const latestByRoute = new Map<string, ChangeRow>();
   for (const row of selected) {
     latestByRoute.set(`${row.app_id}\u0000${row.installation_id}`, row);
@@ -494,7 +545,7 @@ export async function getXmtpListenerHealth(
     };
   }
 
-  const [latest, consumer, invalidRoutes, dirtyRoutes] = await Promise.all([
+  const [latest, consumer, invalidRoutes, dirtyRoutes, capacity] = await Promise.all([
     getLatestSequence(db),
     db.prepare(`
       SELECT
@@ -508,7 +559,9 @@ export async function getXmtpListenerHealth(
       SELECT COUNT(DISTINCT xi.app_id || char(0) || xi.installation_id) AS count
       FROM xmtp_identities xi
       JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
-      JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
+      JOIN subscriptions s ON s.id = xs.subscription_id
+        AND s.disabled_at IS NULL
+        AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       JOIN xmtp_topics xt ON xt.identity_id = xi.id
       JOIN xmtp_topic_hmac_keys hk ON hk.topic_id = xt.id
       WHERE hk.epoch = '' OR hk.epoch GLOB '*[^0-9]*'
@@ -517,6 +570,9 @@ export async function getXmtpListenerHealth(
       SELECT COUNT(*) AS count
       FROM xmtp_listener_dirty_routes
     `).first<{ count: number }>(),
+    db.prepare(`
+      SELECT row_count FROM xmtp_global_capacity WHERE id = 1
+    `).first<{ row_count: number }>(),
   ]);
 
   const fresh = consumer
@@ -551,6 +607,11 @@ export async function getXmtpListenerHealth(
 
   return {
     deliveryReady,
+    capacity: {
+      topicAndHmacRows: capacity?.row_count ?? 0,
+      maxTopicAndHmacRows: 25_000,
+      maxTopicAndHmacRowsPerApp: 5_000,
+    },
     listener: {
       configured: true,
       status: listenerStatus,
@@ -607,7 +668,9 @@ export async function compactXmtpListenerChanges(db: D1Database): Promise<number
           SELECT 1
           FROM xmtp_identities xi
           JOIN xmtp_subscriptions xs ON xs.identity_id = xi.id AND xs.active = 1
-          JOIN subscriptions s ON s.id = xs.subscription_id AND s.disabled_at IS NULL
+          JOIN subscriptions s ON s.id = xs.subscription_id
+            AND s.disabled_at IS NULL
+            AND (s.expires_at IS NULL OR s.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
           WHERE xi.app_id = li.app_id
             AND xi.installation_id = li.installation_id
         )

@@ -11,8 +11,10 @@ import (
 )
 
 const (
-	defaultXMTPAddress = "grpc.production.xmtp.network:443"
-	defaultListenAddr  = ":8080"
+	defaultXMTPAddress     = "grpc.production.xmtp.network:443"
+	defaultListenAddr      = ":8080"
+	defaultControlPageSize = 10
+	maxControlPageSize     = 10
 )
 
 type config struct {
@@ -54,8 +56,8 @@ func loadConfig() (config, error) {
 		IngestToken:               os.Getenv("INTERNAL_INGEST_TOKEN"),
 		InstanceID:                instanceID,
 		AppVersion:                envOrDefault("APP_VERSION", "vapid-party-xmtp-listener/unknown"),
-		SnapshotPageSize:          100,
-		DeltaPageSize:             100,
+		SnapshotPageSize:          defaultControlPageSize,
+		DeltaPageSize:             defaultControlPageSize,
 		ControlPollInterval:       15 * time.Second,
 		ControlMaxStaleness:       2 * time.Minute,
 		StreamStartupGrace:        2 * time.Minute,
@@ -69,10 +71,10 @@ func loadConfig() (config, error) {
 	}
 
 	var err error
-	if cfg.SnapshotPageSize, err = intEnv("SNAPSHOT_PAGE_SIZE", cfg.SnapshotPageSize, 1, 100); err != nil {
+	if cfg.SnapshotPageSize, err = intEnv("SNAPSHOT_PAGE_SIZE", cfg.SnapshotPageSize, 1, maxControlPageSize); err != nil {
 		return config{}, err
 	}
-	if cfg.DeltaPageSize, err = intEnv("DELTA_PAGE_SIZE", cfg.DeltaPageSize, 1, 100); err != nil {
+	if cfg.DeltaPageSize, err = intEnv("DELTA_PAGE_SIZE", cfg.DeltaPageSize, 1, maxControlPageSize); err != nil {
 		return config{}, err
 	}
 	if cfg.DeliveryAttempts, err = intEnv("DELIVERY_ATTEMPTS", cfg.DeliveryAttempts, 1, 10); err != nil {

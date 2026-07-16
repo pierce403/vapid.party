@@ -12,21 +12,12 @@ import {
 import { getXmtpListenerSnapshot, saveXmtpListenerStatus } from '../../src/worker/listener-registry';
 import type { NormalizedXmtpRegistration, XmtpRegistrationResult } from '../../src/worker/core';
 import type { Env, PushQueueJob } from '../../src/worker/types';
+import { migrationStatements } from './migration-helpers';
 
 const inboxId = '11'.repeat(32);
 const installationId = '22'.repeat(32);
 const groupTopic = `/xmtp/mls/1/g-${'33'.repeat(16)}/proto`;
 const welcomeTopic = `/xmtp/mls/1/w-${installationId}/proto`;
-
-function migrationStatements(sql: string): string[] {
-  return sql
-    .split('\n')
-    .map((line) => line.replace(/--.*$/, ''))
-    .join('\n')
-    .split(';')
-    .map((statement) => statement.trim())
-    .filter(Boolean);
-}
 
 async function applyMigration(db: D1Database, path: string): Promise<void> {
   const sql = await readFile(new URL(path, import.meta.url), 'utf8');
@@ -132,6 +123,7 @@ describe('privacy-safe XMTP registration diagnostics', () => {
       '../../migrations/d1/0003_xmtp_listener_registry_expand.sql',
       '../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql',
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
+      '../../migrations/d1/0006_public_apps_and_usage.sql',
     ]) await applyMigration(db, path);
 
     await db.prepare(`
@@ -194,7 +186,13 @@ describe('privacy-safe XMTP registration diagnostics', () => {
   async function postJson(
     path: string,
     body: unknown,
-    options: { receipt?: string; diagnostics?: boolean; ip?: string; method?: 'POST' | 'DELETE' } = {}
+    options: {
+      receipt?: string;
+      apiKey?: string;
+      diagnostics?: boolean;
+      ip?: string;
+      method?: 'POST' | 'DELETE';
+    } = {}
   ): Promise<Response> {
     return (await handleApi(new Request(`https://vapid.party${path}`, {
       method: options.method ?? 'POST',
@@ -202,9 +200,25 @@ describe('privacy-safe XMTP registration diagnostics', () => {
         'Content-Type': 'application/json',
         'CF-Connecting-IP': options.ip ?? '203.0.113.10',
         ...(options.diagnostics === false ? {} : { 'X-Vapid-Party-Diagnostics': '1' }),
+        ...(options.apiKey ? { 'X-API-Key': options.apiKey } : {}),
         ...(options.receipt ? { Authorization: `Bearer ${options.receipt}` } : {}),
       },
       body: JSON.stringify(body),
+    }), env)) as Response;
+  }
+
+  async function postOperatorDiagnostic(
+    path: string,
+    apiKey: string | undefined,
+    receipt: string
+  ): Promise<Response> {
+    return (await handleApi(new Request(`https://vapid.party${path}`, {
+      method: 'POST',
+      headers: {
+        'CF-Connecting-IP': '203.0.113.10',
+        ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+        Authorization: `Bearer ${receipt}`,
+      },
     }), env)) as Response;
   }
 
@@ -259,6 +273,102 @@ describe('privacy-safe XMTP registration diagnostics', () => {
       'AQID',
       diagnostics.receipt,
     ]) expect(serialized).not.toContain(secret);
+  });
+
+  it('serves returned operator diagnostic paths only to the owning app and receipt', async () => {
+    await db.prepare(`
+      INSERT INTO apps (
+        id, name, owner_wallet, api_key, vapid_public_key, vapid_private_key
+      ) VALUES (
+        'operator-one', 'Operator One', 'operator-one', 'operator-secret',
+        'operator-public', 'operator-private'
+      )
+    `).run();
+    const {
+      app: operatorAppDescriptor,
+      ...operatorRegistration
+    } = publicRegistrationRequest('https://fcm.googleapis.com/fcm/send/operator-diagnostic');
+    expect(operatorAppDescriptor.id).toBe('converge.cv');
+
+    const registered = await postJson('/api/xmtp/registrations', operatorRegistration, {
+      apiKey: 'operator-secret',
+      diagnostics: false,
+    });
+    expect(registered.status).toBe(201);
+    const registeredBody = await registered.json() as {
+      data: { diagnostics: { receipt: string; statusPath: string; testPath: string } };
+    };
+    const diagnostics = registeredBody.data.diagnostics;
+    expect(diagnostics).toMatchObject({
+      receipt: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      statusPath: '/api/apps/operator-one/xmtp/status',
+      testPath: '/api/apps/operator-one/xmtp/status/test',
+    });
+
+    const missingAppCredential = await postOperatorDiagnostic(
+      diagnostics.statusPath,
+      undefined,
+      diagnostics.receipt
+    );
+    expect(missingAppCredential.status).toBe(401);
+    expect(missingAppCredential.headers.get('Access-Control-Allow-Origin')).toBeNull();
+
+    const status = await postOperatorDiagnostic(
+      diagnostics.statusPath,
+      'operator-secret',
+      diagnostics.receipt
+    );
+    expect(status.status).toBe(200);
+    expect(status.headers.get('Cache-Control')).toBe('no-store');
+    expect(status.headers.get('Access-Control-Allow-Origin')).toBeNull();
+
+    const test = await postOperatorDiagnostic(
+      diagnostics.testPath,
+      'operator-secret',
+      diagnostics.receipt
+    );
+    expect(test.status).toBe(202);
+    expect(queued).toHaveLength(1);
+
+    await db.prepare(`
+      INSERT INTO apps (
+        id, name, owner_wallet, api_key, vapid_public_key, vapid_private_key
+      ) VALUES (
+        'second-operator', 'Second Operator', 'second-operator', 'second-secret',
+        'second-public', 'second-private'
+      )
+    `).run();
+    const secondInstallationId = '44'.repeat(32);
+    const {
+      app: secondAppDescriptor,
+      ...secondRegistration
+    } = publicRegistrationRequest(
+      'https://fcm.googleapis.com/fcm/send/second-operator-diagnostic',
+      { installationId: secondInstallationId }
+    );
+    expect(secondAppDescriptor.id).toBe('converge.cv');
+    const secondRegistered = await postJson('/api/xmtp/registrations', secondRegistration, {
+      apiKey: 'second-secret',
+      diagnostics: false,
+    });
+    expect(secondRegistered.status).toBe(201);
+    const secondBody = await secondRegistered.json() as {
+      data: { diagnostics: { receipt: string } };
+    };
+
+    const crossAppReceipt = await postOperatorDiagnostic(
+      diagnostics.statusPath,
+      'operator-secret',
+      secondBody.data.diagnostics.receipt
+    );
+    expect(crossAppReceipt.status).toBe(404);
+
+    const mismatchedPath = await postOperatorDiagnostic(
+      '/api/apps/second-operator/xmtp/status',
+      'operator-secret',
+      diagnostics.receipt
+    );
+    expect(mismatchedPath.status).toBe(403);
   });
 
   it('returns the receipt only in a no-store response and rejects custom endpoints', async () => {
@@ -542,6 +652,90 @@ describe('privacy-safe XMTP registration diagnostics', () => {
     `).first()).toEqual({ subscriptions: 0, identities: 0, topics: 0, hmacs: 0 });
   });
 
+  it('returns 409 without replacing state when one app reuses an installation for another inbox', async () => {
+    const originalEndpoint = 'https://fcm.googleapis.com/fcm/send/installation-owner';
+    expect((await postJson(
+      '/api/xmtp/subscriptions',
+      publicRegistrationRequest(originalEndpoint)
+    )).status).toBe(201);
+    const protectedState = () => db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
+        (SELECT COUNT(*) FROM xmtp_identities) AS identities,
+        (SELECT COUNT(*) FROM xmtp_subscriptions) AS logical,
+        (SELECT COUNT(*) FROM xmtp_topics) AS topics,
+        (SELECT COUNT(*) FROM xmtp_topic_hmac_keys) AS hmacs,
+        (SELECT COUNT(*) FROM xmtp_listener_changes) AS changes,
+        (SELECT COUNT(*) FROM xmtp_listener_dirty_routes) AS dirty,
+        (SELECT inbox_id FROM xmtp_identities WHERE installation_id = ?) AS inbox,
+        (SELECT endpoint FROM subscriptions WHERE disabled_at IS NULL) AS endpoint
+    `).bind(installationId).first();
+    const before = await protectedState();
+
+    const conflict = await postJson(
+      '/api/xmtp/subscriptions',
+      publicRegistrationRequest(
+        'https://fcm.googleapis.com/fcm/send/installation-intruder',
+        { inboxId: '44'.repeat(32), installationId }
+      )
+    );
+    expect(conflict.status).toBe(409);
+    expect(conflict.headers.get('Cache-Control')).toBe('no-store');
+    expect(await protectedState()).toEqual(before);
+  });
+
+  it('maps the stable D1 subscription quota abort to 429', async () => {
+    await db.prepare(`
+      CREATE TRIGGER force_subscription_limit_for_test
+      BEFORE INSERT ON subscriptions
+      WHEN NEW.endpoint LIKE '%/forced-quota-limit'
+      BEGIN
+        SELECT RAISE(ABORT, 'app_subscription_limit');
+      END
+    `).run();
+
+    const limited = await postJson(
+      '/api/xmtp/subscriptions',
+      publicRegistrationRequest(
+        'https://fcm.googleapis.com/fcm/send/forced-quota-limit'
+      )
+    );
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get('Cache-Control')).toBe('no-store');
+  });
+
+  it('rejects XMTP capacity before persisting any registration state', async () => {
+    await db.prepare(`
+      INSERT INTO xmtp_app_capacity (app_id, row_count) VALUES ('converge', 5000)
+    `).run();
+    await db.prepare(`
+      UPDATE xmtp_global_capacity SET row_count = 5000 WHERE id = 1
+    `).run();
+
+    const limited = await postJson(
+      '/api/xmtp/subscriptions',
+      publicRegistrationRequest('https://fcm.googleapis.com/fcm/send/capacity-preflight')
+    );
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get('Cache-Control')).toBe('no-store');
+    expect(await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
+        (SELECT COUNT(*) FROM xmtp_identities) AS identities,
+        (SELECT COUNT(*) FROM xmtp_subscriptions) AS logical,
+        (SELECT COUNT(*) FROM xmtp_topics) AS topics,
+        (SELECT COUNT(*) FROM xmtp_listener_changes) AS changes,
+        (SELECT COUNT(*) FROM xmtp_listener_dirty_routes) AS dirty
+    `).first()).toEqual({
+      subscriptions: 0,
+      identities: 0,
+      logical: 0,
+      topics: 0,
+      changes: 0,
+      dirty: 0,
+    });
+  });
+
   it('does not charge rejected mutations to valid registration quotas', async () => {
     const firstEndpoint = 'https://fcm.googleapis.com/fcm/send/quota-one';
     const replacementEndpoint = 'https://fcm.googleapis.com/fcm/send/quota-two';
@@ -598,6 +792,14 @@ describe('privacy-safe XMTP registration diagnostics', () => {
     const tooLongKey = publicRegistrationRequest(endpoint) as any;
     tooLongKey.xmtp.topics[0].hmacKeys[0].key = 'A'.repeat(1025);
     expect((await postJson('/api/xmtp/subscriptions', tooLongKey)).status).toBe(422);
+
+    const tooManyDecodedKeyBytes = publicRegistrationRequest(endpoint) as any;
+    tooManyDecodedKeyBytes.xmtp.topics[0].hmacKeys[0].key = Buffer.alloc(257).toString('base64url');
+    expect((await postJson('/api/xmtp/subscriptions', tooManyDecodedKeyBytes)).status).toBe(422);
+
+    const expired = publicRegistrationRequest(endpoint) as any;
+    expired.subscription.expirationTime = 0;
+    expect((await postJson('/api/xmtp/subscriptions', expired)).status).toBe(422);
 
     const tooLarge = (await handleApi(new Request(
       'https://vapid.party/api/xmtp/subscriptions',
@@ -657,7 +859,7 @@ describe('privacy-safe XMTP registration diagnostics', () => {
       publicRegistrationRequest(endpoint, {
         inboxId: thirdInbox,
         installationId: thirdInstallation,
-        p256dh: `C${'A'.repeat(86)}`,
+        p256dh: 'BAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE',
         auth: 'B'.repeat(22),
       })
     );
@@ -681,7 +883,7 @@ describe('privacy-safe XMTP registration diagnostics', () => {
       postJson('/api/xmtp/subscriptions', publicRegistrationRequest(endpoint, {
         inboxId: secondInbox,
         installationId: secondInstallation,
-        p256dh: `C${'A'.repeat(86)}`,
+        p256dh: 'BAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE',
         auth: 'B'.repeat(22),
       })),
     ]);
@@ -740,6 +942,51 @@ describe('privacy-safe XMTP registration diagnostics', () => {
         (SELECT COUNT(*) FROM rate_limit_logs WHERE id = 'old-rate') AS rates,
         (SELECT COUNT(*) FROM delivery_attempts WHERE id = 'old-diagnostic') AS diagnostics
     `).first()).toEqual({ rates: 0, diagnostics: 0 });
+  });
+
+  it('drains more eligible history than the maximum sustained public-send rate', async () => {
+    const old = '2020-01-01T00:00:00.000Z';
+    await db.prepare(`
+      WITH digits(value) AS (
+        VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9)
+      ), sequence(value) AS (
+        SELECT ones.value + tens.value * 10 + hundreds.value * 100 + thousands.value * 1000
+        FROM digits ones
+        CROSS JOIN digits tens
+        CROSS JOIN digits hundreds
+        CROSS JOIN digits thousands
+        WHERE ones.value + tens.value * 10 + hundreds.value * 100 + thousands.value * 1000 <= 5000
+      )
+      INSERT INTO rate_limit_logs (
+        id, app_id, action, count, window_start, created_at
+      )
+      SELECT
+        'old-rate-' || value,
+        'converge',
+        'old-action-' || value,
+        1,
+        ?,
+        ?
+      FROM sequence
+    `).bind(old, old).run();
+
+    const first = await compactOperationalHistory(db);
+    expect(first).toMatchObject({
+      batchLimit: 5000,
+      deletedRows: 5000,
+      backlogLikely: true,
+      oldestEligibleAt: old,
+    });
+    expect(await db.prepare(`
+      SELECT COUNT(*) AS count FROM rate_limit_logs WHERE window_start = ?
+    `).bind(old).first()).toEqual({ count: 1 });
+
+    const second = await compactOperationalHistory(db);
+    expect(second).toMatchObject({
+      batchLimit: 5000,
+      deletedRows: 1,
+      backlogLikely: false,
+    });
   });
 
   it('saturates denied rate counters without writing on every abusive retry', async () => {

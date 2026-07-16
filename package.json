@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "build": "wrangler deploy --dry-run --outdir dist/worker",
+    "build": "wrangler deploy --dry-run --outdir dist/worker --containers-rollout=none",
     "start": "wrangler dev --remote",
     "lint": "tsc --noEmit -p tsconfig.worker.json",
     "test": "vitest run",

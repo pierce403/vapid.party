@@ -7,7 +7,11 @@ import {
 } from './listener-registry';
 import { handleQueue } from './queue';
 import type { Env, PushQueueJob } from './types';
-import { compactOperationalHistory } from './db';
+import {
+  compactExpiredSubscriptions,
+  compactOperationalHistory,
+  reconcileStalePushDeliveryAttempts,
+} from './db';
 import { withStaticSecurityHeaders } from './security-headers';
 
 export { RelayCoordinator } from './relay-coordinator';
@@ -37,10 +41,61 @@ export default {
     try {
       await reconcileXmtpListenerDirtyRoutes(env.DB);
       await compactXmtpListenerChanges(env.DB);
-      await compactOperationalHistory(env.DB);
     } catch (error) {
       console.error(JSON.stringify({
         event: 'xmtp_listener_maintenance_failed',
+        error: error instanceof Error ? error.message : 'unknown error',
+      }));
+    }
+
+    // Expired browser capabilities stop routing/counting immediately. Cleanup
+    // uses the normal XMTP tombstone path and is isolated from both listener
+    // reconciliation and operational-history retention failures.
+    try {
+      const expired = await compactExpiredSubscriptions(env.DB);
+      if (expired.backlogLikely) {
+        console.warn(JSON.stringify({
+          event: 'expired_subscription_backlog',
+          ...expired,
+        }));
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'expired_subscription_compaction_failed',
+        error: error instanceof Error ? error.message : 'unknown error',
+      }));
+    }
+
+    // A source Queue message can age out during an outage without another
+    // consumer invocation. Close those coarse D1 attempts after the one-hour
+    // Queue retention plus grace so they cannot remain queued indefinitely.
+    try {
+      const stale = await reconcileStalePushDeliveryAttempts(env.DB);
+      if (stale.reconciled >= 5_000) {
+        console.warn(JSON.stringify({
+          event: 'stale_push_attempt_backlog',
+          ...stale,
+        }));
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'stale_push_attempt_reconciliation_failed',
+        error: error instanceof Error ? error.message : 'unknown error',
+      }));
+    }
+
+    // Privacy retention must not depend on listener reconciliation succeeding.
+    try {
+      const compaction = await compactOperationalHistory(env.DB);
+      if (compaction.backlogLikely) {
+        console.warn(JSON.stringify({
+          event: 'operational_history_backlog',
+          ...compaction,
+        }));
+      }
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'operational_history_compaction_failed',
         error: error instanceof Error ? error.message : 'unknown error',
       }));
     }

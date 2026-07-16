@@ -2,33 +2,30 @@ import { readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Miniflare } from 'miniflare';
 import { relayXmtpDelivery, type NormalizedXmtpRegistration } from '../../src/worker/core';
-import { D1XmtpStore } from '../../src/worker/db';
+import {
+  acquireXmtpRegistrationMutationLock,
+  D1XmtpStore,
+  releaseXmtpRegistrationMutationLock,
+  XmtpInstallationIdentityConflictError,
+} from '../../src/worker/db';
 import {
   compactXmtpListenerChanges,
   getXmtpListenerDeltas,
   getXmtpListenerHealth,
   getXmtpListenerSnapshot,
   markXmtpListenerRouteDirty,
+  parseListenerPageLimit,
   reconcileXmtpListenerDirtyRoutes,
   saveXmtpListenerStatus,
 } from '../../src/worker/listener-registry';
 import type { Env, PushQueueJob } from '../../src/worker/types';
+import { migrationStatements } from './migration-helpers';
 
 const p256dh = `B${'A'.repeat(86)}`;
 const auth = 'A'.repeat(22);
 const inboxId = '11'.repeat(32);
 const installationId = '22'.repeat(32);
 const topic = `/xmtp/mls/1/g-${'33'.repeat(16)}/proto`;
-
-function migrationStatements(sql: string): string[] {
-  return sql
-    .split('\n')
-    .map((line) => line.replace(/--.*$/, ''))
-    .join('\n')
-    .split(';')
-    .map((statement) => statement.trim())
-    .filter(Boolean);
-}
 
 async function applyMigration(db: D1Database, sql: string): Promise<void> {
   const statements = migrationStatements(sql);
@@ -82,6 +79,7 @@ describe('app-scoped XMTP listener registry', () => {
       readFile(new URL('../../migrations/d1/0003_xmtp_listener_registry_expand.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0005_xmtp_diagnostics.sql', import.meta.url), 'utf8'),
+      readFile(new URL('../../migrations/d1/0006_public_apps_and_usage.sql', import.meta.url), 'utf8'),
     ]);
     for (const migration of migrations) {
       await applyMigration(db, migration);
@@ -187,6 +185,139 @@ describe('app-scoped XMTP listener registry', () => {
 
     const foreignKeys = await db.prepare('PRAGMA foreign_key_check').all();
     expect(foreignKeys.results).toEqual([]);
+  });
+
+  it('rolls back a failed XMTP queue publish so the same event can be retried', async () => {
+    const appA = new D1XmtpStore(env, 'app-a');
+    await appA.upsertRegistration(registration(
+      'https://push.example/app-a-retry',
+      'AQID',
+      'opaque_app_a_retry'
+    ));
+
+    const snapshot = await getXmtpListenerSnapshot(db, { limit: 100 });
+    const route = snapshot.registrations.find((candidate) => candidate.appId === 'app-a');
+    expect(route?.deliveryToken).toBeTruthy();
+    const delivery = {
+      version: 1,
+      idempotencyKey: 'delivery-queue-retry',
+      installationId,
+      deliveryToken: route?.deliveryToken,
+      topic,
+      messageType: 'v3-conversation',
+      isSilent: false,
+    };
+
+    const workingQueue = env.PUSH_QUEUE;
+    env.PUSH_QUEUE = {
+      ...workingQueue,
+      send: async () => {
+        throw new Error('queue unavailable');
+      },
+    };
+
+    const relay = new D1XmtpStore(env);
+    await expect(relayXmtpDelivery(relay, delivery)).rejects.toThrow('queue unavailable');
+
+    const failedState = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM delivery_attempts WHERE app_id = 'app-a') AS attempts,
+        (SELECT COUNT(*) FROM xmtp_delivery_events) AS events,
+        (SELECT COALESCE(SUM(queued_count), 0)
+          FROM app_usage_daily
+          WHERE app_id = 'app-a' AND event_type = 'xmtp.new_message') AS queued
+    `).first<{ attempts: number; events: number; queued: number }>();
+    expect(failedState).toEqual({ attempts: 0, events: 0, queued: 0 });
+
+    env.PUSH_QUEUE = workingQueue;
+    await expect(relayXmtpDelivery(relay, delivery)).resolves.toMatchObject({
+      matched: 1,
+      queued: 1,
+      deduplicated: 0,
+    });
+    expect(queued).toHaveLength(1);
+
+    const retriedState = await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM delivery_attempts WHERE app_id = 'app-a') AS attempts,
+        (SELECT COUNT(*) FROM xmtp_delivery_events) AS events,
+        (SELECT COALESCE(SUM(queued_count), 0)
+          FROM app_usage_daily
+          WHERE app_id = 'app-a' AND event_type = 'xmtp.new_message') AS queued
+    `).first<{ attempts: number; events: number; queued: number }>();
+    expect(retriedState).toEqual({ attempts: 1, events: 1, queued: 1 });
+  });
+
+  it('rejects a second inbox for one app installation before mutating route state', async () => {
+    const appA = new D1XmtpStore(env, 'app-a');
+    await appA.upsertRegistration(registration(
+      'https://push.example/app-a-original',
+      'AQID',
+      'opaque_app_a'
+    ));
+    const state = () => db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM subscriptions) AS subscriptions,
+        (SELECT COUNT(*) FROM xmtp_identities) AS identities,
+        (SELECT COUNT(*) FROM xmtp_subscriptions) AS logical,
+        (SELECT COUNT(*) FROM xmtp_topics) AS topics,
+        (SELECT COUNT(*) FROM xmtp_topic_hmac_keys) AS hmacs,
+        (SELECT COUNT(*) FROM xmtp_listener_changes) AS changes,
+        (SELECT COUNT(*) FROM xmtp_listener_dirty_routes) AS dirty,
+        (SELECT inbox_id FROM xmtp_identities WHERE app_id = 'app-a') AS inbox,
+        (SELECT inbox_handle FROM xmtp_identities WHERE app_id = 'app-a') AS handle,
+        (SELECT hmac_key FROM xmtp_topic_hmac_keys LIMIT 1) AS hmac
+    `).first();
+    const before = await state();
+
+    await expect(appA.upsertRegistration({
+      ...registration(
+        'https://push.example/app-a-conflict',
+        'BAUG',
+        'must_not_replace_the_original'
+      ),
+      inboxId: '44'.repeat(32),
+    })).rejects.toBeInstanceOf(XmtpInstallationIdentityConflictError);
+
+    expect(await state()).toEqual(before);
+  });
+
+  it('serializes registration mutations by app and installation, not inbox', async () => {
+    const firstInput = { inboxId, installationId };
+    const secondInput = { inboxId: '44'.repeat(32), installationId };
+    const first = await acquireXmtpRegistrationMutationLock(db, 'app-a', firstInput);
+    expect(first).toBeTruthy();
+    expect(await acquireXmtpRegistrationMutationLock(db, 'app-a', secondInput)).toBeNull();
+    await releaseXmtpRegistrationMutationLock(db, 'app-a', firstInput, first as string);
+    expect(await acquireXmtpRegistrationMutationLock(db, 'app-a', secondInput)).toBeTruthy();
+  });
+
+  it('caps parsed and direct snapshot and delta pages at ten routes', async () => {
+    expect(parseListenerPageLimit(null)).toBe(10);
+    expect(parseListenerPageLimit('10')).toBe(10);
+    expect(() => parseListenerPageLimit('11')).toThrow('limit must be between 1 and 10');
+
+    const appA = new D1XmtpStore(env, 'app-a');
+    for (let index = 0; index < 11; index += 1) {
+      const suffix = (index + 1).toString(16).padStart(2, '0');
+      await appA.upsertRegistration({
+        ...registration(
+          `https://push.example/page-${index}`,
+          'AQID',
+          `opaque_page_${index}`
+        ),
+        inboxId: suffix.repeat(32),
+        installationId: (index + 32).toString(16).padStart(2, '0').repeat(32),
+      });
+    }
+
+    const snapshot = await getXmtpListenerSnapshot(db, { limit: 100 });
+    expect(snapshot.registrations).toHaveLength(10);
+    expect(snapshot.nextPageToken).toBeTruthy();
+
+    const deltas = await getXmtpListenerDeltas(db, { after: '0', limit: 100 });
+    expect(deltas.changes).toHaveLength(10);
+    expect(deltas.hasMore).toBe(true);
   });
 
   it('reports ready only for a fresh listener at the latest change cursor', async () => {

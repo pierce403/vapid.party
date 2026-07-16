@@ -1,18 +1,34 @@
 openapi: 3.1.0
 info:
   title: vapid.party API
-  version: 3.0.0
+  version: 4.0.0
   description: |
     Cloudflare-only Web Push relay with an app-scoped XMTP listener.
-    App provisioning is operator-only. Converge has a restricted public
-    compatibility registration; pre-provisioned apps use X-API-Key.
+    The version-4 public app contract and migration 0006 are implemented locally
+    and pending production rollout. Anonymous app creation returns one appSecret;
+    only its SHA-256 digest is stored. Browser enrollment uses narrower
+    per-registration capabilities. General-public apps support generic Web Push
+    only; their XMTP routes return 403 until installation ownership proof exists.
+    Converge's restricted public compatibility registration and pre-provisioned
+    operator flows remain separate. D1 stores no generic or XMTP notification
+    payload; usage is short-retained aggregate daily UTC counters, and source
+    Queue plus dead-letter retention are each one hour and may occur
+    sequentially. Service backstops admit 5,000 anonymous creation attempts,
+    5,000 subscription-verification attempts, and 5,000 authenticated public
+    state mutations per minute; successful app creation is capped at 600/minute.
 servers:
   - url: https://vapid.party
   - url: http://localhost:8787
 tags:
   - name: Health
+  - name: Public Apps
+  - name: Public Enrollment
+  - name: Unavailable Public XMTP
+    description: Reserved paths that return 403 until installation ownership proof exists.
+  - name: App Management
+  - name: Leaderboard
   - name: Converge XMTP
-  - name: App XMTP
+  - name: Operator XMTP
   - name: Generic Push
 paths:
   /api/health:
@@ -27,6 +43,443 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+  /api/apps:
+    post:
+      tags: [Public Apps]
+      summary: Create an app without an account
+      description: |
+        Returns one appSecret in a no-store response. Save it immediately: only
+        its SHA-256 digest is retained and the raw value cannot be recovered.
+        Anonymous creation is protected by high abuse-backstop rate limits.
+        Persistent public state is capped at 25,000 apps service-wide.
+        This route is implemented locally and pending production rollout.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublicAppCreateRequest"
+      responses:
+        "201":
+          description: App created and one raw app secret returned
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicAppCreateResponse"
+        "413":
+          description: Request body exceeds 16,384 bytes
+        "422":
+          description: Invalid name, profile, or domain hostname
+        "429":
+          description: Anonymous creation rate limit exceeded
+        "503":
+          description: Anonymous app storage capacity is full
+  /api/leaderboard:
+    get:
+      tags: [Leaderboard]
+      summary: List verified apps by recent provider acceptances
+      description: |
+        Returns at most 50 opted-in apps whose DNS binding was last verified
+        within seven days against the app id and current VAPID key. DNS is
+        checked on demand, not continuously; domainVerifiedAt is not proof of
+        current ownership. The ranking window is today plus the six preceding
+        UTC dates. Provider accepted does not mean browser delivered, displayed,
+        or read.
+      security: []
+      responses:
+        "200":
+          description: Public leaderboard
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: public, max-age=60
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LeaderboardResponse"
+  /api/apps/{appId}:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    delete:
+      tags: [App Management]
+      summary: Permanently delete an app and its owned state
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: App deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppDeleteResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+        "409":
+          description: App subscription state is concurrently being updated
+        "429":
+          description: Public app mutation capacity is temporarily rate limited
+  /api/apps/{appId}/vapid-public-key:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    get:
+      tags: [Public Apps]
+      summary: Discover a public app's VAPID key
+      security: []
+      responses:
+        "200":
+          description: App id and public VAPID key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppVapidPublicKeyResponse"
+        "404":
+          description: Public app not found
+  /api/apps/{appId}/enrollment-ticket:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [Public Enrollment]
+      summary: Mint a short-lived ticket for one exact browser subscription
+      description: |
+        A trusted app server validates its user, then sends the exact standard
+        PushSubscription it will authorize. The no-store response contains a
+        five-minute stateless bearer ticket bound to the app id, endpoint,
+        keys, and expiration. No ticket state is persisted.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushSubscription"
+      responses:
+        "200":
+          description: Endpoint-bound enrollment ticket
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnrollmentTicketResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+        "413":
+          description: Request body exceeds 65,536 bytes
+        "422":
+          description: Invalid subscription or unsupported provider endpoint
+        "429":
+          description: Enrollment-ticket mint rate limit exceeded
+  /api/apps/{appId}/subscriptions:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [Public Enrollment]
+      summary: Publicly enroll or refresh one generic browser subscription
+      description: |
+        Requires the five-minute ticket minted for this exact body by the app's
+        trusted server. The body cannot set userId, channelId, or metadata.
+        Returns a fresh per-subscription management token in a no-store
+        response; only its SHA-256 digest is stored. Active endpoint keys are
+        immutable, only canonical browser Web Push providers are accepted, and
+        public apps are capped at 150 active physical subscriptions. A non-null
+        expirationTime must be a future Unix-millisecond timestamp. Persistent
+        public subscription state is capped at 250,000 rows service-wide.
+      security:
+        - EnrollmentTicketBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PushSubscription"
+      responses:
+        "200":
+          description: Existing endpoint refreshed and management token rotated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSubscriptionResponse"
+        "201":
+          description: New endpoint created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicSubscriptionResponse"
+        "404":
+          description: Public app not found
+        "401":
+          description: Missing, expired, or body-mismatched enrollment ticket
+        "409":
+          description: Endpoint key or enrollment-contract conflict
+        "413":
+          description: Request body exceeds 65,536 bytes
+        "422":
+          description: Invalid subscription or unsupported provider endpoint
+        "429":
+          description: Public mutation or app subscription limit exceeded
+        "503":
+          description: Anonymous subscription storage capacity is full
+    delete:
+      tags: [Public Enrollment]
+      summary: Disable one generic browser subscription
+      security:
+        - ManagementBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublicSubscriptionDeleteRequest"
+      responses:
+        "200":
+          description: Endpoint disabled or already absent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisabledResponse"
+        "401":
+          description: Missing or invalid subscription management token
+        "404":
+          description: Public app not found
+        "409":
+          description: Endpoint is concurrently being updated
+        "413":
+          description: Request body exceeds 16,384 bytes
+        "429":
+          description: Public mutation rate limit exceeded
+  /api/apps/{appId}/xmtp/subscriptions:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [Unavailable Public XMTP]
+      summary: General-public XMTP enrollment is unavailable
+      description: |
+        Always returns 403. An app secret proves app control, not ownership of
+        the claimed XMTP installation. This path remains reserved until a
+        cryptographic installation-ownership proof contract exists.
+      security: []
+      responses:
+        "403":
+          description: General-public XMTP enrollment is unavailable
+    delete:
+      tags: [Unavailable Public XMTP]
+      summary: General-public XMTP deletion is unavailable
+      description: Always returns 403 until installation ownership proof exists.
+      security: []
+      responses:
+        "403":
+          description: General-public XMTP enrollment is unavailable
+  /api/apps/{appId}/xmtp/status:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [Operator XMTP]
+      summary: Inspect one pre-provisioned operator XMTP route
+      description: |
+        Requires both the owning pre-provisioned app credential and the
+        registration's diagnostic bearer receipt. The receipt is also bound to
+        the app id in this path. Public-app credentials receive 403 until
+        installation ownership proof exists.
+      security:
+        - ApiKeyAuth: []
+          DiagnosticBearerAuth: []
+      responses:
+        "200":
+          description: App- and receipt-scoped diagnostic status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XmtpDiagnosticStatusResponse"
+        "401":
+          description: Missing or invalid app credential or diagnostic receipt
+        "403":
+          description: Credential belongs to another app, or the app is public
+        "404":
+          description: Receipt is not active for this app
+        "429":
+          description: Lookup rate limit exceeded
+  /api/apps/{appId}/xmtp/status/test:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [Operator XMTP]
+      summary: Queue one minimal diagnostic push for an operator XMTP route
+      description: |
+        Requires both the owning pre-provisioned app credential and the
+        registration's app-bound diagnostic bearer receipt. Public-app
+        credentials receive 403 until installation ownership proof exists.
+      security:
+        - ApiKeyAuth: []
+          DiagnosticBearerAuth: []
+      responses:
+        "202":
+          description: Minimal diagnostic push queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/XmtpDiagnosticTestResponse"
+        "401":
+          description: Missing or invalid app credential or diagnostic receipt
+        "403":
+          description: Credential belongs to another app, or the app is public
+        "404":
+          description: Receipt is not active for this app
+        "429":
+          description: Diagnostic test rate limit exceeded
+  /api/apps/{appId}/stats:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    get:
+      tags: [App Management]
+      summary: Get private app topology and short-retained usage counters
+      description: |
+        The seven-day aggregate is today plus the six prior UTC dates. Counters
+        exclude diagnostics. providerAccepted means accepted by a Web Push
+        provider, never delivered, displayed, or read by a browser.
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: App-isolated usage stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppStatsResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+  /api/apps/{appId}/profile:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    patch:
+      tags: [App Management]
+      summary: Update the app's public profile
+      description: |
+        Changing or clearing domain clears its verification. A domain must
+        have been successfully checked within the prior seven days before
+        leaderboardOptIn can be enabled; setting the domain and opting in
+        therefore require separate calls. Verification records the last
+        successful check and is not continuous ownership monitoring.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublicAppUpdateRequest"
+      responses:
+        "200":
+          description: Updated app and profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicAppProfileResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+        "409":
+          description: Domain must have been verified within seven days before leaderboard opt-in
+        "413":
+          description: Request body exceeds 16,384 bytes
+        "422":
+          description: Invalid or empty profile patch
+        "429":
+          description: Public app mutation capacity is temporarily rate limited
+  /api/apps/{appId}/domain:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    get:
+      tags: [App Management]
+      summary: Get DNS verification state and the exact TXT record to publish
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Domain state and expected record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppDomainResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+  /api/apps/{appId}/domain/verify:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [App Management]
+      summary: Verify the app's DNS TXT binding
+      description: |
+        Looks for `_vapid-party.<domain>` with value
+        `v=vapid-party1;app=<appId>;vapid=<current-public-vapid-key>`.
+        A match updates a last-verified timestamp; DNS is not monitored
+        continuously after the request.
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: Current DNS verification result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppDomainResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+        "409":
+          description: Set a domain before verification
+        "429":
+          description: Domain verification rate limit exceeded
+        "502":
+          description: DNS lookup temporarily failed
+  /api/apps/{appId}/secret/rotate:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [App Management]
+      summary: Revoke the current app secret and return one replacement
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "200":
+          description: One new raw secret; the prior credential is revoked
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppSecretRotateResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+        "409":
+          description: App secret is concurrently being rotated
+        "429":
+          description: Public mutation capacity or daily rotation limit exceeded
   /api/xmtp/vapid-public-key:
     get:
       tags: [Converge XMTP]
@@ -52,6 +505,9 @@ paths:
         management receipt in the no-store response. Exact endpoint/key refresh
         can bootstrap a receipt; endpoint replacement requires and preserves a
         current receipt. The unsigned first claim is not XMTP ownership proof.
+        HMAC keys must decode to 1 through 256 bytes. Listener registration
+        state is capped at 5,000 combined topic/HMAC rows per app and 25,000
+        rows globally.
       security:
         - {}
         - DiagnosticBearerAuth: []
@@ -75,13 +531,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/XmtpSubscriptionResponse"
+                $ref: "#/components/schemas/ConvergeXmtpSubscriptionResponse"
         "201":
           description: Created
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/XmtpSubscriptionResponse"
+                $ref: "#/components/schemas/ConvergeXmtpSubscriptionResponse"
         "422":
           description: Validation error
         "409":
@@ -89,7 +545,9 @@ paths:
         "413":
           description: Request body exceeds 2,000,000 bytes
         "429":
-          description: Registration rate limit exceeded
+          description: Registration rate or per-app listener capacity exceeded
+        "503":
+          description: Global listener capacity exceeded
     delete:
       tags: [Converge XMTP]
       summary: Disable one Converge logical XMTP registration
@@ -108,6 +566,10 @@ paths:
       responses:
         "200":
           description: Disabled or already absent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisabledResponse"
         "409":
           description: Current management receipt required
         "413":
@@ -162,8 +624,13 @@ paths:
           description: Diagnostic test rate limit exceeded
   /api/xmtp/registrations:
     post:
-      tags: [App XMTP]
-      summary: Register or update an app-scoped XMTP alert route
+      tags: [Operator XMTP]
+      summary: Register or update a pre-provisioned operator XMTP route
+      description: |
+        Available only to pre-provisioned operator apps. Credentials issued by
+        the general-public app API receive 403 until installation ownership
+        proof exists. HMAC keys decode to 1..256 bytes; listener state is capped
+        at 5,000 combined topic/HMAC rows per app and 25,000 globally.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -178,20 +645,31 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/XmtpSubscriptionResponse"
+                $ref: "#/components/schemas/AppXmtpSubscriptionResponse"
         "201":
           description: Created
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/XmtpSubscriptionResponse"
+                $ref: "#/components/schemas/AppXmtpSubscriptionResponse"
         "401":
           description: Missing or invalid app API key
+        "403":
+          description: Public apps cannot register XMTP routes without installation ownership proof
+        "409":
+          description: Existing route, endpoint, or installation conflict
+        "413":
+          description: Request body exceeds 2,000,000 bytes
         "422":
-          description: Validation error
+          description: Validation error, including decoded HMAC key size
+        "429":
+          description: Subscription limit or per-app listener capacity exceeded
+        "503":
+          description: Global listener capacity exceeded
     delete:
-      tags: [App XMTP]
-      summary: Disable one app-scoped XMTP alert route
+      tags: [Operator XMTP]
+      summary: Disable one pre-provisioned operator XMTP route
+      description: Public-app credentials receive 403.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -203,11 +681,17 @@ paths:
       responses:
         "200":
           description: Disabled or already absent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisabledResponse"
         "401":
           description: Missing or invalid app API key
+        "403":
+          description: Public apps cannot manage XMTP routes without installation ownership proof
   /api/internal/xmtp/deliveries:
     post:
-      tags: [App XMTP]
+      tags: [Operator XMTP]
       summary: Accept an authenticated XMTP listener delivery hint
       description: |
         The production Container sends the minimal version-1 shape. The previous
@@ -259,13 +743,31 @@ paths:
       responses:
         "201":
           description: Created or updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticatedSubscriptionResponse"
         "401":
           description: Missing or invalid app API key
+        "413":
+          description: Request body exceeds 65,536 bytes
+        "422":
+          description: Invalid subscription or unsupported provider endpoint
+        "429":
+          description: App subscription limit exceeded
   /api/send:
     post:
       tags: [Generic Push]
       summary: Queue generic Web Push notifications
-      description: HTTP 202 means queued, not delivered to a provider or browser.
+      description: |
+        HTTP 202 means recipient jobs were queued, not accepted by a provider or
+        delivered to a browser. Per-minute and daily limits are charged by
+        selected recipient count. At most 100 recipients are accepted. The
+        serialized payload is capped at 3,000 UTF-8 bytes and all jobs must fit
+        one estimated 240,000-byte JSON Queue batch. One sendBatch prevents
+        partial publication. A zero-recipient selection returns HTTP 200.
+        Public apps additionally share 2,000 selected deliveries per minute and
+        100,000 per UTC day service-wide.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -275,21 +777,61 @@ paths:
             schema:
               $ref: "#/components/schemas/SendNotificationRequest"
       responses:
+        "200":
+          description: No matching recipients; nothing queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendNotificationResponse"
         "202":
           description: Queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendNotificationResponse"
         "401":
           description: Missing or invalid app API key
+        "413":
+          description: Request, Web Push payload, or aggregate Queue batch is too large
+        "422":
+          description: Invalid notification payload or recipient selector
+        "429":
+          description: Per-app or service-wide recipient-delivery limit exceeded
+        "503":
+          description: Queue publication failed and new attempt state was rolled back
 components:
+  parameters:
+    AppId:
+      name: appId
+      in: path
+      required: true
+      description: App id returned by POST /api/apps.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[A-Za-z0-9_-]+$'
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
       in: header
       name: X-API-Key
+      description: Raw appSecret (or legacy app API key) used only by a trusted app server.
+    ManagementBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque-256-bit-capability
+      description: Per-subscription token returned by public generic enrollment.
+    EnrollmentTicketBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: vpet1-stateless-capability
+      description: Five-minute token minted by the app server for one exact PushSubscription.
     DiagnosticBearerAuth:
       type: http
       scheme: bearer
       bearerFormat: opaque-256-bit-capability
-      description: Receipt returned by an opted-in Converge registration.
+      description: Receipt returned by Converge or pre-provisioned operator XMTP enrollment; not available to public apps.
     InternalBearerAuth:
       type: http
       scheme: bearer
@@ -312,6 +854,438 @@ components:
         code:
           type: string
         details: {}
+    PublicAppCreateRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 500
+        domain:
+          type: string
+          minLength: 1
+          maxLength: 253
+          description: Registrable hostname only; no scheme, path, port, wildcard, or IP.
+        leaderboardOptIn:
+          type: boolean
+          default: false
+          description: Listing still requires a successful DNS check within seven days.
+    PublicAppSummary:
+      type: object
+      required: [id, name, publicVapidKey, createdAt]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        publicVapidKey:
+          type: string
+          description: Base64url uncompressed P-256 public key.
+        createdAt:
+          type: string
+          format: date-time
+    PublicAppCreateResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [app, appSecret]
+              additionalProperties: false
+              properties:
+                app:
+                  $ref: "#/components/schemas/PublicAppSummary"
+                appSecret:
+                  type: string
+                  pattern: '^vp_[0-9a-f]{64}$'
+                  readOnly: true
+                  description: Returned once; only its SHA-256 digest is retained.
+    AppVapidPublicKeyResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [appId, publicKey]
+              additionalProperties: false
+              properties:
+                appId:
+                  type: string
+                publicKey:
+                  type: string
+    EnrollmentTicketResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [token, expiresAt]
+              additionalProperties: false
+              properties:
+                token:
+                  type: string
+                  pattern: '^vpet1\.[A-Za-z0-9_-]{1,1500}\.[A-Za-z0-9_-]{43}$'
+                  readOnly: true
+                expiresAt:
+                  type: string
+                  format: date-time
+    PublicSubscriptionDeleteRequest:
+      type: object
+      required: [endpoint]
+      additionalProperties: false
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          maxLength: 4096
+          description: Canonical HTTPS FCM, Mozilla autopush, Apple Web Push, or WNS endpoint.
+    PublicSubscriptionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [subscriptionId, endpoint, createdAt, management]
+              additionalProperties: false
+              properties:
+                subscriptionId:
+                  type: string
+                endpoint:
+                  type: string
+                  format: uri
+                createdAt:
+                  type: string
+                  format: date-time
+                management:
+                  type: object
+                  required: [token, deletePath]
+                  additionalProperties: false
+                  properties:
+                    token:
+                      type: string
+                      pattern: '^[A-Za-z0-9_-]{43}$'
+                      readOnly: true
+                      description: Fresh token returned on every successful upsert.
+                    deletePath:
+                      type: string
+                      pattern: '^/api/apps/[A-Za-z0-9_-]+/subscriptions$'
+    DisabledResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [disabled]
+              additionalProperties: false
+              properties:
+                disabled:
+                  type: boolean
+    AuthenticatedSubscriptionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [id, endpoint, createdAt]
+              additionalProperties: false
+              properties:
+                id:
+                  type: string
+                endpoint:
+                  type: string
+                  format: uri
+                createdAt:
+                  type: string
+                  format: date-time
+    PublicAppProfile:
+      type: object
+      required: [description, domainVerificationStatus, leaderboardOptIn, updatedAt]
+      additionalProperties: false
+      properties:
+        description:
+          type: string
+          maxLength: 500
+        domain:
+          type: string
+          maxLength: 253
+        domainVerifiedAt:
+          type: string
+          format: date-time
+          description: Last successful DNS check; not continuous proof of current ownership.
+        domainLastCheckedAt:
+          type: string
+          format: date-time
+        domainVerificationStatus:
+          type: string
+          enum: [unverified, verified, mismatch]
+          description: Result of the most recent check, not continuous DNS monitoring.
+        leaderboardOptIn:
+          type: boolean
+          description: Requires a successful DNS check within the prior seven days.
+        updatedAt:
+          type: string
+          format: date-time
+    PublicAppUpdateRequest:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 500
+        domain:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 253
+          description: Registrable hostname, or null to clear it and verification.
+        leaderboardOptIn:
+          type: boolean
+    PublicAppProfileResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [app, profile]
+              additionalProperties: false
+              properties:
+                app:
+                  type: object
+                  required: [id, name, publicVapidKey]
+                  additionalProperties: false
+                  properties:
+                    id:
+                      type: string
+                    name:
+                      type: string
+                    publicVapidKey:
+                      type: string
+                profile:
+                  $ref: "#/components/schemas/PublicAppProfile"
+    AppDomainRecord:
+      type: object
+      required: [type, name, value]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: TXT
+        name:
+          type: string
+          description: "_vapid-party.<domain>"
+        value:
+          type: string
+          description: "v=vapid-party1;app=<appId>;vapid=<current-public-vapid-key>"
+    AppDomainResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [status, record]
+              additionalProperties: false
+              properties:
+                domain:
+                  type: string
+                status:
+                  type: string
+                  enum: [unverified, verified, mismatch]
+                checkedAt:
+                  type: string
+                  format: date-time
+                verifiedAt:
+                  type: string
+                  format: date-time
+                record:
+                  oneOf:
+                    - $ref: "#/components/schemas/AppDomainRecord"
+                    - type: "null"
+    UsageCounts:
+      type: object
+      required: [queued, providerAccepted, failed, expired]
+      additionalProperties: false
+      properties:
+        queued:
+          type: integer
+          minimum: 0
+        providerAccepted:
+          type: integer
+          minimum: 0
+          description: Provider acceptances, not browser deliveries or displays.
+        failed:
+          type: integer
+          minimum: 0
+          description: Failed send attempts, including retries.
+        expired:
+          type: integer
+          minimum: 0
+          description: Terminal invalid-endpoint outcomes.
+    AppStatsResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [generatedAt, app, profile, subscriptions, xmtp, usage, retentionDays]
+              additionalProperties: false
+              properties:
+                generatedAt:
+                  type: string
+                  format: date-time
+                app:
+                  $ref: "#/components/schemas/PublicAppSummary"
+                profile:
+                  $ref: "#/components/schemas/PublicAppProfile"
+                subscriptions:
+                  type: object
+                  required: [active, xmtpRegistrations]
+                  additionalProperties: false
+                  properties:
+                    active:
+                      type: integer
+                      minimum: 0
+                    xmtpRegistrations:
+                      type: integer
+                      minimum: 0
+                      description: Shared-schema field; general-public apps cannot create XMTP routes.
+                xmtp:
+                  type: object
+                  description: Shared-schema topology; empty for general-public apps because XMTP enrollment is unavailable.
+                  required: [groupTopics, welcomeTopics, hmacEpochs]
+                  additionalProperties: false
+                  properties:
+                    groupTopics:
+                      type: integer
+                      minimum: 0
+                    welcomeTopics:
+                      type: integer
+                      minimum: 0
+                    hmacEpochs:
+                      type: integer
+                      minimum: 0
+                usage:
+                  type: object
+                  required: [todayUtc, last7DaysUtc]
+                  additionalProperties: false
+                  properties:
+                    todayUtc:
+                      $ref: "#/components/schemas/UsageCounts"
+                    last7DaysUtc:
+                      $ref: "#/components/schemas/UsageCounts"
+                retentionDays:
+                  type: integer
+                  const: 8
+    LeaderboardResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [generatedAt, window, apps]
+              additionalProperties: false
+              properties:
+                generatedAt:
+                  type: string
+                  format: date-time
+                window:
+                  type: object
+                  required: [kind, days]
+                  additionalProperties: false
+                  properties:
+                    kind:
+                      type: string
+                      const: utc_dates
+                    days:
+                      type: integer
+                      const: 7
+                apps:
+                  type: array
+                  maxItems: 50
+                  items:
+                    type: object
+                    required: [rank, appId, name, description, verifiedDomain, domainVerifiedAt, providerAcceptedLast7Days]
+                    additionalProperties: false
+                    properties:
+                      rank:
+                        type: integer
+                        minimum: 1
+                      appId:
+                        type: string
+                      name:
+                        type: string
+                      description:
+                        type: string
+                      verifiedDomain:
+                        type: string
+                        description: Domain observed in the last successful DNS check.
+                      domainVerifiedAt:
+                        type: string
+                        format: date-time
+                        description: Last verified time, not continuous proof of current ownership.
+                      providerAcceptedLast7Days:
+                        type: integer
+                        minimum: 0
+                        description: Real provider acceptances across today and six prior UTC dates; not browser deliveries.
+    AppSecretRotateResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [appId, appSecret]
+              additionalProperties: false
+              properties:
+                appId:
+                  type: string
+                appSecret:
+                  type: string
+                  pattern: '^vp_[0-9a-f]{64}$'
+                  readOnly: true
+    AppDeleteResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [deleted]
+              additionalProperties: false
+              properties:
+                deleted:
+                  type: boolean
     HealthResponse:
       allOf:
         - $ref: "#/components/schemas/ApiEnvelope"
@@ -396,14 +1370,19 @@ components:
           properties:
             p256dh:
               type: string
+              minLength: 1
               maxLength: 1024
-              description: Base64/base64url uncompressed P-256 public key; decodes to exactly 65 bytes.
+              description: Base64/base64url uncompressed P-256 public key; decodes to 65 bytes beginning with 0x04.
             auth:
               type: string
+              minLength: 1
               maxLength: 1024
               description: Base64/base64url Web Push authentication secret; decodes to exactly 16 bytes.
         expirationTime:
-          type: [number, "null"]
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 8640000000000000
+          description: Null or a Unix-millisecond timestamp strictly in the future at request time.
     XmtpPreferences:
       type: object
       required: [minimalPayloadOnly, plaintextPreview]
@@ -428,6 +1407,8 @@ components:
           pattern: '^[0-9a-f]{64}$'
         address:
           type: string
+          minLength: 1
+          maxLength: 255
     XmtpHmacKey:
       type: object
       required: [epoch, key]
@@ -443,7 +1424,9 @@ components:
               maximum: 4294967295
         key:
           type: string
+          minLength: 1
           maxLength: 1024
+          description: Base64/base64url value that must decode to 1 through 256 bytes.
     XmtpTopic:
       type: object
       required: [topic, hmacKeys]
@@ -457,7 +1440,20 @@ components:
           maxItems: 16
           items:
             $ref: "#/components/schemas/XmtpHmacKey"
-      description: Group topics require HMAC keys; welcome topics require an empty array.
+      allOf:
+        - if:
+            properties:
+              topic:
+                pattern: '^/xmtp/mls/1/w-'
+          then:
+            properties:
+              hmacKeys:
+                maxItems: 0
+          else:
+            properties:
+              hmacKeys:
+                minItems: 1
+      description: Group topics require one or more HMAC keys; welcome topics require an empty array.
     XmtpBody:
       type: object
       required: [identity, subscription, xmtp, notification, preferences, registeredAt]
@@ -480,7 +1476,10 @@ components:
               maxItems: 400
               items:
                 $ref: "#/components/schemas/XmtpTopic"
-              description: Topics plus all HMAC entries must total at most 800 persisted rows.
+              description: |
+                Topics plus all HMAC entries must total at most 800 rows in one
+                registration. Listener state is capped at 5,000 combined rows
+                per app and 25,000 globally.
             topicSource:
               type: string
               const: conversations.hmacKeys
@@ -496,6 +1495,7 @@ components:
           $ref: "#/components/schemas/XmtpPreferences"
         userAgent:
           type: string
+          maxLength: 1024
         registeredAt:
           type: string
           format: date-time
@@ -532,7 +1532,7 @@ components:
       unevaluatedProperties: false
     XmtpSubscriptionRequest:
       $ref: "#/components/schemas/XmtpNestedSubscriptionRequest"
-    XmtpSubscriptionResponse:
+    ConvergeXmtpSubscriptionResponse:
       allOf:
         - $ref: "#/components/schemas/ApiEnvelope"
         - type: object
@@ -541,6 +1541,7 @@ components:
             data:
               type: object
               required: [subscriptionId, identityId, topicsRegistered, hmacKeysRegistered, created]
+              additionalProperties: false
               properties:
                 subscriptionId:
                   type: string
@@ -548,8 +1549,10 @@ components:
                   type: string
                 topicsRegistered:
                   type: integer
+                  minimum: 0
                 hmacKeysRegistered:
                   type: integer
+                  minimum: 0
                 created:
                   type: boolean
                 diagnostics:
@@ -560,12 +1563,51 @@ components:
                     receipt:
                       type: string
                       pattern: '^[A-Za-z0-9_-]{43}$'
+                      readOnly: true
                     statusPath:
                       type: string
                       const: /api/xmtp/status
                     testPath:
                       type: string
                       const: /api/xmtp/status/test
+    AppXmtpSubscriptionResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [subscriptionId, identityId, topicsRegistered, hmacKeysRegistered, created, diagnostics]
+              additionalProperties: false
+              properties:
+                subscriptionId:
+                  type: string
+                identityId:
+                  type: string
+                topicsRegistered:
+                  type: integer
+                  minimum: 0
+                hmacKeysRegistered:
+                  type: integer
+                  minimum: 0
+                created:
+                  type: boolean
+                diagnostics:
+                  type: object
+                  required: [receipt, statusPath, testPath]
+                  additionalProperties: false
+                  properties:
+                    receipt:
+                      type: string
+                      pattern: '^[A-Za-z0-9_-]{43}$'
+                      readOnly: true
+                    statusPath:
+                      type: string
+                      pattern: '^/api/apps/[A-Za-z0-9_-]+/xmtp/status$'
+                    testPath:
+                      type: string
+                      pattern: '^/api/apps/[A-Za-z0-9_-]+/xmtp/status/test$'
     XmtpDiagnosticDeliveryStage:
       type: object
       required: [status]
@@ -824,6 +1866,7 @@ components:
           type: string
           format: uri
           maxLength: 4096
+          description: Canonical HTTPS FCM, Mozilla autopush, Apple Web Push, or WNS endpoint.
         keys:
           type: object
           required: [p256dh, auth]
@@ -831,14 +1874,19 @@ components:
           properties:
             p256dh:
               type: string
+              minLength: 1
               maxLength: 1024
               description: Base64/base64url uncompressed P-256 public key; decodes to exactly 65 bytes.
             auth:
               type: string
+              minLength: 1
               maxLength: 1024
               description: Base64/base64url Web Push authentication secret; decodes to exactly 16 bytes.
         expirationTime:
-          type: [number, "null"]
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 8640000000000000
+          description: Null or a Unix-millisecond timestamp strictly in the future at request time.
         userId:
           type: string
           maxLength: 255
@@ -855,36 +1903,103 @@ components:
         payload:
           type: object
           required: [title]
+          additionalProperties: false
           properties:
             title:
               type: string
+              minLength: 1
+              maxLength: 255
             body:
               type: string
+              maxLength: 1000
             icon:
-              type: string
+              $ref: "#/components/schemas/AbsoluteUrlOrPath"
             badge:
-              type: string
+              $ref: "#/components/schemas/AbsoluteUrlOrPath"
             image:
-              type: string
+              $ref: "#/components/schemas/AbsoluteUrlOrPath"
             url:
-              type: string
+              $ref: "#/components/schemas/AbsoluteUrlOrPath"
             data:
               type: object
             actions:
               type: array
+              maxItems: 4
               items:
                 type: object
+                required: [action, title]
+                additionalProperties: false
+                properties:
+                  action:
+                    type: string
+                    minLength: 1
+                    maxLength: 64
+                  title:
+                    type: string
+                    minLength: 1
+                    maxLength: 128
+                  icon:
+                    $ref: "#/components/schemas/AbsoluteUrlOrPath"
             tag:
               type: string
+              maxLength: 128
             requireInteraction:
               type: boolean
             silent:
               type: boolean
         userId:
           type: string
+          maxLength: 255
         channelId:
           type: string
+          maxLength: 255
         subscriptionIds:
           type: array
+          maxItems: 100
           items:
             type: string
+            maxLength: 128
+    AbsoluteUrlOrPath:
+      type: string
+      anyOf:
+        - format: uri
+        - pattern: '^/'
+    SendNotificationResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [queued, sent, failed, total, jobs]
+              additionalProperties: false
+              properties:
+                queued:
+                  type: integer
+                  minimum: 0
+                sent:
+                  type: integer
+                  const: 0
+                  description: Always zero at queue acceptance time.
+                failed:
+                  type: integer
+                  const: 0
+                  description: Always zero at queue acceptance time.
+                total:
+                  type: integer
+                  minimum: 0
+                jobs:
+                  type: array
+                  items:
+                    type: object
+                    required: [deliveryAttemptId, subscriptionId, source]
+                    additionalProperties: false
+                    properties:
+                      deliveryAttemptId:
+                        type: string
+                      subscriptionId:
+                        type: string
+                      source:
+                        type: string
+                        const: generic

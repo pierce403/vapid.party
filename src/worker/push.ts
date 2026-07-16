@@ -7,6 +7,24 @@ export interface WebPushResult {
   statusCode?: number;
   terminal?: boolean;
   error?: string;
+  retryAfterSeconds?: number;
+}
+
+const MAX_RETRY_AFTER_SECONDS = 300;
+const WEB_PUSH_SOCKET_TIMEOUT_MS = 45_000;
+
+function boundedRetryAfterSeconds(
+  headers: Record<string, string | string[] | undefined> | undefined
+): number | undefined {
+  const value = headers?.['retry-after'] ?? headers?.['Retry-After'];
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (!raw) return undefined;
+
+  const seconds = /^\d+$/.test(raw.trim())
+    ? Number(raw)
+    : Math.ceil((Date.parse(raw) - Date.now()) / 1000);
+  if (!Number.isFinite(seconds) || seconds < 0) return undefined;
+  return Math.min(MAX_RETRY_AFTER_SECONDS, Math.ceil(seconds));
 }
 
 export async function sendWebPush(
@@ -30,6 +48,7 @@ export async function sendWebPush(
       },
       JSON.stringify(payload),
       {
+        timeout: WEB_PUSH_SOCKET_TIMEOUT_MS,
         TTL: options.ttl ?? 86400,
         urgency: options.urgency ?? 'normal',
         vapidDetails: {
@@ -42,13 +61,19 @@ export async function sendWebPush(
 
     return { success: true, statusCode: result.statusCode };
   } catch (error) {
-    const err = error as { statusCode?: number; message?: string };
+    const err = error as {
+      statusCode?: number;
+      message?: string;
+      headers?: Record<string, string | string[] | undefined>;
+    };
     const terminal = err.statusCode === 404 || err.statusCode === 410;
+    const retryAfterSeconds = boundedRetryAfterSeconds(err.headers);
     return {
       success: false,
       statusCode: err.statusCode,
       terminal,
       error: err.message || 'Push failed',
+      ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
     };
   }
 }

@@ -27,7 +27,7 @@ func runControlLoop(
 		} else {
 			err = applyCurrentDeltas(ctx, client, index)
 			if shouldReloadSnapshot(err) {
-				logger.Warn("control cursor expired; reloading full snapshot")
+				logger.Warn("control state requires a fresh full snapshot", "error", err)
 				loaded = false
 				continue
 			}

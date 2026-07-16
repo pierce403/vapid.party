@@ -13,6 +13,11 @@ Runtime:
   three HMAC epochs, own-message and shouldPush=false suppression, and cleanup.
 - Push remains experimental because SubscribeAll has no durable replay cursor;
   restart/disconnect hints can be missed while XMTP client sync remains authoritative.
+- Migration 0006 and the general-public app API are implemented locally but
+  pending production migration and Worker rollout. The Converge and legacy
+  pre-provisioned contracts below describe the existing production base.
+- General-public apps support generic Web Push only. Public XMTP enrollment is
+  unavailable until installation ownership can be proven cryptographically.
 
 OpenAPI:
 - /openapi.yaml
@@ -29,6 +34,92 @@ Public health:
   stream, successful internal delivery probe, and a D1-synchronized bridge with
   zero pending or failed registrations.
 - The response never exposes internal URLs, tokens, endpoints, or HMAC keys.
+
+Public app creation (pending production rollout):
+- POST /api/apps
+- No account, wallet, approval, or API key is required.
+- Body: name (required, 1..255), optional description (max 500), optional
+  registrable hostname domain, optional leaderboardOptIn (default false).
+- The no-store 201 response returns app.id, app.name, app.publicVapidKey,
+  app.createdAt, and one appSecret.
+- Save appSecret immediately. The raw value is returned once and only its
+  SHA-256 digest is stored. Use it as X-API-Key for trusted-server routes.
+- Anonymous creation uses high scoped/global per-minute abuse backstops. Client
+  scopes are stored as secret-salted hashes, never raw IP addresses.
+- Persistent anonymous state has hard service ceilings of 25,000 public apps
+  and 250,000 public subscription rows.
+- Service backstops admit at most 5,000 anonymous creation attempts, 5,000
+  subscription-verification attempts, and 5,000 authenticated public state
+  mutations per minute; successful app creation remains capped at 600/minute.
+
+Public generic browser enrollment (pending production rollout):
+- GET /api/apps/{appId}/vapid-public-key
+- POST /api/apps/{appId}/enrollment-ticket (X-API-Key on trusted server)
+- POST /api/apps/{appId}/subscriptions
+- DELETE /api/apps/{appId}/subscriptions
+- Browser code does not need and must not receive appSecret.
+- The trusted app server validates its own user, then posts the exact standard
+  PushSubscription to enrollment-ticket. The no-store response contains a
+  five-minute stateless bearer token bound to app id, endpoint, keys, and
+  expiration; no ticket state is persisted.
+- The browser POSTs that same PushSubscription with the ticket as Authorization
+  Bearer. It cannot set userId, channelId, or metadata; the app maps the returned
+  subscription id itself. Only canonical FCM, Mozilla, Apple, and WNS endpoints
+  are accepted.
+- A successful create/refresh returns a new 256-bit management.token and its
+  deletePath in a no-store response; only the token hash is stored.
+- DELETE body is `{ "endpoint": "..." }` and requires
+  `Authorization: Bearer <management.token>`.
+- Endpoint keys are immutable while active. Public mutation limits and the
+  public app maximum of 150 active physical subscriptions is enforced.
+- expirationTime must be null or a future Unix-millisecond timestamp.
+
+General-public XMTP enrollment (unavailable/planned):
+- POST /api/apps/{appId}/xmtp/subscriptions
+- DELETE /api/apps/{appId}/xmtp/subscriptions
+- Public-app credentials receive HTTP 403 on POST/DELETE
+  /api/xmtp/registrations and on the app-scoped XMTP status/test paths.
+- An appSecret proves control of the vapid.party app, not ownership of a claimed
+  XMTP installation. General-public XMTP enrollment remains planned until a
+  cryptographic installation-ownership proof contract exists.
+- Existing Converge compatibility and pre-provisioned operator XMTP flows are
+  separate and remain available according to their rollout status.
+
+App-secret management routes (pending production rollout):
+- GET /api/apps/{appId}/stats
+- PATCH /api/apps/{appId}/profile
+- GET /api/apps/{appId}/domain
+- POST /api/apps/{appId}/domain/verify
+- POST /api/apps/{appId}/secret/rotate
+- DELETE /api/apps/{appId}
+- All require X-API-Key: appSecret, and the credential must match appId.
+- PATCH accepts name, description, domain or null, and leaderboardOptIn. Set and
+  verify the domain before enabling leaderboardOptIn.
+- Secret rotation atomically revokes the old secret, returns one new raw secret,
+  and is limited to ten rotations per UTC day. App deletion cascades its
+  credentials and app-owned state.
+
+DNS and leaderboard (pending production rollout):
+- GET /api/leaderboard is public, opt-in, cached for 60 seconds, and returns at
+  most 50 apps.
+- Publish TXT `_vapid-party.<domain>` with the exact value
+  `v=vapid-party1;app=<appId>;vapid=<current-public-vapid-key>`.
+- GET /api/apps/{appId}/domain returns the exact record; POST .../domain/verify
+  checks it. A listing requires a successful check within seven days and a
+  VAPID snapshot matching the current app key.
+- Ranking uses providerAcceptedLast7Days across today and the prior six UTC
+  dates. Provider accepted does not mean delivered, displayed, or read.
+- domainVerifiedAt means last verified. DNS is checked on demand, not monitored
+  continuously, so it is not a claim of continuous or current ownership.
+
+Private stats semantics (pending production rollout):
+- todayUtc is the current UTC date; last7DaysUtc is today plus six prior UTC dates.
+- queued means a recipient job was enqueued.
+- providerAccepted means a Web Push provider accepted a send attempt.
+- failed counts failed send attempts, including retries.
+- expired counts terminal invalid-endpoint outcomes.
+- Counters exclude diagnostic tests, retain eight UTC dates, and contain no
+  notification payload, endpoint, user, topic, inbox, or message data.
 
 Public Converge XMTP routes:
 - GET /api/xmtp/vapid-public-key
@@ -54,8 +145,9 @@ Converge registration:
 - Browser endpoints are restricted to canonical HTTPS FCM, Mozilla autopush,
   Apple Web Push, and WNS shapes.
 - Maximums: 400 topics, 800 combined topic/HMAC rows, 1024 characters per
-  base64 key, uint32 epochs. The max row contract assumes paid D1 limits.
-- One active logical route exists per app/inbox/installation. Active endpoint
+  base64 key, 1..256 decoded HMAC-key bytes, and uint32 epochs. Listener state
+  is capped at 5,000 combined topic/HMAC rows per app and 25,000 globally.
+- One inbox identity exists per app/installation. Active endpoint
   p256dh/auth keys are immutable, though several logical routes can share them.
 - Send X-Vapid-Party-Diagnostics: 1 to receive a random 256-bit management
   receipt in the no-store response. The server stores only its hash.
@@ -71,15 +163,32 @@ Converge registration:
   denial of service. This route is Converge-only, not general app enrollment.
 
 Authenticated app routes:
-- Pre-provisioned apps use X-API-Key.
+- Legacy pre-provisioned apps and, after rollout, publicly created apps use
+  X-API-Key on trusted servers for generic Web Push.
 - GET /api/vapid/public-key
 - POST /api/subscribe
 - POST /api/send
+- Pre-provisioned operator apps may also use:
 - POST /api/xmtp/registrations
 - DELETE /api/xmtp/registrations
-- The API key selects app scope; the registration request cannot override it.
-- App provisioning and key rotation are operator-only. The old wallet-admin
-  routes are removed and return 404.
+- POST /api/apps/{appId}/xmtp/status
+- POST /api/apps/{appId}/xmtp/status/test
+- Public-app credentials receive HTTP 403 on the XMTP registration routes.
+  General-public XMTP enrollment is not shipped.
+- For operator apps, the API key selects app scope; the registration request
+  cannot override it.
+- Operator registration returns a diagnostic receipt and app-scoped status/test
+  paths. Both X-API-Key and Authorization: Bearer <receipt> are required, and
+  the receipt is checked against the app id in the path.
+- POST /api/send applies per-minute and daily limits to selected recipient
+  deliveries, not only request count. Every send is capped at 100 selected
+  recipients, including filter-based sends.
+- Public apps share service backstops of 2,000 selected recipient deliveries per
+  minute and 100,000 per UTC day.
+- The serialized notification payload is capped at 3,000 UTF-8 bytes. All jobs
+  must fit one estimated 240,000-byte JSON Queue batch and publish through one
+  sendBatch; Queue publication failure rolls back the new attempt rows/counters.
+- The old wallet-admin routes remain removed and return 404.
 
 Listener delivery:
 - POST /api/internal/xmtp/deliveries
@@ -101,3 +210,11 @@ Privacy:
 - vapid.party stores routing metadata and Web Push material needed for delivery.
 - It never stores, forwards, or previews plaintext XMTP text, sender names,
   decrypted content, attachment URLs, previews, or encrypted envelopes.
+- D1 delivery-attempt rows store no generic or XMTP notification payload. The
+  opaque inboxHandle remains registration routing state, but is not copied into
+  attempt payloads. Generic copy is transient in Queue/Web Push because it is
+  the requested notification; XMTP uses only the minimal wake-up payload there.
+- D1 operational rows retain coarse status/timestamps under short retention;
+  only diagnostic rows may retain a short-lived testId. Source and dead-letter
+  Queue windows can occur sequentially; each must be verified at one hour before launch,
+  this requires a Cloudflare plan that permits a 3,600-second setting.
