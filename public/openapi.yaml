@@ -4,8 +4,8 @@ info:
   version: 4.0.0
   description: |
     Cloudflare-only Web Push relay with an app-scoped XMTP listener.
-    The version-4 public app contract and migration 0006 are implemented locally
-    and pending production rollout. Anonymous app creation returns one appSecret;
+    The version-4 public app contract and migration 0006 are deployed in
+    production. Anonymous app creation returns one appSecret;
     only its SHA-256 digest is stored. Browser enrollment uses narrower
     per-registration capabilities. General-public apps support generic Web Push
     only; their XMTP routes return 403 until installation ownership proof exists.
@@ -52,7 +52,7 @@ paths:
         its SHA-256 digest is retained and the raw value cannot be recovered.
         Anonymous creation is protected by high abuse-backstop rate limits.
         Persistent public state is capped at 25,000 apps service-wide.
-        This route is implemented locally and pending production rollout.
+        This route is deployed in production.
       security: []
       requestBody:
         required: true

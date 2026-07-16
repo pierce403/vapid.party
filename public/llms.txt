@@ -13,9 +13,8 @@ Runtime:
   three HMAC epochs, own-message and shouldPush=false suppression, and cleanup.
 - Push remains experimental because SubscribeAll has no durable replay cursor;
   restart/disconnect hints can be missed while XMTP client sync remains authoritative.
-- Migration 0006 and the general-public app API are implemented locally but
-  pending production migration and Worker rollout. The Converge and legacy
-  pre-provisioned contracts below describe the existing production base.
+- Migration 0006 and the general-public app API are deployed in production.
+  Converge and pre-provisioned operator contracts remain separate.
 - General-public apps support generic Web Push only. Public XMTP enrollment is
   unavailable until installation ownership can be proven cryptographically.
 
@@ -35,7 +34,7 @@ Public health:
   zero pending or failed registrations.
 - The response never exposes internal URLs, tokens, endpoints, or HMAC keys.
 
-Public app creation (pending production rollout):
+Public app creation (deployed):
 - POST /api/apps
 - No account, wallet, approval, or API key is required.
 - Body: name (required, 1..255), optional description (max 500), optional
@@ -52,7 +51,7 @@ Public app creation (pending production rollout):
   subscription-verification attempts, and 5,000 authenticated public state
   mutations per minute; successful app creation remains capped at 600/minute.
 
-Public generic browser enrollment (pending production rollout):
+Public generic browser enrollment (deployed):
 - GET /api/apps/{appId}/vapid-public-key
 - POST /api/apps/{appId}/enrollment-ticket (X-API-Key on trusted server)
 - POST /api/apps/{appId}/subscriptions
@@ -85,7 +84,7 @@ General-public XMTP enrollment (unavailable/planned):
 - Existing Converge compatibility and pre-provisioned operator XMTP flows are
   separate and remain available according to their rollout status.
 
-App-secret management routes (pending production rollout):
+App-secret management routes (deployed):
 - GET /api/apps/{appId}/stats
 - PATCH /api/apps/{appId}/profile
 - GET /api/apps/{appId}/domain
@@ -99,7 +98,7 @@ App-secret management routes (pending production rollout):
   and is limited to ten rotations per UTC day. App deletion cascades its
   credentials and app-owned state.
 
-DNS and leaderboard (pending production rollout):
+DNS and leaderboard (deployed):
 - GET /api/leaderboard is public, opt-in, cached for 60 seconds, and returns at
   most 50 apps.
 - Publish TXT `_vapid-party.<domain>` with the exact value
@@ -112,7 +111,7 @@ DNS and leaderboard (pending production rollout):
 - domainVerifiedAt means last verified. DNS is checked on demand, not monitored
   continuously, so it is not a claim of continuous or current ownership.
 
-Private stats semantics (pending production rollout):
+Private stats semantics (deployed):
 - todayUtc is the current UTC date; last7DaysUtc is today plus six prior UTC dates.
 - queued means a recipient job was enqueued.
 - providerAccepted means a Web Push provider accepted a send attempt.

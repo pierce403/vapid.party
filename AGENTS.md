@@ -104,14 +104,16 @@ These instructions apply to the entire repository.
 - The deployed v2 listener still requests control pages with `limit=100`.
   Worker parsing must clamp positive legacy limits to 10 instead of rejecting
   them, unless the Container rollout is coordinated first.
+- After every Worker deploy, wait through at least two listener control polls
+  and require public health to return `deliveryReady: true`, listener `ready`,
+  and bridge `synced` before declaring success.
 - XMTP listener routes are keyed by `(appId, installationId)`. Never union HMAC
   keys or fan out registrations across apps, even for a shared installation or
   topic. Listener-to-Worker delivery is a minimal authenticated hint and must
   never include XMTP ciphertext, sender identity, or message content.
-- Production has D1 migrations 0001 through 0005, the pre-public-app Worker
+- Production has D1 migrations 0001 through 0006, the public-app Worker
   contract, Queue, and the singleton custom Go XMTP listener Container
-  deployed. Migration 0006 and its Worker are release-ready but not live until
-  the production rollout and canary complete. Public
+  deployed. The disposable public-app canary passed on 2026-07-15. Public
   health reported `deliveryReady: true`, listener `ready`, and bridge `synced`
   on 2026-07-14. On 2026-07-15 the same `streamConnectedAt` survived for 11
   minutes 31 seconds across the former ten-minute idle cutoff. `SubscribeAll`

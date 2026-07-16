@@ -20,13 +20,16 @@ minutes 31 seconds across the former ten-minute Container idle cutoff.
 Web Push remains experimental while restart/disconnect behavior and mobile/PWA
 reliability are characterized.
 
-The frictionless public app platform in migration `0006` is implemented and
-tested locally, but is pending its production migration and Worker rollout.
-Until that rollout completes, the production service continues to expose the
-already-deployed Converge compatibility and pre-provisioned app contracts.
-The general-public launch is for generic Web Push only. General-public XMTP
-enrollment remains unavailable until the relay can verify installation
-ownership cryptographically; the existing Converge compatibility and
+On 2026-07-15 migration `0006` and the frictionless public-app Worker contract
+were deployed. A disposable production canary passed anonymous creation,
+one-time secret handling, VAPID discovery, ticketed browser enrollment,
+private stats, DNS mismatch and leaderboard exclusion, management-token
+unsubscribe, secret rotation, and complete app deletion. Post-cutover health
+then remained `deliveryReady`, listener `ready`, and bridge `synced` across
+multiple control polls without restarting the Container. The general-public
+launch is for generic Web Push only. General-public XMTP enrollment remains
+unavailable until the relay can verify installation ownership
+cryptographically; the existing Converge compatibility and
 operator-provisioned XMTP flows remain separate.
 
 Verified production behavior includes:
@@ -197,7 +200,7 @@ continuous XMTP delivery ready based only on a successful container start.
 
 ## Public App Provisioning
 
-Status: implemented locally in migration `0006`; pending production rollout.
+Status: deployed in production with migration `0006`.
 
 Anyone can create an isolated app without an account, wallet, or operator step:
 

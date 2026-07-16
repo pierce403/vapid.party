@@ -18,9 +18,9 @@ Properties:
 - Production is served at `https://vapid.party` and the Worker development URL.
 - D1 migrations 0001 through 0005 are applied in production. Migration 0005
   supplies the deployed management-receipt and route-diagnostic contract.
-- Migration 0006 and the matching public-app Worker contract are implemented
-  locally and pending production rollout. Nothing in the public-app sections
-  below should be read as already live until both are deployed.
+- D1 migration 0006 and the matching public-app Worker contract are deployed
+  in production. A disposable end-to-end public-app canary passed on
+  2026-07-15.
 - Node.js 22 or newer is required by the pinned Wrangler toolchain.
 
 Test Criteria:
@@ -30,6 +30,7 @@ Test Criteria:
 - [x] Go race tests and `go vet`
 - [x] Worker and Container production deployment
 - [x] Public health reported the listener ready and bridge synced on 2026-07-14
+- [x] Post-public-app rollout health remained ready and synced on 2026-07-15
 
 ## App-Scoped D1 Registry
 
@@ -71,7 +72,7 @@ Test Criteria:
 
 ## Frictionless Public Apps
 
-Stability: implemented locally; pending production migration and Worker rollout
+Stability: deployed
 
 Description:
 - Anyone can create an isolated app with `POST /api/apps`; there is no account,
@@ -117,12 +118,11 @@ Test Criteria:
 - [x] Rotation atomically revokes the prior secret and is capped at ten per UTC day
 - [x] Deletion cascades app-owned state
 - [x] App-id path mismatch is rejected
-- [ ] Migration 0006 and the matching Worker are deployed to production
+- [x] Migration 0006 and the matching Worker are deployed to production
 
 ## Public Generic Enrollment And Planned XMTP Ownership Proof
 
-Stability: generic enrollment implemented locally and pending production
-rollout; general-public XMTP unavailable and planned
+Stability: generic enrollment deployed; general-public XMTP unavailable and planned
 
 Generic Routes:
 - `POST /api/apps/{appId}/enrollment-ticket` (app secret)
@@ -168,12 +168,12 @@ Test Criteria:
 - [x] Generic refresh rotates its management capability and deletion requires it
 - [x] Public-app XMTP paths and public credentials on operator XMTP routes return 403
 - [x] Cross-contract, endpoint-key, and provider-host conflicts fail
-- [ ] Public app enrollment routes are deployed to production
+- [x] Public app enrollment routes are deployed to production
 - [ ] Cryptographic installation ownership proof and general-public XMTP enrollment
 
 ## Verified App Profiles And Public Leaderboard
 
-Stability: implemented locally; pending production migration and Worker rollout
+Stability: deployed
 
 Description:
 - Apps are absent by default. Listing requires an explicit profile opt-in and a
@@ -204,11 +204,11 @@ Test Criteria:
 - [x] Unverified, stale, mismatched, and non-opted-in apps are excluded
 - [x] Last-verified VAPID binding and deterministic ranking are enforced
 - [x] Public output contains only profile/DNS identity and aggregate acceptance
-- [ ] The production leaderboard route is live
+- [x] The production leaderboard route is live
 
 ## Private Usage Stats
 
-Stability: implemented locally; pending production migration and Worker rollout
+Stability: deployed
 
 Description:
 - `GET /api/apps/{appId}/stats` returns the app's profile, active subscription
@@ -230,7 +230,7 @@ Test Criteria:
 - [x] Stats are app-isolated and require the matching app credential
 - [x] Today/seven-date windows and eight-date retention are explicit
 - [x] Provider acceptance is never labeled delivered
-- [ ] Private production stats are live
+- [x] Private production stats are live
 
 ## Public Converge Registration
 
@@ -284,12 +284,12 @@ Test Criteria:
 
 ## Authenticated App APIs
 
-Stability: base send and operator registration deployed; public-app access pending rollout
+Stability: deployed
 
 Description:
 - Legacy pre-provisioned apps and publicly created apps use `X-API-Key` for
-  generic Web Push. Public apps receive their secret through the pending
-  `POST /api/apps` rollout.
+  generic Web Push. Public apps receive their one-time raw secret from the
+  deployed `POST /api/apps` route.
 
 Routes:
 - `GET /api/vapid/public-key`
