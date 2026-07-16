@@ -295,7 +295,8 @@ describe('app-scoped XMTP listener registry', () => {
   it('caps parsed and direct snapshot and delta pages at ten routes', async () => {
     expect(parseListenerPageLimit(null)).toBe(10);
     expect(parseListenerPageLimit('10')).toBe(10);
-    expect(() => parseListenerPageLimit('11')).toThrow('limit must be between 1 and 10');
+    expect(parseListenerPageLimit('11')).toBe(10);
+    expect(parseListenerPageLimit('100')).toBe(10);
 
     const appA = new D1XmtpStore(env, 'app-a');
     for (let index = 0; index < 11; index += 1) {

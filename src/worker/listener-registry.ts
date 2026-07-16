@@ -108,11 +108,10 @@ function parseCursor(value: string, field: string): number {
 export function parseListenerPageLimit(value: string | null): number {
   if (value === null) return DEFAULT_PAGE_LIMIT;
   if (!/^\d+$/.test(value)) throw new Error('limit must be a positive integer');
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_PAGE_LIMIT) {
-    throw new Error(`limit must be between 1 and ${MAX_PAGE_LIMIT}`);
-  }
-  return parsed;
+  // The already-deployed listener requested pages of 100 before the Worker
+  // tightened its response budget. Preserve that wire compatibility while
+  // enforcing the smaller server-side result bound.
+  return capListenerPageLimit(Number(value));
 }
 
 function capListenerPageLimit(value: number): number {

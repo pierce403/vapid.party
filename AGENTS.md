@@ -101,6 +101,9 @@ These instructions apply to the entire repository.
   stronger guarantees.
 - Listener topic plus HMAC state is capped at 5,000 rows per app and 25,000
   rows globally. Snapshot and delta pages are capped at 10 routes.
+- The deployed v2 listener still requests control pages with `limit=100`.
+  Worker parsing must clamp positive legacy limits to 10 instead of rejecting
+  them, unless the Container rollout is coordinated first.
 - XMTP listener routes are keyed by `(appId, installationId)`. Never union HMAC
   keys or fan out registrations across apps, even for a shared installation or
   topic. Listener-to-Worker delivery is a minimal authenticated hint and must
