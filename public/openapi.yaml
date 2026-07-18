@@ -1,14 +1,16 @@
 openapi: 3.1.0
 info:
   title: vapid.party API
-  version: 4.0.0
+  version: 5.0.0
   description: |
     Cloudflare-only Web Push relay with an app-scoped XMTP listener.
-    The version-4 public app contract and migration 0006 are deployed in
-    production. Anonymous app creation returns one appSecret;
+    The version-5 public XMTP contract uses migration 0007. Anonymous app
+    creation returns one appSecret;
     only its SHA-256 digest is stored. Browser enrollment uses narrower
-    per-registration capabilities. General-public apps support generic Web Push
-    only; their XMTP routes return 403 until installation ownership proof exists.
+    per-registration capabilities. General-public XMTP enrollment requires an
+    exact-body ticket plus an Ed25519 installation-key possession proof. Routes
+    can target Web Push or a signed HTTPS callback on the app's exact fresh
+    verified domain.
     Converge's restricted public compatibility registration and pre-provisioned
     operator flows remain separate. D1 stores no generic or XMTP notification
     payload; usage is short-retained aggregate daily UTC counters, and source
@@ -23,8 +25,8 @@ tags:
   - name: Health
   - name: Public Apps
   - name: Public Enrollment
-  - name: Unavailable Public XMTP
-    description: Reserved paths that return 403 until installation ownership proof exists.
+  - name: Public XMTP
+    description: Installation-proved XMTP availability alerts with Web Push or signed HTTPS callbacks.
   - name: App Management
   - name: Leaderboard
   - name: Converge XMTP
@@ -89,8 +91,8 @@ paths:
         within seven days against the app id and current VAPID key. DNS is
         checked on demand, not continuously; domainVerifiedAt is not proof of
         current ownership. The ranking window is today plus the six preceding
-        UTC dates. Provider accepted does not mean browser delivered, displayed,
-        or read.
+        UTC dates. The compatibility acceptance count includes Web Push provider
+        responses and callback HTTP 2xx; neither proves display or read.
       security: []
       responses:
         "200":
@@ -262,40 +264,136 @@ paths:
           description: Request body exceeds 16,384 bytes
         "429":
           description: Public mutation rate limit exceeded
+  /api/apps/{appId}/xmtp/enrollment-ticket:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    post:
+      tags: [Public XMTP]
+      summary: Mint an exact-registration XMTP installation challenge
+      description: |
+        A trusted app server submits the exact normalized registration it is
+        willing to authorize. The five-minute stateless token is bound to the
+        app id and canonical registration hash. The XMTP client signs the exact
+        returned signatureText with Client.signWithInstallationKey. HTTPS
+        callbacks require the app's exact configured domain and current VAPID
+        DNS binding. A stale previously verified binding is re-resolved here
+        under bounded rate limits; existing callback routes do not expire when
+        DNS freshness ages out.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublicXmtpTicketRequest"
+      responses:
+        "200":
+          description: Exact-registration challenge issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicXmtpTicketResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+        "409":
+          description: Callback app domain is not verified
+        "422":
+          description: Invalid registration, provider endpoint, or callback domain
+        "429":
+          description: Ticket or DNS refresh rate limit exceeded
+        "502":
+          description: Automatic stale DNS verification failed temporarily
   /api/apps/{appId}/xmtp/subscriptions:
     parameters:
       - $ref: "#/components/parameters/AppId"
     post:
-      tags: [Unavailable Public XMTP]
-      summary: General-public XMTP enrollment is unavailable
+      tags: [Public XMTP]
+      summary: Enroll or refresh an installation-proved XMTP alert route
       description: |
-        Always returns 403. An app secret proves app control, not ownership of
-        the claimed XMTP installation. This path remains reserved until a
-        cryptographic installation-ownership proof contract exists.
-      security: []
+        Authorization is the five-minute vpxet1 ticket minted for the exact
+        registration. proof.publicKey is the raw 32-byte Ed25519 installation
+        key encoded as base64url; its lowercase hex must equal installationId.
+        proof.signature is Client.signWithInstallationKey(ticket) encoded as
+        base64url. Replaying one exact proof is an idempotent refresh and cannot
+        redirect the route or rotate its management receipt. Endpoint changes
+        additionally require the existing receipt in
+        X-Vapid-Party-Management-Token. Callback routes are accepted only on
+        the app's exact fresh verified HTTPS domain. For callbacks, one app id
+        plus inboxHandle is one recipient: after a newly proved route is active,
+        older callback installations with that handle are removed. A failed
+        ticket or proof cannot evict the existing route.
+      security:
+        - XmtpEnrollmentTicketBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublicXmtpRegistrationRequest"
       responses:
-        "403":
-          description: General-public XMTP enrollment is unavailable
+        "200":
+          description: Existing exact route refreshed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppXmtpSubscriptionResponse"
+        "201":
+          description: New installation-proved route created with a management receipt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AppXmtpSubscriptionResponse"
+        "401":
+          description: Missing, expired, mismatched, or invalid installation proof
+        "404":
+          description: Public app not found
+        "409":
+          description: Route, endpoint, callback verification, or management-capability conflict
+        "422":
+          description: Invalid registration or delivery target
+        "429":
+          description: Public mutation or listener capacity limit exceeded
+        "503":
+          description: Public subscription or listener capacity is full
     delete:
-      tags: [Unavailable Public XMTP]
-      summary: General-public XMTP deletion is unavailable
-      description: Always returns 403 until installation ownership proof exists.
-      security: []
+      tags: [Public XMTP]
+      summary: Revoke one installation-proved XMTP alert route
+      security:
+        - DiagnosticBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublicXmtpDeleteRequest"
       responses:
-        "403":
-          description: General-public XMTP enrollment is unavailable
+        "200":
+          description: Route disabled or already absent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisabledResponse"
+        "409":
+          description: Receipt is missing, invalid, or bound to another route
+        "422":
+          description: Invalid deletion body
+        "429":
+          description: Public mutation rate limit exceeded
   /api/apps/{appId}/xmtp/status:
     parameters:
       - $ref: "#/components/parameters/AppId"
     post:
-      tags: [Operator XMTP]
-      summary: Inspect one pre-provisioned operator XMTP route
+      tags: [Public XMTP, Operator XMTP]
+      summary: Inspect one app-bound XMTP route
       description: |
-        Requires both the owning pre-provisioned app credential and the
-        registration's diagnostic bearer receipt. The receipt is also bound to
-        the app id in this path. Public-app credentials receive 403 until
-        installation ownership proof exists.
+        A public app uses its route receipt alone. A pre-provisioned operator
+        app also supplies its app credential. The receipt is app- and
+        registration-bound.
       security:
+        - DiagnosticBearerAuth: []
         - ApiKeyAuth: []
           DiagnosticBearerAuth: []
       responses:
@@ -307,23 +405,61 @@ paths:
                 $ref: "#/components/schemas/XmtpDiagnosticStatusResponse"
         "401":
           description: Missing or invalid app credential or diagnostic receipt
-        "403":
-          description: Credential belongs to another app, or the app is public
         "404":
           description: Receipt is not active for this app
         "429":
           description: Lookup rate limit exceeded
+  /api/apps/{appId}/xmtp/callback-routes:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    delete:
+      tags: [Public XMTP]
+      summary: Revoke every callback route for one opaque app recipient
+      description: |
+        Trusted-server opt-out adapter. Requires the app secret and accepts only
+        the app-issued opaque inboxHandle; the backend does not need to retain
+        installation ids or raw route receipts. Removes matching logical
+        callback registrations, identities, topics, HMAC epochs, and receipts.
+        A shared physical callback URL remains while any other logical route
+        still uses it. This private response does not permit browser CORS.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallbackRouteRevokeRequest"
+      responses:
+        "200":
+          description: Matching routes revoked, or none were active
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallbackRouteRevokeResponse"
+        "401":
+          description: Missing or invalid app secret
+        "403":
+          description: Credential belongs to another app
+        "409":
+          description: App subscription state is concurrently changing
+        "422":
+          description: Invalid or non-exact request body
+        "429":
+          description: Mutation or callback-revocation rate limit exceeded
   /api/apps/{appId}/xmtp/status/test:
     parameters:
       - $ref: "#/components/parameters/AppId"
     post:
-      tags: [Operator XMTP]
-      summary: Queue one minimal diagnostic push for an operator XMTP route
+      tags: [Public XMTP, Operator XMTP]
+      summary: Queue one minimal diagnostic delivery for an XMTP route
       description: |
-        Requires both the owning pre-provisioned app credential and the
-        registration's app-bound diagnostic bearer receipt. Public-app
-        credentials receive 403 until installation ownership proof exists.
+        A public app uses its route receipt alone. A pre-provisioned operator
+        app also supplies its credential. HTTPS callback routes accept only
+        normal XMTP message-available events, so diagnostic callback delivery
+        is recorded as unsupported rather than invoking the callback.
       security:
+        - DiagnosticBearerAuth: []
         - ApiKeyAuth: []
           DiagnosticBearerAuth: []
       responses:
@@ -335,8 +471,6 @@ paths:
                 $ref: "#/components/schemas/XmtpDiagnosticTestResponse"
         "401":
           description: Missing or invalid app credential or diagnostic receipt
-        "403":
-          description: Credential belongs to another app, or the app is public
         "404":
           description: Receipt is not active for this app
         "429":
@@ -827,11 +961,16 @@ components:
       scheme: bearer
       bearerFormat: vpet1-stateless-capability
       description: Five-minute token minted by the app server for one exact PushSubscription.
+    XmtpEnrollmentTicketBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: vpxet1-stateless-capability
+      description: Five-minute app- and canonical-registration-bound token signed by the XMTP installation key.
     DiagnosticBearerAuth:
       type: http
       scheme: bearer
       bearerFormat: opaque-256-bit-capability
-      description: Receipt returned by Converge or pre-provisioned operator XMTP enrollment; not available to public apps.
+      description: App- and route-bound receipt returned on first XMTP enrollment; only its SHA-256 digest is stored.
     InternalBearerAuth:
       type: http
       scheme: bearer
@@ -1175,10 +1314,10 @@ components:
                     xmtpRegistrations:
                       type: integer
                       minimum: 0
-                      description: Shared-schema field; general-public apps cannot create XMTP routes.
+                      description: Active installation-proved or operator XMTP registrations.
                 xmtp:
                   type: object
-                  description: Shared-schema topology; empty for general-public apps because XMTP enrollment is unavailable.
+                  description: Active app-isolated XMTP listener topology.
                   required: [groupTopics, welcomeTopics, hmacEpochs]
                   additionalProperties: false
                   properties:
@@ -1454,6 +1593,222 @@ components:
               hmacKeys:
                 minItems: 1
       description: Group topics require one or more HMAC keys; welcome topics require an empty array.
+    PublicXmtpIdentity:
+      type: object
+      required: [inboxId, installationId]
+      additionalProperties: false
+      properties:
+        inboxId:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        installationId:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Lowercase hex of the raw 32-byte Ed25519 installation public key.
+    PublicXmtpDelivery:
+      oneOf:
+        - type: object
+          required: [kind, subscription]
+          additionalProperties: false
+          properties:
+            kind:
+              type: string
+              const: web_push
+            subscription:
+              $ref: "#/components/schemas/PushSubscription"
+        - type: object
+          required: [kind, url]
+          additionalProperties: false
+          properties:
+            kind:
+              type: string
+              const: https_callback
+            url:
+              type: string
+              format: uri
+              maxLength: 2048
+              description: HTTPS URL on the app's exact fresh verified domain; redirects are not followed.
+      discriminator:
+        propertyName: kind
+    PublicXmtpRegistration:
+      type: object
+      required: [version, identity, delivery, xmtp, notification, preferences, registeredAt]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          const: 1
+        identity:
+          $ref: "#/components/schemas/PublicXmtpIdentity"
+        delivery:
+          $ref: "#/components/schemas/PublicXmtpDelivery"
+        xmtp:
+          type: object
+          required: [env, topics, topicSource]
+          additionalProperties: false
+          properties:
+            env:
+              type: string
+              const: production
+            topics:
+              type: array
+              minItems: 1
+              maxItems: 400
+              items:
+                $ref: "#/components/schemas/XmtpTopic"
+              description: Topics plus HMAC epochs total at most 800 stored listener rows.
+            topicSource:
+              type: string
+              const: conversations.hmacKeys
+        notification:
+          type: object
+          required: [inboxHandle]
+          additionalProperties: false
+          properties:
+            inboxHandle:
+              type: string
+              pattern: '^[A-Za-z0-9_-]{8,128}$'
+              description: Opaque app route handle; the callback receives this instead of XMTP identity or topic metadata.
+        preferences:
+          $ref: "#/components/schemas/XmtpPreferences"
+        registeredAt:
+          type: string
+          format: date-time
+    PublicXmtpTicketRequest:
+      type: object
+      required: [registration]
+      additionalProperties: false
+      properties:
+        registration:
+          $ref: "#/components/schemas/PublicXmtpRegistration"
+    PublicXmtpTicketResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [token, expiresAt, signatureText]
+              additionalProperties: false
+              properties:
+                token:
+                  type: string
+                  pattern: '^vpxet1\.[A-Za-z0-9_-]{1,1500}\.[A-Za-z0-9_-]{43}$'
+                  readOnly: true
+                expiresAt:
+                  type: string
+                  format: date-time
+                signatureText:
+                  type: string
+                  description: Exact UTF-8 text for Client.signWithInstallationKey; equal to token in version 1.
+                  readOnly: true
+    PublicXmtpRegistrationRequest:
+      type: object
+      required: [registration, proof]
+      additionalProperties: false
+      properties:
+        registration:
+          $ref: "#/components/schemas/PublicXmtpRegistration"
+        proof:
+          type: object
+          required: [publicKey, signature]
+          additionalProperties: false
+          properties:
+            publicKey:
+              type: string
+              maxLength: 128
+              description: Unpadded base64url raw 32-byte Ed25519 installation public key.
+            signature:
+              type: string
+              maxLength: 256
+              description: Unpadded base64url raw 64-byte Ed25519 signature over signatureText.
+    PublicXmtpDeleteRequest:
+      type: object
+      required: [version, identity, delivery, deletedAt]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          const: 1
+        identity:
+          $ref: "#/components/schemas/PublicXmtpIdentity"
+        delivery:
+          oneOf:
+            - type: object
+              required: [kind, endpoint]
+              additionalProperties: false
+              properties:
+                kind:
+                  type: string
+                  const: web_push
+                endpoint:
+                  type: string
+                  format: uri
+                  maxLength: 4096
+            - type: object
+              required: [kind, url]
+              additionalProperties: false
+              properties:
+                kind:
+                  type: string
+                  const: https_callback
+                url:
+                  type: string
+                  format: uri
+                  maxLength: 2048
+        deletedAt:
+          type: string
+          format: date-time
+    CallbackRouteRevokeRequest:
+      type: object
+      required: [inboxHandle]
+      additionalProperties: false
+      properties:
+        inboxHandle:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{8,128}$'
+    CallbackRouteRevokeResponse:
+      allOf:
+        - $ref: "#/components/schemas/ApiEnvelope"
+        - type: object
+          required: [data]
+          properties:
+            data:
+              type: object
+              required: [disabled]
+              additionalProperties: false
+              properties:
+                disabled:
+                  type: integer
+                  minimum: 0
+                  description: Number of active logical callback routes removed.
+    XmtpCallbackEvent:
+      type: object
+      required: [version, type, deliveryId, inboxHandle]
+      additionalProperties: false
+      properties:
+        version:
+          type: integer
+          const: 1
+        type:
+          type: string
+          const: xmtp.message_available
+        deliveryId:
+          type: string
+          description: Stable opaque idempotency key across Queue retries.
+        inboxHandle:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{8,128}$'
+      description: |
+        POSTed to the registered callback with Vapid-Party-App-Id,
+        Vapid-Party-Delivery-Id, Vapid-Party-Timestamp, and
+        Vapid-Party-Signature. The signature is unpadded base64url of the raw
+        64-byte IEEE-P1363 ECDSA P-256/SHA-256 signature over UTF-8
+        timestamp + "\n" + deliveryId + "\n" + exactBody. Verify it with the
+        app public VAPID key. 2xx accepts; 404/410 terminally removes the matched
+        logical route while retaining a callback URL used by another route;
+        408/425/429/5xx retry. Queue delivery is at least once.
     XmtpBody:
       type: object
       required: [identity, subscription, xmtp, notification, preferences, registeredAt]
@@ -1578,7 +1933,7 @@ components:
           properties:
             data:
               type: object
-              required: [subscriptionId, identityId, topicsRegistered, hmacKeysRegistered, created, diagnostics]
+              required: [subscriptionId, identityId, topicsRegistered, hmacKeysRegistered, created]
               additionalProperties: false
               properties:
                 subscriptionId:
@@ -1608,6 +1963,7 @@ components:
                     testPath:
                       type: string
                       pattern: '^/api/apps/[A-Za-z0-9_-]+/xmtp/status/test$'
+                  description: Returned on first public enrollment, and on an authorized capability-preserving replacement; omitted on an exact proof replay.
     XmtpDiagnosticDeliveryStage:
       type: object
       required: [status]

@@ -131,6 +131,10 @@ describe('XMTP listener expand/contract migrations', () => {
       db,
       await loadMigration('../../migrations/d1/0006_public_apps_and_usage.sql')
     );
+    await applyMigration(
+      db,
+      await loadMigration('../../migrations/d1/0007_public_xmtp_and_callbacks.sql')
+    );
     expect((await db.prepare('PRAGMA foreign_key_check').all()).results).toEqual([]);
     expect(await db.prepare(`
       SELECT
@@ -142,6 +146,8 @@ describe('XMTP listener expand/contract migrations', () => {
           WHERE name = 'diagnostic_token_hash') AS diagnostic_column_count,
         (SELECT COUNT(*) FROM pragma_table_info('delivery_attempts')
           WHERE name = 'xmtp_subscription_id') AS attempt_registration_column_count,
+        (SELECT COUNT(*) FROM pragma_table_info('subscriptions')
+          WHERE name = 'delivery_kind') AS delivery_kind_column_count,
         (SELECT COUNT(*) FROM sqlite_master
           WHERE type = 'table' AND name = 'app_credentials') AS credential_table_count,
         (SELECT COUNT(*) FROM sqlite_master
@@ -157,6 +163,7 @@ describe('XMTP listener expand/contract migrations', () => {
       hmac_count: 1,
       diagnostic_column_count: 1,
       attempt_registration_column_count: 1,
+      delivery_kind_column_count: 1,
       credential_table_count: 1,
       usage_table_count: 1,
       installation_index_count: 1,
@@ -250,6 +257,7 @@ describe('XMTP listener expand/contract migrations', () => {
       '../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql',
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
+      '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
     ]) await applyMigration(db, await loadMigration(path));
     await insertApp(db, 'app-a');
     await db.prepare(`
@@ -351,6 +359,7 @@ describe('XMTP listener expand/contract migrations', () => {
       '../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql',
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
+      '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
     ]) await applyMigration(db, await loadMigration(path));
     await insertApp(db, 'app-a');
     await db.prepare(`
@@ -460,6 +469,7 @@ describe('XMTP listener expand/contract migrations', () => {
       '../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql',
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
+      '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
     ]) await applyMigration(db, await loadMigration(path));
     await insertApp(db, 'public-a');
     await db.batch([

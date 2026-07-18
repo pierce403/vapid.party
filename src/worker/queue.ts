@@ -1,15 +1,36 @@
 import {
   claimPushDeliveryAttempt,
   completePushDeliveryAttempt,
+  disableXmtpCallbackRegistration,
   getPushJobContext,
   releasePushDeliveryAttempt,
 } from './db';
 import { handleTerminalPushFailure, sendWebPush } from './push';
 import type { WebPushResult } from './push';
+import { sendXmtpCallback } from './callback';
 import type { Env, PushQueueJob } from './types';
 
 const MIN_PUSH_RETRY_SECONDS = 30;
 const MAX_PUSH_RETRY_SECONDS = 300;
+
+async function handleTerminalDeliveryFailure(
+  env: Env,
+  job: PushQueueJob,
+  deliveryKind: 'web_push' | 'https_callback'
+): Promise<void> {
+  if (deliveryKind === 'https_callback') {
+    if (!job.xmtpSubscriptionId) {
+      throw new Error('Callback Queue job is missing its logical XMTP registration id');
+    }
+    await disableXmtpCallbackRegistration(env.DB, {
+      appId: job.appId,
+      subscriptionId: job.subscriptionId,
+      xmtpSubscriptionId: job.xmtpSubscriptionId,
+    });
+    return;
+  }
+  await handleTerminalPushFailure(env.DB, job.subscriptionId);
+}
 
 export function pushDeliveryOptions(source: PushQueueJob['source']): {
   ttl?: number;
@@ -47,7 +68,11 @@ export async function handleQueue(batch: MessageBatch<PushQueueJob>, env: Env): 
       // An earlier terminal 404/410 may have committed before endpoint cleanup
       // failed. Retrying cleanup is safe and never calls the push provider.
       if (claim.terminalStatus === 'expired') {
-        await handleTerminalPushFailure(env.DB, job.subscriptionId);
+        await handleTerminalDeliveryFailure(
+          env,
+          job,
+          job.deliveryKind ?? 'web_push'
+        );
       }
       message.ack();
       continue;
@@ -69,10 +94,19 @@ export async function handleQueue(batch: MessageBatch<PushQueueJob>, env: Env): 
       continue;
     }
 
-    const result = await sendWebPush(context.app, context.subscription, job.payload, {
-      vapidSubject: env.VAPID_SUBJECT,
-      ...pushDeliveryOptions(job.source),
-    });
+    const result: WebPushResult = context.subscription.deliveryKind === 'https_callback'
+      ? job.source === 'xmtp'
+        ? await sendXmtpCallback(
+            context.app,
+            context.subscription,
+            job.payload,
+            job.deliveryAttemptId
+          )
+        : { success: false, statusCode: 422, error: 'Callbacks accept XMTP events only' }
+      : await sendWebPush(context.app, context.subscription, job.payload, {
+          vapidSubject: env.VAPID_SUBJECT,
+          ...pushDeliveryOptions(job.source),
+        });
 
     if (result.success) {
       // The provider request and D1 cannot share one atomic transaction. A
@@ -94,7 +128,11 @@ export async function handleQueue(batch: MessageBatch<PushQueueJob>, env: Env): 
         pushStatus: result.statusCode,
       });
       if (completed) {
-        await handleTerminalPushFailure(env.DB, job.subscriptionId);
+        await handleTerminalDeliveryFailure(
+          env,
+          job,
+          context.subscription.deliveryKind
+        );
       }
       message.ack();
       continue;

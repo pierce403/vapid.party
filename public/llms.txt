@@ -13,10 +13,9 @@ Runtime:
   three HMAC epochs, own-message and shouldPush=false suppression, and cleanup.
 - Push remains experimental because SubscribeAll has no durable replay cursor;
   restart/disconnect hints can be missed while XMTP client sync remains authoritative.
-- Migration 0006 and the general-public app API are deployed in production.
+- Migration 0007 plus the version-5 Worker add general-public XMTP enrollment
+  with installation-key proof and Web Push or signed callback delivery.
   Converge and pre-provisioned operator contracts remain separate.
-- General-public apps support generic Web Push only. Public XMTP enrollment is
-  unavailable until installation ownership can be proven cryptographically.
 
 OpenAPI:
 - /openapi.yaml
@@ -73,16 +72,56 @@ Public generic browser enrollment (deployed):
   public app maximum of 150 active physical subscriptions is enforced.
 - expirationTime must be null or a future Unix-millisecond timestamp.
 
-General-public XMTP enrollment (unavailable/planned):
+General-public XMTP enrollment (version 5):
+- POST /api/apps/{appId}/xmtp/enrollment-ticket with X-API-Key
 - POST /api/apps/{appId}/xmtp/subscriptions
 - DELETE /api/apps/{appId}/xmtp/subscriptions
-- Public-app credentials receive HTTP 403 on POST/DELETE
-  /api/xmtp/registrations and on the app-scoped XMTP status/test paths.
-- An appSecret proves control of the vapid.party app, not ownership of a claimed
-  XMTP installation. General-public XMTP enrollment remains planned until a
-  cryptographic installation-ownership proof contract exists.
+- POST /api/apps/{appId}/xmtp/status with the route receipt
+- DELETE /api/apps/{appId}/xmtp/callback-routes with X-API-Key and exact
+  `{inboxHandle}` for trusted-server opt-out; returns `{disabled:<count>}`.
+- Ticket body is `{registration}` and its no-store response includes token,
+  expiresAt, and signatureText. The ticket is valid for five minutes and bound
+  to app id plus the canonical exact registration hash.
+- Sign signatureText (equal to token in version 1) with
+  Client.signWithInstallationKey. Submit `{registration,proof}` with the ticket
+  as Authorization Bearer. proof.publicKey is unpadded base64url raw 32-byte
+  Ed25519; its lowercase hex must equal installationId. proof.signature is the
+  unpadded base64url raw 64-byte signature over UTF-8 signatureText.
+- This proves installation-key possession, not current third-party inbox-state
+  membership. Exact signed replays are idempotent and cannot redirect the route
+  or rotate/expose the management receipt.
+- delivery.kind is web_push with a standard subscription, or https_callback
+  with a URL on the exact fresh verified app domain. Ticket mint automatically
+  re-resolves a stale previously verified TXT binding under global 600/minute
+  and app 30/minute limits. Existing callbacks do not stop merely because the
+  seven-day ticket-eligibility freshness window ages out.
+- One app+inboxHandle is one callback recipient. A successful newly proved
+  installation removes older callback installations with the same handle only
+  after the new route is active; a failed ticket/proof leaves the old route.
+- First enrollment returns diagnostics.receipt; only its hash is stored.
+  Endpoint replacement also sends X-Vapid-Party-Management-Token. DELETE sends
+  the receipt as Authorization Bearer and the exact identity/delivery target.
+- Public submit/delete/status permit CORS. Ticket mint is trusted-server-only.
+- callback-routes is app-secret-only, private/no-CORS, idempotent, removes all
+  logical state for the handle, and retains a shared URL used by other handles.
+- Public-app credentials still receive HTTP 403 on legacy POST/DELETE
+  /api/xmtp/registrations.
 - Existing Converge compatibility and pre-provisioned operator XMTP flows are
   separate and remain available according to their rollout status.
+
+Signed XMTP callback:
+- Body is exactly `{version:1,type:"xmtp.message_available",deliveryId,inboxHandle}`.
+- No topic, inbox id, installation id, sender, ciphertext, or message content.
+- Headers: Vapid-Party-App-Id, Vapid-Party-Delivery-Id,
+  Vapid-Party-Timestamp (Unix seconds), Vapid-Party-Signature.
+- Verify with GET /api/apps/{appId}/vapid-public-key. Signature bytes are raw
+  64-byte IEEE-P1363 ECDSA P-256/SHA-256 r||s, not DER, unpadded base64url.
+  Signed UTF-8 input is timestamp + "\n" + deliveryId + "\n" + exact body.
+- Queue is at least once and deliveryId is stable across retries. 2xx accepts;
+  408/425/429/5xx and network errors retry; redirects are not followed. 404/410
+  terminally delete only the matched logical route, topics/HMACs, listener
+  entry, and management receipt. The physical callback URL remains while any
+  other logical route uses it. Other 4xx fail without deleting the route.
 
 App-secret management routes (deployed):
 - GET /api/apps/{appId}/stats
@@ -107,14 +146,16 @@ DNS and leaderboard (deployed):
   checks it. A listing requires a successful check within seven days and a
   VAPID snapshot matching the current app key.
 - Ranking uses providerAcceptedLast7Days across today and the prior six UTC
-  dates. Provider accepted does not mean delivered, displayed, or read.
+  dates. It includes Web Push provider responses and callback HTTP 2xx; target
+  acceptance does not mean delivered, displayed, or read.
 - domainVerifiedAt means last verified. DNS is checked on demand, not monitored
   continuously, so it is not a claim of continuous or current ownership.
 
 Private stats semantics (deployed):
 - todayUtc is the current UTC date; last7DaysUtc is today plus six prior UTC dates.
 - queued means a recipient job was enqueued.
-- providerAccepted means a Web Push provider accepted a send attempt.
+- providerAccepted is a compatibility field meaning the downstream target
+  accepted a request: Web Push provider acceptance or callback HTTP 2xx.
 - failed counts failed send attempts, including retries.
 - expired counts terminal invalid-endpoint outcomes.
 - Counters exclude diagnostic tests, retain eight UTC dates, and contain no
@@ -172,8 +213,8 @@ Authenticated app routes:
 - DELETE /api/xmtp/registrations
 - POST /api/apps/{appId}/xmtp/status
 - POST /api/apps/{appId}/xmtp/status/test
-- Public-app credentials receive HTTP 403 on the XMTP registration routes.
-  General-public XMTP enrollment is not shipped.
+- Public-app credentials receive HTTP 403 on the legacy XMTP registration
+  routes. General-public apps use the installation-proved app-scoped routes.
 - For operator apps, the API key selects app scope; the registration request
   cannot override it.
 - Operator registration returns a diagnostic receipt and app-scoped status/test

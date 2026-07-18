@@ -4,7 +4,7 @@ import { Miniflare } from 'miniflare';
 import { handleApi } from '../../src/worker/api';
 import { insertDeliveryAttempt, updateDeliveryAttempt } from '../../src/worker/db';
 import { appDomainRecord } from '../../src/worker/domain';
-import { sha256Hex } from '../../src/worker/encoding';
+import { bytesToBase64Url, bytesToHex, sha256Hex } from '../../src/worker/encoding';
 import type { Env, PushQueueJob } from '../../src/worker/types';
 import { migrationStatements } from './migration-helpers';
 
@@ -100,6 +100,7 @@ describe('anonymous public app contract', () => {
       `),
     ]);
     await applyMigration(db, '../../migrations/d1/0006_public_apps_and_usage.sql');
+    await applyMigration(db, '../../migrations/d1/0007_public_xmtp_and_callbacks.sql');
 
     queued = [];
     appSecrets = new Map();
@@ -215,6 +216,78 @@ describe('anonymous public app contract', () => {
     });
     expect(response.status).toBe(201);
     return data(response);
+  }
+
+  async function ownedXmtpRegistration(
+    delivery: Record<string, unknown> = {
+      kind: 'web_push',
+      subscription: {
+        endpoint: 'https://fcm.googleapis.com/fcm/send/public-xmtp',
+        expirationTime: null,
+        keys: { p256dh, auth },
+      },
+    },
+    options: { inboxHandle?: string } = {}
+  ): Promise<{ registration: Record<string, unknown>; keyPair: CryptoKeyPair; publicKey: string }> {
+    const keyPair = await crypto.subtle.generateKey(
+      { name: 'Ed25519' },
+      true,
+      ['sign', 'verify']
+    ) as CryptoKeyPair;
+    const publicKeyBytes = new Uint8Array(
+      await crypto.subtle.exportKey('raw', keyPair.publicKey) as ArrayBuffer
+    );
+    const installationId = bytesToHex(publicKeyBytes);
+    return {
+      keyPair,
+      publicKey: bytesToBase64Url(publicKeyBytes),
+      registration: {
+        version: 1,
+        identity: { inboxId: '11'.repeat(32), installationId },
+        delivery,
+        xmtp: {
+          env: 'production',
+          topics: [
+            {
+              topic: `/xmtp/mls/1/g-${'33'.repeat(16)}/proto`,
+              hmacKeys: [{ epoch: '7', key: 'AQID' }],
+            },
+            {
+              topic: `/xmtp/mls/1/w-${installationId}/proto`,
+              hmacKeys: [],
+            },
+          ],
+          topicSource: 'conversations.hmacKeys',
+        },
+        notification: { inboxHandle: options.inboxHandle ?? 'opaque_public_xmtp' },
+        preferences: { minimalPayloadOnly: true, plaintextPreview: false },
+        registeredAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  async function mintOwnedXmtpTicket(
+    created: CreatedApp,
+    registration: Record<string, unknown>
+  ): Promise<{ token: string; expiresAt: string; signatureText: string }> {
+    const response = await request(`/api/apps/${created.app.id}/xmtp/enrollment-ticket`, {
+      method: 'POST',
+      appSecret: created.appSecret,
+      body: { registration },
+    });
+    expect(response.status).toBe(200);
+    return data(response);
+  }
+
+  async function signInstallationTicket(
+    keyPair: CryptoKeyPair,
+    ticket: string
+  ): Promise<string> {
+    return bytesToBase64Url(new Uint8Array(await crypto.subtle.sign(
+      { name: 'Ed25519' },
+      keyPair.privateKey,
+      new TextEncoder().encode(ticket)
+    )));
   }
 
   it('applies 0006 without retaining legacy notification copy', async () => {
@@ -587,59 +660,88 @@ describe('anonymous public app contract', () => {
     `).bind(created.app.id).first()).toEqual({ count: 0 });
   });
 
-  it('keeps public XMTP enrollment disabled until installation ownership can be proved', async () => {
+  it('enrolls public XMTP only with an exact ticket and installation-key proof', async () => {
     const created = await createApp();
-    const inboxId = '11'.repeat(32);
-    const installationId = '22'.repeat(32);
-    const endpoint = 'https://fcm.googleapis.com/fcm/send/public-xmtp';
-    const body = {
-      version: 1,
-      identity: { inboxId, installationId },
-      subscription: { endpoint, expirationTime: null, keys: { p256dh, auth } },
-      xmtp: {
-        env: 'production',
-        topics: [
-          {
-            topic: `/xmtp/mls/1/g-${'33'.repeat(16)}/proto`,
-            hmacKeys: [{ epoch: '7', key: 'AQID' }],
-          },
-          {
-            topic: `/xmtp/mls/1/w-${installationId}/proto`,
-            hmacKeys: [],
-          },
-        ],
-        topicSource: 'conversations.hmacKeys',
-      },
-      notification: { inboxHandle: 'opaque_public_xmtp' },
-      preferences: { minimalPayloadOnly: true, plaintextPreview: false },
-      registeredAt: new Date().toISOString(),
-    };
+    const { registration, keyPair, publicKey } = await ownedXmtpRegistration();
 
     const enrolled = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
       method: 'POST',
-      body,
+      body: { registration, proof: { publicKey, signature: 'AA' } },
     });
-    expect(enrolled.status).toBe(403);
+    expect(enrolled.status).toBe(422);
 
+    const ticket = await mintOwnedXmtpTicket(created, registration);
+    expect(ticket.token).toBe(ticket.signatureText);
+    expect(ticket.token).toMatch(/^vpxet1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
+    const signature = await signInstallationTicket(keyPair, ticket.signatureText);
     const authorizedEnrollment = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
       method: 'POST',
-      appSecret: created.appSecret,
-      body,
+      bearer: ticket.token,
+      body: { registration, proof: { publicKey, signature } },
     });
-    expect(authorizedEnrollment.status).toBe(403);
-    expect(authorizedEnrollment.headers.get('Access-Control-Allow-Origin')).toBeNull();
-    for (const suffix of ['/xmtp/status', '/xmtp/status/test']) {
-      const diagnostics = await request(`/api/apps/${created.app.id}${suffix}`, {
-        method: 'POST',
-        appSecret: created.appSecret,
-      });
-      expect(diagnostics.status).toBe(403);
-      expect(diagnostics.headers.get('Access-Control-Allow-Origin')).toBeNull();
-    }
+    expect(authorizedEnrollment.status).toBe(201);
+    expect(authorizedEnrollment.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(authorizedEnrollment.headers.get('Access-Control-Allow-Headers'))
+      .toContain('X-Vapid-Party-Management-Token');
+    const result = await data<{
+      created: boolean;
+      diagnostics: { receipt: string; statusPath: string; testPath: string };
+    }>(authorizedEnrollment);
+    expect(result).toMatchObject({
+      created: true,
+      diagnostics: {
+        statusPath: `/api/apps/${created.app.id}/xmtp/status`,
+        testPath: `/api/apps/${created.app.id}/xmtp/status/test`,
+      },
+    });
+    expect(result.diagnostics.receipt).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    const status = await request(`/api/apps/${created.app.id}/xmtp/status`, {
+      method: 'POST',
+      bearer: result.diagnostics.receipt,
+      body: {},
+    });
+    expect(status.status).toBe(200);
+    expect(status.headers.get('Access-Control-Allow-Origin')).toBe('*');
+
+    const replay = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
+      method: 'POST',
+      bearer: ticket.token,
+      body: { registration, proof: { publicKey, signature } },
+    });
+    expect(replay.status).toBe(200);
+    const replayResult = await data<{ created: boolean; diagnostics?: unknown }>(replay);
+    expect(replayResult).toEqual(expect.objectContaining({ created: false }));
+    expect(replayResult.diagnostics).toBeUndefined();
+
+    const tampered = structuredClone(registration);
+    (tampered.notification as { inboxHandle: string }).inboxHandle = 'opaque_tampered_route';
+    const rejected = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
+      method: 'POST',
+      bearer: ticket.token,
+      body: { registration: tampered, proof: { publicKey, signature } },
+    });
+    expect(rejected.status).toBe(401);
+
+    const identity = registration.identity as { inboxId: string; installationId: string };
+    const delivery = registration.delivery as { kind: 'web_push'; subscription: { endpoint: string } };
+    const deleted = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
+      method: 'DELETE',
+      bearer: result.diagnostics.receipt,
+      body: {
+        version: 1,
+        identity,
+        delivery: { kind: 'web_push', endpoint: delivery.subscription.endpoint },
+        deletedAt: new Date().toISOString(),
+      },
+    });
+    expect(deleted.status).toBe(200);
+    expect(await data(deleted)).toEqual({ disabled: true });
+
     const genericBypass = await request('/api/xmtp/registrations', {
       method: 'POST',
       appSecret: created.appSecret,
-      body,
+      body: registration,
     });
     expect(genericBypass.status).toBe(403);
     expect(await db.prepare(`
@@ -648,6 +750,172 @@ describe('anonymous public app contract', () => {
         (SELECT COUNT(*) FROM xmtp_subscriptions) AS registrations,
         (SELECT COUNT(*) FROM xmtp_topics) AS topics
     `).bind(created.app.id).first()).toEqual({ identities: 0, registrations: 0, topics: 0 });
+  });
+
+  it('restricts XMTP callbacks to the fresh exact verified app domain', async () => {
+    const created = await createApp({ domain: 'notify.example.com' });
+    const wrong = await ownedXmtpRegistration({
+      kind: 'https_callback',
+      url: 'https://other.example.com/api/xmtp',
+    });
+    const unverified = await request(`/api/apps/${created.app.id}/xmtp/enrollment-ticket`, {
+      method: 'POST',
+      appSecret: created.appSecret,
+      body: { registration: wrong.registration },
+    });
+    expect(unverified.status).toBe(409);
+
+    const timestamp = new Date().toISOString();
+    await db.prepare(`
+      UPDATE app_public_profiles
+      SET domain_verification_status = 'verified',
+          domain_verified_at = ?,
+          domain_last_checked_at = ?,
+          domain_verified_vapid_key = ?
+      WHERE app_id = ?
+    `).bind(timestamp, timestamp, created.app.publicVapidKey, created.app.id).run();
+    const wrongDomain = await request(`/api/apps/${created.app.id}/xmtp/enrollment-ticket`, {
+      method: 'POST',
+      appSecret: created.appSecret,
+      body: { registration: wrong.registration },
+    });
+    expect(wrongDomain.status).toBe(422);
+
+    const staleTimestamp = new Date(Date.now() - 8 * 24 * 60 * 60_000).toISOString();
+    await db.prepare(`
+      UPDATE app_public_profiles SET domain_last_checked_at = ? WHERE app_id = ?
+    `).bind(staleTimestamp, created.app.id).run();
+    const dnsRecord = appDomainRecord(
+      'notify.example.com',
+      created.app.id,
+      created.app.publicVapidKey
+    );
+    const dnsFetch = vi.fn(async () => new Response(JSON.stringify({
+      Status: 0,
+      Answer: [{ name: `${dnsRecord.name}.`, type: 16, data: `"${dnsRecord.value}"` }],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', dnsFetch);
+
+    const owned = await ownedXmtpRegistration({
+      kind: 'https_callback',
+      url: 'https://notify.example.com/api/xmtp',
+    });
+    const ticket = await mintOwnedXmtpTicket(created, owned.registration);
+    expect(dnsFetch).toHaveBeenCalledOnce();
+    expect((await db.prepare(`
+      SELECT domain_last_checked_at FROM app_public_profiles WHERE app_id = ?
+    `).bind(created.app.id).first<{ domain_last_checked_at: string }>())?.domain_last_checked_at)
+      .not.toBe(staleTimestamp);
+    const signature = await signInstallationTicket(owned.keyPair, ticket.signatureText);
+    const enrolled = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
+      method: 'POST',
+      bearer: ticket.token,
+      body: {
+        registration: owned.registration,
+        proof: { publicKey: owned.publicKey, signature },
+      },
+    });
+    expect(enrolled.status).toBe(201);
+    expect(await db.prepare(`
+      SELECT endpoint, delivery_kind, p256dh, auth
+      FROM subscriptions WHERE app_id = ?
+    `).bind(created.app.id).first()).toEqual({
+      endpoint: 'https://notify.example.com/api/xmtp',
+      delivery_kind: 'https_callback',
+      p256dh: '',
+      auth: '',
+    });
+
+    const replacement = await ownedXmtpRegistration({
+      kind: 'https_callback',
+      url: 'https://notify.example.com/api/xmtp',
+    });
+    const replacementTicket = await mintOwnedXmtpTicket(created, replacement.registration);
+    const invalidReplacement = await request(
+      `/api/apps/${created.app.id}/xmtp/subscriptions`,
+      {
+        method: 'POST',
+        bearer: replacementTicket.token,
+        body: {
+          registration: replacement.registration,
+          proof: {
+            publicKey: replacement.publicKey,
+            signature: bytesToBase64Url(new Uint8Array(64).fill(7)),
+          },
+        },
+      }
+    );
+    expect(invalidReplacement.status).toBe(401);
+    expect(await db.prepare(`
+      SELECT installation_id FROM xmtp_identities WHERE app_id = ? AND inbox_handle = ?
+    `).bind(created.app.id, 'opaque_public_xmtp').first()).toEqual({
+      installation_id: (owned.registration.identity as { installationId: string }).installationId,
+    });
+
+    const replacementSignature = await signInstallationTicket(
+      replacement.keyPair,
+      replacementTicket.signatureText
+    );
+    const replaced = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
+      method: 'POST',
+      bearer: replacementTicket.token,
+      body: {
+        registration: replacement.registration,
+        proof: { publicKey: replacement.publicKey, signature: replacementSignature },
+      },
+    });
+    expect(replaced.status).toBe(201);
+    expect(await db.prepare(`
+      SELECT installation_id FROM xmtp_identities WHERE app_id = ? AND inbox_handle = ?
+    `).bind(created.app.id, 'opaque_public_xmtp').all()).toMatchObject({
+      results: [{
+        installation_id: (replacement.registration.identity as { installationId: string })
+          .installationId,
+      }],
+    });
+
+    const other = await ownedXmtpRegistration({
+      kind: 'https_callback',
+      url: 'https://notify.example.com/api/xmtp',
+    }, { inboxHandle: 'opaque_other_recipient' });
+    const otherTicket = await mintOwnedXmtpTicket(created, other.registration);
+    const otherSignature = await signInstallationTicket(other.keyPair, otherTicket.signatureText);
+    expect((await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
+      method: 'POST',
+      bearer: otherTicket.token,
+      body: {
+        registration: other.registration,
+        proof: { publicKey: other.publicKey, signature: otherSignature },
+      },
+    })).status).toBe(201);
+
+    const revoked = await request(`/api/apps/${created.app.id}/xmtp/callback-routes`, {
+      method: 'DELETE',
+      appSecret: created.appSecret,
+      body: { inboxHandle: 'opaque_public_xmtp' },
+    });
+    expect(revoked.status).toBe(200);
+    expect(revoked.headers.get('Access-Control-Allow-Origin')).toBeNull();
+    expect(await data<{ disabled: number }>(revoked)).toEqual({ disabled: 1 });
+    expect(await db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM xmtp_identities
+          WHERE app_id = ? AND inbox_handle = 'opaque_public_xmtp') AS revoked_count,
+        (SELECT COUNT(*) FROM xmtp_identities
+          WHERE app_id = ? AND inbox_handle = 'opaque_other_recipient') AS active_count,
+        (SELECT COUNT(*) FROM subscriptions
+          WHERE app_id = ? AND delivery_kind = 'https_callback') AS endpoint_count
+    `).bind(created.app.id, created.app.id, created.app.id).first()).toEqual({
+      revoked_count: 0,
+      active_count: 1,
+      endpoint_count: 1,
+    });
+    const repeated = await request(`/api/apps/${created.app.id}/xmtp/callback-routes`, {
+      method: 'DELETE',
+      appSecret: created.appSecret,
+      body: { inboxHandle: 'opaque_public_xmtp' },
+    });
+    expect(await data<{ disabled: number }>(repeated)).toEqual({ disabled: 0 });
   });
 
   it('keeps notification content transient while recording aggregate queued usage', async () => {

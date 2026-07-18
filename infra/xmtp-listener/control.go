@@ -79,7 +79,7 @@ func newControlClient(cfg config) *controlClient {
 		deltaSize:           boundedControlPageSize(cfg.DeltaPageSize),
 		deltaChangeBudget:   maxDeltaChanges,
 		deltaResponseBudget: maxDeltaResponseBytes,
-		httpClient:          &http.Client{Timeout: cfg.HTTPTimeout},
+		httpClient:          newInternalHTTPClient(cfg.HTTPTimeout),
 	}
 }
 

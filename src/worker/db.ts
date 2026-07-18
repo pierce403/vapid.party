@@ -131,6 +131,7 @@ interface SubscriptionRow {
   endpoint: string;
   p256dh: string;
   auth: string;
+  delivery_kind?: 'web_push' | 'https_callback';
   user_id: string | null;
   channel_id: string | null;
   metadata: string | null;
@@ -169,6 +170,7 @@ interface TopicMatchRow {
   endpoint: string;
   p256dh: string;
   auth: string;
+  delivery_kind: 'web_push' | 'https_callback';
   conversation_id: string | null;
   inbox_handle: string | null;
 }
@@ -265,6 +267,7 @@ function mapSubscription(row: SubscriptionRow): SubscriptionRecord {
     endpoint: row.endpoint,
     p256dh: row.p256dh,
     auth: row.auth,
+    deliveryKind: row.delivery_kind ?? 'web_push',
     userId: row.user_id ?? undefined,
     channelId: row.channel_id ?? undefined,
     metadata: parseJsonObject(row.metadata, {}),
@@ -445,6 +448,23 @@ export async function getAppPublicProfile(
     SELECT * FROM app_public_profiles WHERE app_id = ?
   `).bind(appId).first<AppPublicProfileRow>();
   return mapPublicProfile(row);
+}
+
+export async function getFreshVerifiedAppDomain(
+  db: D1Database,
+  app: AppRecord
+): Promise<string | null> {
+  const freshAfter = new Date(Date.now() - APP_DOMAIN_VERIFICATION_FRESHNESS_MS).toISOString();
+  const row = await db.prepare(`
+    SELECT domain
+    FROM app_public_profiles
+    WHERE app_id = ?
+      AND domain IS NOT NULL
+      AND domain_verification_status = 'verified'
+      AND domain_last_checked_at >= ?
+      AND domain_verified_vapid_key = ?
+  `).bind(app.id, freshAfter, app.vapidPublicKey).first<{ domain: string }>();
+  return row?.domain ?? null;
 }
 
 export async function isPublicApp(db: D1Database, appId: string): Promise<boolean> {
@@ -714,6 +734,7 @@ export async function upsertSubscription(
     endpoint: string;
     p256dh: string;
     auth: string;
+    deliveryKind?: 'web_push' | 'https_callback';
     userId?: string;
     channelId?: string;
     metadata?: Record<string, unknown>;
@@ -728,11 +749,15 @@ export async function upsertSubscription(
     : new Date(input.expirationTime).toISOString();
 
   await db.prepare(`
-    INSERT INTO subscriptions (id, app_id, endpoint, p256dh, auth, user_id, channel_id, metadata, expires_at, created_at, updated_at, disabled_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    INSERT INTO subscriptions (
+      id, app_id, endpoint, p256dh, auth, delivery_kind, user_id, channel_id,
+      metadata, expires_at, created_at, updated_at, disabled_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(app_id, endpoint) DO UPDATE SET
       p256dh = excluded.p256dh,
       auth = excluded.auth,
+      delivery_kind = excluded.delivery_kind,
       user_id = excluded.user_id,
       channel_id = excluded.channel_id,
       metadata = excluded.metadata,
@@ -740,7 +765,9 @@ export async function upsertSubscription(
       updated_at = excluded.updated_at,
       disabled_at = NULL
     ${options.immutableKeys
-      ? 'WHERE subscriptions.p256dh = excluded.p256dh AND subscriptions.auth = excluded.auth'
+      ? `WHERE subscriptions.p256dh = excluded.p256dh
+          AND subscriptions.auth = excluded.auth
+          AND subscriptions.delivery_kind = excluded.delivery_kind`
       : ''}
   `).bind(
     id,
@@ -748,6 +775,7 @@ export async function upsertSubscription(
     input.endpoint,
     input.p256dh,
     input.auth,
+    input.deliveryKind ?? 'web_push',
     input.userId ?? null,
     input.channelId ?? null,
     json(input.metadata),
@@ -762,7 +790,11 @@ export async function upsertSubscription(
     .first<SubscriptionRow>();
 
   if (!row) throw new Error('Subscription upsert could not be loaded');
-  if (options.immutableKeys && (row.p256dh !== input.p256dh || row.auth !== input.auth)) {
+  if (options.immutableKeys && (
+    row.p256dh !== input.p256dh
+    || row.auth !== input.auth
+    || (row.delivery_kind ?? 'web_push') !== (input.deliveryKind ?? 'web_push')
+  )) {
     throw new XmtpEndpointKeyConflictError();
   }
   return mapSubscription(row);
@@ -838,6 +870,7 @@ export async function getSubscriptionsByApp(
 ): Promise<SubscriptionRecord[]> {
   const clauses = [
     'app_id = ?',
+    "delivery_kind = 'web_push'",
     'disabled_at IS NULL',
     "(expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
   ];
@@ -883,6 +916,7 @@ export async function getSubscriptionsByIds(
       .prepare(`
         SELECT * FROM subscriptions
         WHERE app_id = ? AND id IN (${placeholders}) AND disabled_at IS NULL
+          AND delivery_kind = 'web_push'
           AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       `)
       .bind(appId, ...chunk)
@@ -949,6 +983,127 @@ export async function disableSubscription(db: D1Database, id: string): Promise<v
   // the physical row after recording listener removals so p256dh/auth secrets
   // and every logical route backed by that endpoint are removed immediately.
   await db.prepare('DELETE FROM subscriptions WHERE id = ?').bind(id).run();
+}
+
+interface CallbackRouteCleanupRow {
+  xmtp_subscription_id: string;
+  identity_id: string;
+  subscription_id: string;
+  installation_id: string;
+}
+
+async function cleanCallbackRouteRows(
+  db: D1Database,
+  appId: string,
+  rows: CallbackRouteCleanupRow[]
+): Promise<number> {
+  const uniqueRows = [...new Map(rows.map((row) => [row.xmtp_subscription_id, row])).values()];
+  if (uniqueRows.length === 0) return 0;
+
+  const dirtyVersions = new Map<string, string>();
+  for (const row of uniqueRows) {
+    dirtyVersions.set(
+      row.xmtp_subscription_id,
+      await markXmtpListenerRouteDirty(db, appId, row.installation_id)
+    );
+  }
+
+  const subscriptions = [...new Set(uniqueRows.map((row) => row.subscription_id))];
+  const results = await db.batch([
+    ...uniqueRows.map((row) => db.prepare(`
+      UPDATE xmtp_subscriptions
+      SET active = 0, diagnostic_token_hash = NULL, updated_at = ?
+      WHERE id = ? AND active = 1
+    `).bind(nowIso(), row.xmtp_subscription_id)),
+    ...uniqueRows.map((row) => db.prepare(`
+      DELETE FROM xmtp_identities
+      WHERE id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM xmtp_subscriptions registration
+          WHERE registration.identity_id = xmtp_identities.id
+            AND registration.active = 1
+        )
+    `).bind(row.identity_id)),
+    ...subscriptions.map((subscriptionId) => db.prepare(`
+      DELETE FROM subscriptions
+      WHERE id = ? AND app_id = ? AND delivery_kind = 'https_callback'
+        AND NOT EXISTS (
+          SELECT 1 FROM xmtp_subscriptions registration
+          WHERE registration.subscription_id = subscriptions.id
+            AND registration.active = 1
+        )
+    `).bind(subscriptionId, appId)),
+  ]);
+
+  let disabled = 0;
+  for (const [index, row] of uniqueRows.entries()) {
+    if (Number(results[index]?.meta.changes ?? 0) !== 1) continue;
+    disabled += 1;
+    await recordXmtpListenerChange(
+      db,
+      appId,
+      row.installation_id,
+      'registration-deleted',
+      dirtyVersions.get(row.xmtp_subscription_id) as string
+    );
+  }
+  return disabled;
+}
+
+export async function disableXmtpCallbackRegistration(
+  db: D1Database,
+  input: { appId: string; xmtpSubscriptionId: string; subscriptionId: string }
+): Promise<boolean> {
+  const row = await db.prepare(`
+    SELECT
+      registration.id AS xmtp_subscription_id,
+      registration.identity_id,
+      registration.subscription_id,
+      identity.installation_id
+    FROM xmtp_subscriptions registration
+    JOIN xmtp_identities identity ON identity.id = registration.identity_id
+    JOIN subscriptions subscription ON subscription.id = registration.subscription_id
+    WHERE registration.id = ?
+      AND registration.subscription_id = ?
+      AND identity.app_id = ?
+      AND subscription.delivery_kind = 'https_callback'
+      AND registration.active = 1
+  `).bind(
+    input.xmtpSubscriptionId,
+    input.subscriptionId,
+    input.appId
+  ).first<CallbackRouteCleanupRow>();
+  if (!row) return false;
+  return await cleanCallbackRouteRows(db, input.appId, [row]) === 1;
+}
+
+export async function disableXmtpCallbackRoutesByHandle(
+  db: D1Database,
+  appId: string,
+  inboxHandle: string,
+  options: { exceptInstallationId?: string } = {}
+): Promise<number> {
+  const result = await db.prepare(`
+    SELECT
+      registration.id AS xmtp_subscription_id,
+      registration.identity_id,
+      registration.subscription_id,
+      identity.installation_id
+    FROM xmtp_subscriptions registration
+    JOIN xmtp_identities identity ON identity.id = registration.identity_id
+    JOIN subscriptions subscription ON subscription.id = registration.subscription_id
+    WHERE identity.app_id = ?
+      AND identity.inbox_handle = ?
+      AND subscription.delivery_kind = 'https_callback'
+      AND registration.active = 1
+      AND (? IS NULL OR identity.installation_id <> ?)
+  `).bind(
+    appId,
+    inboxHandle,
+    options.exceptInstallationId ?? null,
+    options.exceptInstallationId ?? null
+  ).all<CallbackRouteCleanupRow>();
+  return cleanCallbackRouteRows(db, appId, result.results);
 }
 
 export async function checkAndIncrementRateLimit(
@@ -1277,7 +1432,8 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       endpoint: input.endpoint,
       p256dh: input.p256dh,
       auth: input.auth,
-      metadata: { source: 'xmtp' },
+      deliveryKind: input.deliveryKind,
+      metadata: { source: 'xmtp', deliveryKind: input.deliveryKind },
       expirationTime: input.expirationTime,
     }, { immutableKeys: options.immutableEndpointKeys });
 
@@ -1354,6 +1510,19 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       nowIso(),
       xmtpSubscriptionId
     ).run();
+
+    if (input.deliveryKind === 'https_callback' && input.inboxHandle) {
+      // The app-issued opaque handle is one downstream recipient. Only after
+      // the newly proved route is fully active, retire abandoned installations
+      // that previously claimed the same handle. A failed proof never reaches
+      // this point, so it cannot evict the working route.
+      await disableXmtpCallbackRoutesByHandle(
+        this.env.DB,
+        app.id,
+        input.inboxHandle,
+        { exceptInstallationId: input.installationId }
+      );
+    }
 
     if (existing && existing.subscription_id !== subscription.id) {
       const active = await this.env.DB.prepare(`
@@ -1476,6 +1645,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
         s.endpoint AS endpoint,
         s.p256dh AS p256dh,
         s.auth AS auth,
+        s.delivery_kind AS delivery_kind,
         xt.conversation_id AS conversation_id,
         xi.inbox_handle AS inbox_handle
       FROM xmtp_topics xt
@@ -1498,6 +1668,7 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
       endpoint: row.endpoint,
       p256dh: row.p256dh,
       auth: row.auth,
+      deliveryKind: row.delivery_kind,
       conversationId: row.conversation_id ?? undefined,
       inboxHandle: row.inbox_handle ?? undefined,
     }));
@@ -1538,6 +1709,8 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
         deliveryAttemptId,
         appId: match.appId,
         subscriptionId: match.subscriptionId,
+        xmtpSubscriptionId: match.xmtpSubscriptionId,
+        deliveryKind: match.deliveryKind,
         payload,
         source: 'xmtp',
       }, { contentType: 'json' });
@@ -1835,11 +2008,29 @@ export async function getPushJobContext(
   const [app, subscriptionRow] = await Promise.all([
     getAppById(db, job.appId),
     db.prepare(`
-      SELECT * FROM subscriptions
-      WHERE id = ? AND app_id = ? AND disabled_at IS NULL
-        AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      SELECT subscription.* FROM subscriptions subscription
+      WHERE subscription.id = ? AND subscription.app_id = ?
+        AND subscription.disabled_at IS NULL
+        AND (
+          subscription.expires_at IS NULL
+          OR subscription.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        )
+        AND (
+          ? IS NULL
+          OR EXISTS (
+            SELECT 1 FROM xmtp_subscriptions registration
+            WHERE registration.id = ?
+              AND registration.subscription_id = subscription.id
+              AND registration.active = 1
+          )
+        )
     `)
-      .bind(job.subscriptionId, job.appId)
+      .bind(
+        job.subscriptionId,
+        job.appId,
+        job.xmtpSubscriptionId ?? null,
+        job.xmtpSubscriptionId ?? null
+      )
       .first<SubscriptionRow>(),
   ]);
 
@@ -1874,6 +2065,7 @@ export async function claimPushDeliveryAttempt(
         attempts = attempts + 1,
         updated_at = ?
     WHERE id = ? AND app_id = ? AND subscription_id = ?
+      AND (? IS NULL OR xmtp_subscription_id = ?)
       AND (
         status = 'queued'
         OR (status = 'processing' AND updated_at <= ?)
@@ -1884,6 +2076,8 @@ export async function claimPushDeliveryAttempt(
     job.deliveryAttemptId,
     job.appId,
     job.subscriptionId,
+    job.xmtpSubscriptionId ?? null,
+    job.xmtpSubscriptionId ?? null,
     staleBefore
   ).first<{ attempts: number }>();
 
@@ -1892,17 +2086,26 @@ export async function claimPushDeliveryAttempt(
   }
 
   const row = await db.prepare(`
-    SELECT app_id, subscription_id, status, updated_at
+    SELECT app_id, subscription_id, xmtp_subscription_id, status, updated_at
     FROM delivery_attempts
     WHERE id = ?
   `).bind(job.deliveryAttemptId).first<{
     app_id: string;
     subscription_id: string;
+    xmtp_subscription_id: string | null;
     status: string;
     updated_at: string;
   }>();
 
-  if (!row || row.app_id !== job.appId || row.subscription_id !== job.subscriptionId) {
+  if (
+    !row
+    || row.app_id !== job.appId
+    || row.subscription_id !== job.subscriptionId
+    || (
+      job.xmtpSubscriptionId !== undefined
+      && row.xmtp_subscription_id !== job.xmtpSubscriptionId
+    )
+  ) {
     return { outcome: 'ignored' };
   }
   if (row.status === 'processing') {
@@ -1949,8 +2152,16 @@ export async function releasePushDeliveryAttempt(
   pushStatus?: number
 ): Promise<boolean> {
   const timestamp = nowIso();
+  const identityBindings = [
+    job.deliveryAttemptId,
+    job.appId,
+    job.subscriptionId,
+    ...(job.xmtpSubscriptionId ? [job.xmtpSubscriptionId] : []),
+    generation,
+  ];
   const predicate = `
     id = ? AND app_id = ? AND subscription_id = ?
+    ${job.xmtpSubscriptionId ? 'AND xmtp_subscription_id = ?' : ''}
     AND status = 'processing' AND attempts = ?
   `;
   const results = await db.batch([
@@ -1965,10 +2176,7 @@ export async function releasePushDeliveryAttempt(
     `).bind(
       timestamp.slice(0, 10),
       timestamp,
-      job.deliveryAttemptId,
-      job.appId,
-      job.subscriptionId,
-      generation
+      ...identityBindings
     ),
     db.prepare(`
       UPDATE delivery_attempts
@@ -1981,10 +2189,7 @@ export async function releasePushDeliveryAttempt(
       deliveryAttemptErrorCategory('failed', pushStatus),
       pushStatus ?? null,
       timestamp,
-      job.deliveryAttemptId,
-      job.appId,
-      job.subscriptionId,
-      generation
+      ...identityBindings
     ),
   ]);
   return Number(results[1]?.meta.changes ?? 0) === 1;
@@ -2011,16 +2216,21 @@ export async function completePushDeliveryAttempt(
     : update.status === 'failed'
       ? 'failed_count'
       : 'expired_count';
+  const identityBindings = [
+    job.deliveryAttemptId,
+    job.appId,
+    job.subscriptionId,
+    ...(job.xmtpSubscriptionId ? [job.xmtpSubscriptionId] : []),
+    generation,
+  ];
   const predicate = `
     id = ? AND app_id = ? AND subscription_id = ?
+    ${job.xmtpSubscriptionId ? 'AND xmtp_subscription_id = ?' : ''}
     AND status = 'processing' AND attempts = ?
   `;
   const mutation = update.deleteAttempt
     ? db.prepare(`DELETE FROM delivery_attempts WHERE ${predicate}`).bind(
-        job.deliveryAttemptId,
-        job.appId,
-        job.subscriptionId,
-        generation
+        ...identityBindings
       )
     : db.prepare(`
         UPDATE delivery_attempts
@@ -2034,10 +2244,7 @@ export async function completePushDeliveryAttempt(
         deliveryAttemptErrorCategory(update.status, update.pushStatus),
         update.pushStatus ?? null,
         timestamp,
-        job.deliveryAttemptId,
-        job.appId,
-        job.subscriptionId,
-        generation
+        ...identityBindings
       );
   const results = await db.batch([
     db.prepare(`
@@ -2051,10 +2258,7 @@ export async function completePushDeliveryAttempt(
     `).bind(
       timestamp.slice(0, 10),
       timestamp,
-      job.deliveryAttemptId,
-      job.appId,
-      job.subscriptionId,
-      generation
+      ...identityBindings
     ),
     mutation,
   ]);
@@ -2180,13 +2384,21 @@ export async function getActiveSubscriptionEndpointKeys(
   db: D1Database,
   appId: string,
   endpoint: string
-): Promise<{ p256dh: string; auth: string } | null> {
+): Promise<{
+  p256dh: string;
+  auth: string;
+  delivery_kind: 'web_push' | 'https_callback';
+} | null> {
   return db.prepare(`
-    SELECT p256dh, auth
+    SELECT p256dh, auth, delivery_kind
     FROM subscriptions
     WHERE app_id = ? AND endpoint = ? AND disabled_at IS NULL
       AND (expires_at IS NULL OR expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-  `).bind(appId, endpoint).first<{ p256dh: string; auth: string }>();
+  `).bind(appId, endpoint).first<{
+    p256dh: string;
+    auth: string;
+    delivery_kind: 'web_push' | 'https_callback';
+  }>();
 }
 
 export async function countActiveXmtpRegistrations(
@@ -2234,6 +2446,7 @@ export interface ActiveXmtpRegistrationState {
   endpoint: string;
   p256dh: string;
   auth: string;
+  deliveryKind: 'web_push' | 'https_callback';
   diagnosticTokenHash?: string;
 }
 
@@ -2247,6 +2460,7 @@ export async function getActiveXmtpRegistrationState(
       s.endpoint,
       s.p256dh,
       s.auth,
+      s.delivery_kind,
       xs.diagnostic_token_hash
     FROM xmtp_subscriptions xs
     JOIN xmtp_identities xi ON xi.id = xs.identity_id
@@ -2262,6 +2476,7 @@ export async function getActiveXmtpRegistrationState(
     endpoint: string;
     p256dh: string;
     auth: string;
+    delivery_kind: 'web_push' | 'https_callback';
     diagnostic_token_hash: string | null;
   }>();
   if (!row) return null;
@@ -2269,6 +2484,7 @@ export async function getActiveXmtpRegistrationState(
     endpoint: row.endpoint,
     p256dh: row.p256dh,
     auth: row.auth,
+    deliveryKind: row.delivery_kind,
     diagnosticTokenHash: row.diagnostic_token_hash ?? undefined,
   };
 }
@@ -2850,6 +3066,7 @@ export async function enqueueXmtpDiagnosticTest(
       deliveryAttemptId,
       appId: registration.app_id,
       subscriptionId: registration.subscription_id,
+      xmtpSubscriptionId: registration.xmtp_subscription_id,
       payload,
       source: 'diagnostic',
     });

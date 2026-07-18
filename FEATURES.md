@@ -21,6 +21,8 @@ Properties:
 - D1 migration 0006 and the matching public-app Worker contract are deployed
   in production. A disposable end-to-end public-app canary passed on
   2026-07-15.
+- D1 migration 0007 and the version-5 public XMTP/callback Worker contract are
+  implemented and require an ordered migration-before-Worker rollout.
 - Node.js 22 or newer is required by the pinned Wrangler toolchain.
 
 Test Criteria:
@@ -41,7 +43,7 @@ Description:
   XMTP registrations, topics, HMAC epochs, listener changes, delivery attempts,
   and rate-limit records. Migration 0006 adds hashed app and enrollment
   capabilities, public profiles, DNS state, and short-retained daily UTC usage
-  counters.
+  counters. Migration 0007 distinguishes Web Push and HTTPS callback targets.
 - Listener routes are keyed by `(appId, installationId)`, not only by an inbox,
   installation, endpoint, or topic.
 
@@ -77,8 +79,8 @@ Stability: deployed
 Description:
 - Anyone can create an isolated app with `POST /api/apps`; there is no account,
   wallet signature, approval, or operator provisioning step.
-- General-public apps support generic Web Push only. XMTP enrollment is held
-  back until an installation-ownership proof contract exists.
+- General-public apps support generic Web Push and installation-proved XMTP
+  availability alerts through Web Push or signed HTTPS callbacks.
 - The no-store creation response returns the raw `appSecret` exactly once,
   alongside the app id, name, public VAPID key, and creation timestamp.
 - Only the SHA-256 digest of that credential is stored. Each public app has one
@@ -91,6 +93,7 @@ Public Routes:
 
 Authenticated Management Routes (`X-API-Key: <appSecret>`):
 - `POST /api/apps/{appId}/enrollment-ticket`
+- `POST /api/apps/{appId}/xmtp/enrollment-ticket`
 - `GET /api/apps/{appId}/stats`
 - `PATCH /api/apps/{appId}/profile`
 - `GET /api/apps/{appId}/domain`
@@ -120,22 +123,25 @@ Test Criteria:
 - [x] App-id path mismatch is rejected
 - [x] Migration 0006 and the matching Worker are deployed to production
 
-## Public Generic Enrollment And Planned XMTP Ownership Proof
+## Public Generic And Installation-Proved XMTP Enrollment
 
-Stability: generic enrollment deployed; general-public XMTP unavailable and planned
+Stability: generic enrollment deployed; XMTP and callback contract implemented for version-5 rollout
 
 Generic Routes:
 - `POST /api/apps/{appId}/enrollment-ticket` (app secret)
 - `POST /api/apps/{appId}/subscriptions`
 - `DELETE /api/apps/{appId}/subscriptions`
 
-Unavailable XMTP Paths (HTTP `403`):
+XMTP Routes:
+- `POST /api/apps/{appId}/xmtp/enrollment-ticket` (app secret)
 - `POST /api/apps/{appId}/xmtp/subscriptions`
 - `DELETE /api/apps/{appId}/xmtp/subscriptions`
+- `POST /api/apps/{appId}/xmtp/status`
+- `DELETE /api/apps/{appId}/xmtp/callback-routes` (app secret and opaque handle)
+
+Legacy Operator Paths Still Forbidden To Public Credentials:
 - `POST /api/xmtp/registrations` with a public-app credential
 - `DELETE /api/xmtp/registrations` with a public-app credential
-- `POST /api/apps/{appId}/xmtp/status` with a public-app credential
-- `POST /api/apps/{appId}/xmtp/status/test` with a public-app credential
 
 Properties:
 - Browser enrollment does not receive or require the app secret.
@@ -147,10 +153,24 @@ Properties:
 - Generic subscription upsert returns a fresh 256-bit management token in a
   no-store response. Only its hash is persisted; bearer possession is required
   to delete the endpoint.
-- General-public XMTP enrollment is not shipped. A public app secret proves app
-  control, but it does not prove ownership of a claimed XMTP installation.
-  Public-app XMTP paths therefore fail closed with HTTP `403` until a future
-  enrollment contract supplies that proof.
+- Public XMTP ticket mint binds the app id and canonical exact registration for
+  five minutes. Submission proves possession of the raw Ed25519 installation
+  key: its hex must equal installationId and its signature over the ticket must
+  verify. This proves key possession, not third-party inbox-directory membership.
+- Exact ticket/proof replays are idempotent and cannot redirect a route or
+  rotate/expose its management receipt. Replacement also requires the current
+  receipt in `X-Vapid-Party-Management-Token`; deletion uses it as Bearer auth.
+- XMTP delivery is canonical Web Push or an HTTPS callback on the app's exact
+  verified domain. Ticket mint automatically refreshes a stale prior TXT proof
+  under bounded DNS limits. Existing routes do not expire with DNS freshness.
+- Callback bodies contain only a stable opaque delivery id and inbox handle.
+  They are signed by the app VAPID P-256 key using raw IEEE-P1363 ECDSA and are
+  at-least-once. Terminal 404/410 removes only the matched logical route and its
+  HMAC snapshot; a shared physical callback remains for other handles.
+- A successful callback registration makes one app/handle's newest proved
+  installation win only after activation; failed proof preserves the old route.
+  The trusted revoke-by-handle route provides receipt-free idempotent opt-out
+  while preserving callback URLs shared by other handles.
 - Provider endpoint keys are immutable while active, and a physical endpoint
   cannot silently cross from another enrollment contract.
 - Public enrollment applies per-app and secret-salted scoped abuse backstops and
@@ -166,10 +186,13 @@ Test Criteria:
 - [x] Browser code can discover VAPID and enroll with an endpoint-bound ticket,
   without receiving the app secret
 - [x] Generic refresh rotates its management capability and deletion requires it
-- [x] Public-app XMTP paths and public credentials on operator XMTP routes return 403
+- [x] Public credentials remain unable to bypass proof through operator routes
 - [x] Cross-contract, endpoint-key, and provider-host conflicts fail
 - [x] Public app enrollment routes are deployed to production
-- [ ] Cryptographic installation ownership proof and general-public XMTP enrollment
+- [x] Cryptographic installation-key possession proof and general-public XMTP enrollment
+- [x] Exact verified-domain signed callback delivery with terminal cleanup
+- [x] Successful-installation replacement and trusted idempotent handle opt-out
+- [ ] Migration 0007, matching Worker, and a disposable production canary
 
 ## Verified App Profiles And Public Leaderboard
 
@@ -196,8 +219,9 @@ DNS Contract:
   created with the opt-in flag set remains hidden until its DNS binding verifies.
 
 Honesty Boundary:
-- `providerAcceptedLast7Days` is a count of Web Push provider acceptances. It is
-  not a count of notifications delivered to, displayed by, or read in browsers.
+- `providerAcceptedLast7Days` is a compatibility count of downstream target
+  acceptances: Web Push provider responses or callback HTTP 2xx. It is not a
+  count of notifications displayed or read.
 - Empty or unverified apps are not padded with pretend data or sample usage.
 
 Test Criteria:
@@ -213,14 +237,15 @@ Stability: deployed
 Description:
 - `GET /api/apps/{appId}/stats` returns the app's profile, active subscription
   and XMTP topology counts, and aggregate daily UTC event counters.
-- XMTP fields remain in the shared response schema for operator compatibility;
-  they are empty for general-public apps because public XMTP enrollment is unavailable.
+- XMTP fields report active topology for operator and installation-proved
+  general-public routes.
 - `todayUtc` is the current UTC date. `last7DaysUtc` is today plus the six prior
   UTC dates, not a rolling 168-hour window.
 
 Counter Semantics:
 - `queued`: selected recipient jobs accepted into the Queue.
-- `providerAccepted`: send attempts accepted by a Web Push provider.
+- `providerAccepted`: compatibility field for Web Push provider acceptance or
+  callback HTTP 2xx target acceptance.
 - `failed`: failed provider attempts, including retries.
 - `expired`: terminal invalid-endpoint outcomes.
 - Diagnostic tests are excluded. Counters are retained for eight UTC dates and
@@ -306,8 +331,8 @@ Security Properties:
 - The former unsigned wallet bearer/admin routes are removed and return 404.
 - The reserved Converge generic API routes fail closed without a configured
   `CONVERGE_API_KEY`; its public compatibility routes remain independent.
-- Public-app credentials receive HTTP `403` on operator XMTP routes. General
-  XMTP onboarding remains planned until installation ownership can be proven.
+- Public-app credentials receive HTTP `403` on operator XMTP routes. Public XMTP
+  onboarding uses the separate app-scoped ticket plus installation-proof routes.
 - Operator registration returns an app-scoped diagnostic receipt. Status and
   test calls require both the owning `X-API-Key` and that bearer receipt, and
   the receipt is checked against the app id in the path.

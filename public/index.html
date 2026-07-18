@@ -206,7 +206,7 @@
                     <th scope="col">Rank</th>
                     <th scope="col">App</th>
                     <th scope="col">Last-verified domain</th>
-                    <th scope="col">Provider accepted · 7 days</th>
+                    <th scope="col">Target accepted · 7 days</th>
                   </tr>
                 </thead>
                 <tbody data-leaderboard-body></tbody>
@@ -230,7 +230,8 @@
           <p class="section-summary">
             The restricted Converge and operator XMTP integrations keep matching, app
             routing, and browser delivery inside a Cloudflare Worker, D1, Queue, and
-            singleton Container. Newly created public apps use generic Web Push only.
+            singleton Container. Public apps can register XMTP routes only after an
+            installation-key proof, then choose Web Push or a signed HTTPS callback.
           </p>
         </div>
 
@@ -247,8 +248,8 @@
           </article>
           <article class="pipeline-step">
             <span class="step-number">03 / Deliver</span>
-            <h3>Queue a minimal Web Push hint</h3>
-            <p>The browser receives opaque activity, then the XMTP client performs authoritative sync.</p>
+            <h3>Queue a minimal availability hint</h3>
+            <p>Web Push or a signed callback receives opaque activity, then the XMTP client performs authoritative sync.</p>
           </article>
         </div>
 
@@ -257,8 +258,8 @@
           <p>
             XMTP SubscribeAll has no durable replay cursor. A listener restart or disconnect can
             miss a push hint; the receiving XMTP inbox remains the source of truth.
-            General-public XMTP enrollment also remains unavailable until installation
-            ownership can be proven.
+            Public enrollment proves possession of the claimed installation key, but
+            normal XMTP client sync remains authoritative after every hint.
           </p>
         </aside>
 
@@ -278,8 +279,8 @@
               XMTP match. Global health cannot prove one app route matched.
             </li>
             <li>
-              <strong>Confirm provider delivery separately.</strong>
-              A diagnostic canary proves the Web Push provider and browser path only; it does not
+              <strong>Confirm target delivery separately.</strong>
+              A diagnostic canary proves a provider path only; it does not
               prove that a real XMTP message matched the registration.
             </li>
           </ol>

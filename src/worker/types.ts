@@ -25,6 +25,7 @@ export interface SubscriptionRecord {
   endpoint: string;
   p256dh: string;
   auth: string;
+  deliveryKind: 'web_push' | 'https_callback';
   userId?: string;
   channelId?: string;
   metadata: Record<string, unknown>;
@@ -94,6 +95,7 @@ export interface XmtpTopicMatch {
   endpoint: string;
   p256dh: string;
   auth: string;
+  deliveryKind: 'web_push' | 'https_callback';
   conversationId?: string;
   inboxHandle?: string;
 }
@@ -104,6 +106,8 @@ export interface PushQueueJob {
   deliveryAttemptId: string;
   appId: string;
   subscriptionId: string;
+  xmtpSubscriptionId?: string;
+  deliveryKind?: 'web_push' | 'https_callback';
   payload: PushPayload;
   source: 'generic' | 'xmtp' | 'diagnostic';
 }

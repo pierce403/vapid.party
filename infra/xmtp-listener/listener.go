@@ -210,9 +210,7 @@ func (l *xmtpListener) processEnvelope(ctx context.Context, envelope *messageAPI
 		if err := l.delivery.Deliver(ctx, event); err != nil {
 			l.logger.Error(
 				"delivery ingest failed",
-				"installation_id", target.InstallationID,
-				"topic", target.Topic,
-				"error", err,
+				"failure_category", "upstream_unavailable",
 			)
 		}
 	}

@@ -24,7 +24,7 @@ export function corsHeaders(): HeadersInit {
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, X-Internal-Token, X-Vapid-Party-Diagnostics',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-API-Key, X-Internal-Token, X-Vapid-Party-Diagnostics, X-Vapid-Party-Management-Token',
   };
 }
 

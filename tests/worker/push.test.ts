@@ -36,6 +36,7 @@ function subscription(id: string): SubscriptionRecord {
     endpoint: `https://push.example/${id}`,
     p256dh: `p256dh-${id}`,
     auth: `auth-${id}`,
+    deliveryKind: 'web_push',
     metadata: {},
     createdAt: '2026-07-14T00:00:00.000Z',
     updatedAt: '2026-07-14T00:00:00.000Z',

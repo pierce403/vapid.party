@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { Miniflare } from 'miniflare';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  D1XmtpStore,
   insertDeliveryAttempt,
   reconcileStalePushDeliveryAttempts,
 } from '../../src/worker/db';
@@ -11,12 +12,18 @@ import {
   pushRetryDelaySeconds,
 } from '../../src/worker/queue';
 import { handleTerminalPushFailure, sendWebPush } from '../../src/worker/push';
+import { sendXmtpCallback } from '../../src/worker/callback';
 import type { Env, PushQueueJob } from '../../src/worker/types';
+import type { NormalizedXmtpRegistration } from '../../src/worker/core';
 import { migrationStatements } from './migration-helpers';
 
 vi.mock('../../src/worker/push', () => ({
   sendWebPush: vi.fn(),
   handleTerminalPushFailure: vi.fn(),
+}));
+
+vi.mock('../../src/worker/callback', () => ({
+  sendXmtpCallback: vi.fn(),
 }));
 
 const p256dh = `B${'A'.repeat(86)}`;
@@ -58,6 +65,7 @@ describe('at-least-once Queue delivery claims', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     vi.mocked(sendWebPush).mockResolvedValue({ success: true, statusCode: 201 });
+    vi.mocked(sendXmtpCallback).mockResolvedValue({ success: true, statusCode: 204 });
     vi.mocked(handleTerminalPushFailure).mockResolvedValue(undefined);
 
     miniflare = new Miniflare({
@@ -75,6 +83,7 @@ describe('at-least-once Queue delivery claims', () => {
       '../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql',
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
+      '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
     ]) await applyMigration(db, path);
 
     await db.batch([
@@ -96,6 +105,14 @@ describe('at-least-once Queue delivery claims', () => {
         INSERT INTO subscriptions (id, app_id, endpoint, p256dh, auth)
         VALUES ('sub-b', 'app-b', 'https://fcm.googleapis.com/fcm/send/b', ?, ?)
       `).bind(p256dh, auth),
+      db.prepare(`
+        INSERT INTO subscriptions (
+          id, app_id, endpoint, p256dh, auth, delivery_kind, metadata
+        ) VALUES (
+          'sub-callback', 'app-a', 'https://notify.example.com/api/xmtp', '', '',
+          'https_callback', '{"source":"xmtp","deliveryKind":"https_callback"}'
+        )
+      `),
     ]);
 
     env = {
@@ -137,6 +154,28 @@ describe('at-least-once Queue delivery claims', () => {
       ackAll: vi.fn(),
       retryAll: vi.fn(),
     } as unknown as MessageBatch<PushQueueJob>, env);
+  }
+
+  function callbackRegistration(
+    inboxId: string,
+    installationId: string,
+    inboxHandle: string
+  ): NormalizedXmtpRegistration {
+    return {
+      endpoint: 'https://notify.example.com/api/xmtp',
+      p256dh: '',
+      auth: '',
+      deliveryKind: 'https_callback',
+      inboxId,
+      installationId,
+      inboxHandle,
+      preferences: { minimalPayloadOnly: true, plaintextPreview: false },
+      topics: [{
+        topic: `/xmtp/mls/1/g-${'44'.repeat(16)}/proto`,
+        algorithm: 'hmac-sha256',
+        hmacKeys: [{ epoch: '7', key: 'AQID' }],
+      }],
+    };
   }
 
   async function attempt(id: string): Promise<{
@@ -184,6 +223,137 @@ describe('at-least-once Queue delivery claims', () => {
     expect(message.retry).not.toHaveBeenCalled();
     expect(await attempt(job.deliveryAttemptId)).toBeNull();
     expect(await usage()).toEqual({ queued: 1, sent: 1, failed: 0, expired: 0 });
+  });
+
+  it('routes XMTP callback jobs through the signed callback adapter', async () => {
+    const deliveryAttemptId = await insertDeliveryAttempt(db, {
+      appId: 'app-a',
+      subscriptionId: 'sub-callback',
+      eventType: 'xmtp.new_message',
+      payload: {},
+    });
+    const job: PushQueueJob = {
+      deliveryAttemptId,
+      appId: 'app-a',
+      subscriptionId: 'sub-callback',
+      payload: { type: 'xmtp.new_message', inboxHandle: 'opaque_callback' },
+      source: 'xmtp',
+    };
+    const message = queueMessage(job);
+
+    await consume(message);
+
+    expect(sendXmtpCallback).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'app-a' }),
+      expect.objectContaining({ id: 'sub-callback', deliveryKind: 'https_callback' }),
+      job.payload,
+      deliveryAttemptId
+    );
+    expect(sendWebPush).not.toHaveBeenCalled();
+    expect(message.ack).toHaveBeenCalledOnce();
+    expect(await attempt(deliveryAttemptId)).toMatchObject({ status: 'sent', push_status: 204 });
+  });
+
+  it('terminally removes only one logical callback route sharing a physical URL', async () => {
+    const store = new D1XmtpStore(env, 'app-a');
+    const firstInstallation = '11'.repeat(32);
+    const secondInstallation = '22'.repeat(32);
+    const topic = `/xmtp/mls/1/g-${'44'.repeat(16)}/proto`;
+    await store.upsertRegistration(callbackRegistration(
+      'aa'.repeat(32),
+      firstInstallation,
+      'opaque_callback_first'
+    ));
+    await store.upsertRegistration(callbackRegistration(
+      'bb'.repeat(32),
+      secondInstallation,
+      'opaque_callback_second'
+    ));
+    const routes = await db.prepare(`
+      SELECT
+        registration.id AS xmtp_subscription_id,
+        identity.installation_id,
+        registration.subscription_id
+      FROM xmtp_subscriptions registration
+      JOIN xmtp_identities identity ON identity.id = registration.identity_id
+      WHERE identity.app_id = ? AND registration.active = 1
+      ORDER BY identity.installation_id
+    `).bind('app-a').all<{
+      xmtp_subscription_id: string;
+      installation_id: string;
+      subscription_id: string;
+    }>();
+    expect(routes.results).toHaveLength(2);
+    const firstRoute = routes.results[0];
+    const secondRoute = routes.results[1];
+    expect(firstRoute?.subscription_id).toBe(secondRoute?.subscription_id);
+
+    const firstAttempt = await insertDeliveryAttempt(db, {
+      appId: 'app-a',
+      subscriptionId: firstRoute.subscription_id,
+      xmtpSubscriptionId: firstRoute.xmtp_subscription_id,
+      eventType: 'xmtp.new_message',
+      payload: {},
+    });
+    vi.mocked(sendXmtpCallback).mockResolvedValueOnce({
+      success: false,
+      statusCode: 410,
+      terminal: true,
+      error: 'gone',
+    });
+    const firstJob: PushQueueJob = {
+      deliveryAttemptId: firstAttempt,
+      appId: 'app-a',
+      subscriptionId: firstRoute.subscription_id,
+      xmtpSubscriptionId: firstRoute.xmtp_subscription_id,
+      deliveryKind: 'https_callback',
+      payload: { inboxHandle: 'opaque_callback_first' },
+      source: 'xmtp',
+    };
+    await consume(queueMessage(firstJob));
+
+    expect(handleTerminalPushFailure).not.toHaveBeenCalled();
+    expect(await db.prepare(`
+      SELECT COUNT(*) AS count FROM xmtp_identities WHERE app_id = ?
+    `).bind('app-a').first()).toEqual({ count: 1 });
+    expect(await db.prepare(`
+      SELECT COUNT(*) AS count FROM subscriptions
+      WHERE app_id = ? AND delivery_kind = 'https_callback'
+    `).bind('app-a').first()).toEqual({ count: 1 });
+    const token = await db.prepare(`
+      SELECT delivery_token FROM xmtp_listener_installations
+      WHERE app_id = ? AND installation_id = ?
+    `).bind('app-a', secondInstallation).first<{ delivery_token: string }>();
+    expect(await store.findDeliveryMatches(
+      secondInstallation,
+      topic,
+      token?.delivery_token as string
+    )).toHaveLength(1);
+
+    const secondAttempt = await insertDeliveryAttempt(db, {
+      appId: 'app-a',
+      subscriptionId: secondRoute.subscription_id,
+      xmtpSubscriptionId: secondRoute.xmtp_subscription_id,
+      eventType: 'xmtp.new_message',
+      payload: {},
+    });
+    const secondJob: PushQueueJob = {
+      deliveryAttemptId: secondAttempt,
+      appId: 'app-a',
+      subscriptionId: secondRoute.subscription_id,
+      xmtpSubscriptionId: secondRoute.xmtp_subscription_id,
+      deliveryKind: 'https_callback',
+      payload: { inboxHandle: 'opaque_callback_second' },
+      source: 'xmtp',
+    };
+    await consume(queueMessage(secondJob));
+    expect(sendXmtpCallback).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: secondRoute.subscription_id }),
+      secondJob.payload,
+      secondAttempt
+    );
+    expect(await attempt(secondAttempt)).toMatchObject({ status: 'sent' });
   });
 
   it.each(['sent', 'expired'] as const)(

@@ -36,6 +36,24 @@ export function normalizeAppDomain(input: string): string | null {
   return hostname;
 }
 
+export function normalizeVerifiedCallbackUrl(input: string, verifiedDomain: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    return null;
+  }
+  if (
+    url.protocol !== 'https:'
+    || (url.port && url.port !== '443')
+    || url.username
+    || url.password
+    || url.hash
+    || url.hostname.toLowerCase() !== verifiedDomain.toLowerCase()
+  ) return null;
+  return url.toString();
+}
+
 export function appDomainRecord(
   domain: string,
   appId: string,

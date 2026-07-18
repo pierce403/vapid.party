@@ -40,6 +40,7 @@ function registration(topics: NormalizedXmtpRegistration['topics'] = [
     endpoint: 'https://push.example/diagnostic-endpoint',
     p256dh: `B${'A'.repeat(86)}`,
     auth: 'A'.repeat(22),
+    deliveryKind: 'web_push',
     expirationTime: null,
     inboxId,
     installationId,
@@ -124,6 +125,7 @@ describe('privacy-safe XMTP registration diagnostics', () => {
       '../../migrations/d1/0004_app_scoped_xmtp_identity_contract.sql',
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
+      '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
     ]) await applyMigration(db, path);
 
     await db.prepare(`
@@ -852,7 +854,7 @@ describe('privacy-safe XMTP registration diagnostics', () => {
     expect(before).toMatchObject({
       user_id: null,
       channel_id: null,
-      metadata: '{"source":"xmtp"}',
+      metadata: '{"source":"xmtp","deliveryKind":"web_push"}',
     });
     const rejected = await postJson(
       '/api/xmtp/subscriptions',

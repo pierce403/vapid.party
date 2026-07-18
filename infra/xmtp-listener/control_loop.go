@@ -27,7 +27,7 @@ func runControlLoop(
 		} else {
 			err = applyCurrentDeltas(ctx, client, index)
 			if shouldReloadSnapshot(err) {
-				logger.Warn("control state requires a fresh full snapshot", "error", err)
+				logger.Warn("control state requires a fresh full snapshot")
 				loaded = false
 				continue
 			}
@@ -35,7 +35,7 @@ func runControlLoop(
 
 		if err != nil {
 			state.markControlError(errorControlUnavailable)
-			logger.Error("registration control sync failed", "error", err)
+			logger.Error("registration control sync failed")
 			if !sleepWithContext(ctx, backoff) {
 				return
 			}

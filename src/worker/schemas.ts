@@ -262,6 +262,95 @@ const XmtpNestedTopicSchema = z.object({
   }
 });
 
+const PublicXmtpWebPushDeliverySchema = z.object({
+  kind: z.literal('web_push'),
+  subscription: PushSubscriptionSchema,
+}).strict();
+
+const PublicXmtpCallbackDeliverySchema = z.object({
+  kind: z.literal('https_callback'),
+  url: z.string().url().max(2048),
+}).strict();
+
+export const PublicXmtpDeliverySchema = z.discriminatedUnion('kind', [
+  PublicXmtpWebPushDeliverySchema,
+  PublicXmtpCallbackDeliverySchema,
+]);
+
+export const PublicXmtpRegistrationSchema = z.object({
+  version: z.literal(1),
+  identity: z.object({
+    inboxId: XmtpHex32Schema,
+    installationId: XmtpHex32Schema,
+  }).strict(),
+  delivery: PublicXmtpDeliverySchema,
+  xmtp: z.object({
+    env: z.literal('production'),
+    topics: z.array(XmtpNestedTopicSchema).min(1).max(400),
+    topicSource: z.literal('conversations.hmacKeys'),
+  }).strict(),
+  notification: z.object({
+    inboxHandle: OpaqueInboxHandleSchema,
+  }).strict(),
+  preferences: XmtpPreferencesSchema,
+  registeredAt: z.string().datetime({ offset: true }),
+}).strict().superRefine(validateXmtpRegistrationCost);
+
+export const PublicXmtpEnrollmentTicketRequestSchema = z.object({
+  registration: PublicXmtpRegistrationSchema,
+}).strict();
+
+const Ed25519PublicKeySchema = z.string().max(128).superRefine((value, ctx) => {
+  const bytes = base64UrlToBytes(value);
+  if (!bytes || bytes.length !== 32) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'proof.publicKey must be a 32-byte base64url Ed25519 public key',
+    });
+  }
+});
+
+const Ed25519SignatureSchema = z.string().max(256).superRefine((value, ctx) => {
+  const bytes = base64UrlToBytes(value);
+  if (!bytes || bytes.length !== 64) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'proof.signature must be a 64-byte base64url Ed25519 signature',
+    });
+  }
+});
+
+export const PublicXmtpRegistrationRequestSchema = z.object({
+  registration: PublicXmtpRegistrationSchema,
+  proof: z.object({
+    publicKey: Ed25519PublicKeySchema,
+    signature: Ed25519SignatureSchema,
+  }).strict(),
+}).strict();
+
+export const PublicXmtpDeleteRequestSchema = z.object({
+  version: z.literal(1),
+  identity: z.object({
+    inboxId: XmtpHex32Schema,
+    installationId: XmtpHex32Schema,
+  }).strict(),
+  delivery: z.discriminatedUnion('kind', [
+    z.object({
+      kind: z.literal('web_push'),
+      endpoint: WebPushEndpoint,
+    }).strict(),
+    z.object({
+      kind: z.literal('https_callback'),
+      url: z.string().url().max(2048),
+    }).strict(),
+  ]),
+  deletedAt: z.string().datetime({ offset: true }),
+}).strict();
+
+export const CallbackRoutesDeleteRequestSchema = z.object({
+  inboxHandle: OpaqueInboxHandleSchema,
+}).strict();
+
 const XmtpNestedSubscriptionRequestObjectSchema = z.object({
   version: z.literal(1),
   app: z.object({
@@ -431,4 +520,7 @@ export type XmtpDeleteSubscriptionRequestInput = z.infer<typeof XmtpDeleteSubscr
 export type XmtpDeliveryRequestInput = z.infer<typeof XmtpDeliveryRequestSchema>;
 export type GenericXmtpSubscriptionRequestInput = z.infer<typeof GenericXmtpSubscriptionRequestSchema>;
 export type GenericXmtpDeleteSubscriptionRequestInput = z.infer<typeof GenericXmtpDeleteSubscriptionRequestSchema>;
+export type PublicXmtpRegistrationInput = z.infer<typeof PublicXmtpRegistrationSchema>;
+export type PublicXmtpRegistrationRequestInput = z.infer<typeof PublicXmtpRegistrationRequestSchema>;
+export type PublicXmtpDeleteRequestInput = z.infer<typeof PublicXmtpDeleteRequestSchema>;
 export type XmtpListenerStatusInput = z.infer<typeof XmtpListenerStatusSchema>;

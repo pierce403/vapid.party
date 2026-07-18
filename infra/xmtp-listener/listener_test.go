@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -140,6 +142,49 @@ func TestProcessEnvelopeHonorsShouldPushFalse(t *testing.T) {
 	listener.processEnvelope(context.Background(), testGroupEnvelope(t, []byte("data"), nil, false))
 	if requests != 0 {
 		t.Fatalf("delivery requests = %d; want 0", requests)
+	}
+}
+
+func TestProcessEnvelopeFailureLogOmitsRouteMetadata(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	index := newIndexManager()
+	if err := index.Replace("1", []registration{
+		testRegistration("converge", "token-a", []byte("key-a")),
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	state := newRuntimeState()
+	state.markControlSync(time.Now())
+	state.markDeliveryReady(time.Now())
+	var logs bytes.Buffer
+	listener := newXMTPListener(
+		config{
+			ControlMaxStaleness:       time.Minute,
+			StreamStartupGrace:        time.Minute,
+			StreamMaxIdle:             time.Minute,
+			DeliveryProbeMaxStaleness: time.Minute,
+		},
+		index,
+		state,
+		&deliveryClient{url: server.URL, token: "secret", maxAttempts: 1, httpClient: server.Client()},
+		slog.New(slog.NewTextHandler(&logs, nil)),
+	)
+
+	listener.processEnvelope(context.Background(), testGroupEnvelope(t, []byte("data"), nil, true))
+	output := logs.String()
+	if !strings.Contains(output, "delivery ingest failed") {
+		t.Fatalf("missing coarse delivery failure log: %s", output)
+	}
+	for _, forbidden := range []string{testInstallationID, testGroupTopic, "installation_id", "topic"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("delivery failure log leaked route metadata %q: %s", forbidden, output)
+		}
 	}
 }
 

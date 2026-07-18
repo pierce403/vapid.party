@@ -425,6 +425,7 @@ describe('official XMTP HTTP delivery', () => {
     endpoint: 'https://push.example/subscription/1',
     p256dh,
     auth,
+    deliveryKind: 'web_push',
     conversationId: 'safe-conversation',
     inboxHandle: 'opaque_inbox_1',
   };

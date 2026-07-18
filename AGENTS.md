@@ -72,8 +72,19 @@ These instructions apply to the entire repository.
 - `maxSubscriptions` is enforced on subscribe requests.
 - `maxNotificationsPerMinute` is enforced on send requests.
 - `maxNotificationsPerDay` is enforced with a UTC-day window.
-- Anonymous apps support generic Web Push only. Every app-scoped public XMTP
-  route must remain `403` until installation ownership can be proved.
+- Public XMTP enrollment requires an exact-body app ticket plus Ed25519
+  installation-key possession proof. Never re-open the legacy app-secret-only
+  XMTP route or let an exact proof replay rotate its management receipt.
+- HTTPS callback targets must remain on the exact fresh verified app domain at
+  ticket mint. Stale prior verification may be re-resolved under bounded DNS
+  limits, but existing routes must not silently expire when freshness ages out.
+- Callback signatures use the app VAPID P-256 key and raw 64-byte IEEE-P1363
+  ECDSA, not DER. A terminal 404/410 must remove the full logical route and its
+  topic/HMAC state, not only stop one attempt; it must retain a physical callback
+  URL while another logical route uses it.
+- For HTTPS callbacks, `(appId, inboxHandle)` is one recipient. Activate a newly
+  proved installation before retiring older installations with that handle, and
+  keep trusted receipt-free handle revocation app-secret-only and private.
 - Public generic sends are bounded to 100 recipients, a 3,000-byte JSON
   payload, and an estimated 240,000-byte single Queue batch. Shared public
   relay ceilings are 2,000 selected deliveries/minute and 100,000/day.
@@ -113,6 +124,12 @@ These instructions apply to the entire repository.
   keys or fan out registrations across apps, even for a shared installation or
   topic. Listener-to-Worker delivery is a minimal authenticated hint and must
   never include XMTP ciphertext, sender identity, or message content.
+- Listener logs must not include installation ids, exact topics, HMAC material,
+  delivery tokens, or raw index-validation errors that can embed those values.
+  Keep route failures categorical and diagnose route specifics in local tests.
+- Internal listener control and delivery clients carry bearer capabilities and
+  must never follow HTTP redirects; only the exact configured Worker URLs are
+  valid trust targets.
 - Production has D1 migrations 0001 through 0006, the public-app Worker
   contract, Queue, and the singleton custom Go XMTP listener Container
   deployed. The disposable public-app canary passed on 2026-07-15. Public
@@ -121,6 +138,8 @@ These instructions apply to the entire repository.
   minutes 31 seconds across the former ten-minute idle cutoff. `SubscribeAll`
   has no listener replay cursor, so push can still have restart/disconnect gaps
   while normal XMTP client sync remains authoritative.
+- Migration 0007 adds delivery-kind labeling for public XMTP callbacks and must
+  be applied before deploying the matching version-5 Worker.
 - XMTP stream traffic is background work and does not renew the Container
   helper's `sleepAfter` timer. Preserve the listener's `onActivityExpired()`
   renewal override; the minute `startAndWaitForPorts()` cron starts and checks

@@ -35,7 +35,7 @@ func newDeliveryClient(cfg config) *deliveryClient {
 		url:         cfg.DeliveryURL,
 		token:       cfg.IngestToken,
 		maxAttempts: cfg.DeliveryAttempts,
-		httpClient:  &http.Client{Timeout: cfg.HTTPTimeout},
+		httpClient:  newInternalHTTPClient(cfg.HTTPTimeout),
 	}
 }
 

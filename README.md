@@ -26,11 +26,12 @@ one-time secret handling, VAPID discovery, ticketed browser enrollment,
 private stats, DNS mismatch and leaderboard exclusion, management-token
 unsubscribe, secret rotation, and complete app deletion. Post-cutover health
 then remained `deliveryReady`, listener `ready`, and bridge `synced` across
-multiple control polls without restarting the Container. The general-public
-launch is for generic Web Push only. General-public XMTP enrollment remains
-unavailable until the relay can verify installation ownership
-cryptographically; the existing Converge compatibility and
-operator-provisioned XMTP flows remain separate.
+multiple control polls without restarting the Container. Migration `0007` and
+the version-5 Worker contract add general-public XMTP enrollment with an
+exact-registration ticket, Ed25519 installation-key proof, and either Web Push
+or a signed HTTPS callback delivery target. Apply the migration before rolling
+out that Worker. The existing Converge compatibility and operator-provisioned
+XMTP flows remain separate.
 
 Verified production behavior includes:
 
@@ -58,8 +59,9 @@ D1 is the durable source of truth for apps, VAPID keys, physical Web Push
 subscriptions, logical XMTP registrations, topics, HMAC epochs, app-scoped
 listener routes, control-plane deltas, and short-retained operational delivery
 state. Migration `0006` adds hashed app and enrollment capabilities, public app
-profiles, DNS verification state, and daily UTC usage counters. The container
-keeps only a validated in-memory routing index.
+profiles, DNS verification state, and daily UTC usage counters. Migration
+`0007` labels each physical delivery target as Web Push or HTTPS callback. The
+container keeps only a validated in-memory routing index.
 
 An XMTP listener route is keyed by `(appId, installationId)`. Each app route has
 its own opaque delivery token and HMAC set, so two apps can register the same
@@ -74,7 +76,7 @@ The container:
 4. Evaluates `shouldPush`, topic HMACs, and sender suppression separately for
    each app route.
 5. Sends the Worker a minimal authenticated delivery hint; the Worker resolves
-   the app-scoped token and enqueues Web Push.
+   the app-scoped token and enqueues Web Push or a signed HTTPS callback.
 
 The listener never stores PostgreSQL state and never sends XMTP ciphertext,
 sender identity, or message content to the Worker.
@@ -183,10 +185,14 @@ Apply migrations before deploying the Worker/container contract:
 
 ```bash
 npm run db:migrate:remote
-npx wrangler deploy --containers-rollout=none
+npx wrangler deploy --containers-rollout=immediate
 npx wrangler queues update vapid-party-push-send --message-retention-period-secs 3600
 npx wrangler queues update vapid-party-push-dlq --message-retention-period-secs 3600
 ```
+
+This version changes both the Worker contract and the Go XMTP listener image,
+so `--containers-rollout=none` is not sufficient. Use `none` only for a later
+Worker-only release whose `infra/xmtp-listener/` tree is unchanged.
 
 The one-hour settings bound transient generic notification copy to one hour in
 the source queue and, after a failed source delivery is moved, one hour in the
@@ -200,7 +206,8 @@ continuous XMTP delivery ready based only on a successful container start.
 
 ## Public App Provisioning
 
-Status: deployed in production with migration `0006`.
+Status: version-4 provisioning is deployed; version-5 XMTP enrollment requires
+migration `0007` and the matching Worker.
 
 Anyone can create an isolated app without an account, wallet, or operator step:
 
@@ -249,12 +256,50 @@ future. High service safety ceilings keep persistent anonymous state finite at
 25,000 public apps and 250,000 public subscription rows; capacity exhaustion
 fails closed instead of accepting partial state.
 
-General-public XMTP enrollment is not shipped. Requests under
-`/api/apps/{appId}/xmtp/*`, and public-app credentials presented to
-`/api/xmtp/registrations`, receive HTTP `403`. Those routes stay unavailable
-until a future contract can prove that the caller owns the claimed XMTP
-installation. Creating a public app does not grant access to the existing
-Converge or operator-provisioned XMTP compatibility flows.
+General-public XMTP enrollment uses these app-scoped routes:
+
+- `POST /api/apps/{appId}/xmtp/enrollment-ticket` with `X-API-Key`
+- `POST /api/apps/{appId}/xmtp/subscriptions` with a ticket and installation proof
+- `DELETE /api/apps/{appId}/xmtp/subscriptions` with its management receipt
+- `POST /api/apps/{appId}/xmtp/status` with its management receipt
+- `DELETE /api/apps/{appId}/xmtp/callback-routes` with `X-API-Key` and `{inboxHandle}`
+
+The trusted app server mints a five-minute `vpxet1` ticket for one exact
+canonical registration. The XMTP client signs the exact returned
+`signatureText` (equal to the token in version 1) with
+`Client.signWithInstallationKey`. The public submit includes the unpadded
+base64url raw 32-byte Ed25519 installation public key and raw 64-byte signature.
+The key's lowercase hex must equal `identity.installationId`; the Worker verifies
+the signature over the UTF-8 ticket. This proves installation-key possession,
+not that a third-party inbox directory currently maps that installation to the
+claimed inbox id.
+
+The registration can use a canonical browser Web Push subscription or
+`{"kind":"https_callback","url":"https://..."}`. A callback must be HTTPS on
+the app's exact configured domain with a current TXT binding to the app id and
+VAPID key. Ticket mint automatically re-resolves a stale previously verified
+binding under the existing global DNS backstop and a 30/minute app refresh
+limit. Existing callback routes continue delivering when that seven-day
+eligibility check ages out; freshness is re-established when a new callback
+ticket is minted, so routes do not silently expire.
+
+First enrollment returns a route receipt whose digest is stored. An exact
+ticket/proof replay is idempotent and does not rotate or expose that receipt.
+Endpoint replacement also sends the current receipt in
+`X-Vapid-Party-Management-Token`. Deletion uses
+`Authorization: Bearer <receipt>`. The ticket route is server-only; public
+submit, deletion, and status responses permit CORS. Public-app credentials on
+the legacy `/api/xmtp/registrations` operator route still receive HTTP `403`.
+For trusted-server opt-out, callback-routes removes every logical callback route
+for the app's opaque handle without requiring a receipt or installation id. It
+is idempotent, private/no-CORS, and preserves a shared callback URL while any
+other handle remains active.
+
+For callback delivery, one `(appId, inboxHandle)` is one downstream recipient.
+A newly proven installation becomes active before older callback installations
+with the same handle are removed. Therefore a failed ticket or proof preserves
+the working route, while a successful Mini installation rotation retires the
+abandoned identity, topics, HMAC keys, and receipt without an extra prompt.
 
 Anonymous creation and public enrollment have high abuse-backstop rate limits,
 with client scopes stored only as secret-salted digests rather than raw IP
@@ -263,6 +308,38 @@ addresses. The service accepts at most 5,000 anonymous app-creation attempts,
 state mutations per minute. Successful app creation remains capped at 600 per
 minute, and DNS verification has a 600-check service backstop per minute.
 These limits are not a signup gate or a claim of unlimited service.
+
+### Signed XMTP callback delivery
+
+For a callback route, vapid.party posts only:
+
+```json
+{
+  "version": 1,
+  "type": "xmtp.message_available",
+  "deliveryId": "opaque-stable-queue-attempt-id",
+  "inboxHandle": "opaque-app-route-handle"
+}
+```
+
+The body contains no XMTP topic, inbox id, installation id, sender, ciphertext,
+or message content. Headers are `Vapid-Party-App-Id`,
+`Vapid-Party-Delivery-Id`, `Vapid-Party-Timestamp` (Unix seconds), and
+`Vapid-Party-Signature: v1=<base64url>`. Verify the signature with the 65-byte
+uncompressed P-256 key from `GET /api/apps/{appId}/vapid-public-key`. The signed
+UTF-8 bytes are exactly
+`timestamp + "\n" + deliveryId + "\n" + rawBody`. Cloudflare Web Crypto returns
+the ECDSA P-256/SHA-256 signature as raw 64-byte IEEE-P1363 `r || s`, not DER;
+the header uses unpadded base64url.
+
+Queue delivery is at least once and `deliveryId` is stable across retries, so
+receivers should deduplicate it. A 2xx response accepts the event. HTTP 408,
+425, 429, 5xx, timeouts, and network failures retry with bounded backoff; redirects
+are never followed. HTTP 404 or 410 is terminal and deletes only the matched
+logical XMTP route, its topic/HMAC snapshot, listener entry, and management
+receipt. The physical callback URL remains while another logical route uses it,
+and is removed after the last route. Other 4xx responses fail that attempt
+without deleting the route.
 
 ## App Management, DNS, And Stats
 
@@ -281,11 +358,11 @@ secret, returns a new raw secret once, and is limited to ten rotations per UTC
 day. App deletion cascades through credentials, profiles, enrollment, and usage
 state.
 
-Stats report active generic subscriptions, shared-schema XMTP topology fields,
-and daily UTC event counters for today and the last seven UTC dates. Public
-apps cannot create XMTP routes, so those topology fields remain empty under the
-general-public contract. `queued` means a job was enqueued;
-`providerAccepted` means the Web Push provider accepted a send; `failed` counts
+Stats report active generic and XMTP subscriptions, XMTP topology fields, and
+daily UTC event counters for today and the last seven UTC dates. `queued` means
+a job was enqueued; the compatibility field `providerAccepted` means the
+configured downstream target accepted the request (a Web Push provider response
+or callback HTTP 2xx); `failed` counts
 failed send attempts, including retries; and `expired` is a terminal invalid
 endpoint. Provider acceptance does not prove a browser or OS displayed, read,
 or even received a notification. Counters retain eight UTC dates, exclude
@@ -371,8 +448,8 @@ The Converge compatibility route does not cryptographically prove ownership of
 the claimed XMTP inbox or installation on first registration. An attacker who
 can guess those identifiers can first-claim a route and cause a denial of
 service until the operator removes it. This bounded compatibility path is for
-Converge only. General-public XMTP enrollment remains unavailable until an
-installation-ownership proof contract exists.
+Converge only. General-public apps use the separate ticket plus installation-key
+proof contract above.
 
 ### Private route diagnostics
 
@@ -406,8 +483,8 @@ Only pre-provisioned operator apps may also use:
 - `POST /api/apps/{appId}/xmtp/status`
 - `POST /api/apps/{appId}/xmtp/status/test`
 
-Public-app credentials receive HTTP `403` on these XMTP routes until
-installation ownership proof is available. For operator-provisioned apps, the
+Public-app credentials receive HTTP `403` on these legacy operator XMTP routes;
+public apps instead use their installation-proved app-scoped routes. For operator-provisioned apps, the
 registration body matches Converge's nested version-1 body except that it omits
 the fixed `app` field; the API key selects the app. Registration data, listener
 routes, delivery tokens, VAPID keys, and queued delivery remain app-isolated.

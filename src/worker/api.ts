@@ -16,6 +16,7 @@ import {
   deleteApp,
   discardQueuedDeliveryAttempts,
   disableSubscription,
+  disableXmtpCallbackRoutesByHandle,
   D1XmtpStore,
   enqueueXmtpDiagnosticTest,
   ensureConvergeApp,
@@ -24,6 +25,7 @@ import {
   getActiveSubscriptionEndpointKeys,
   getAppById,
   getAppPublicProfile,
+  getFreshVerifiedAppDomain,
   getAppUsageStats,
   getPublicLeaderboard,
   getSubscriptionManagementState,
@@ -66,8 +68,12 @@ import {
 import {
   PublicAppCreateSchema,
   PublicAppUpdateSchema,
+  CallbackRoutesDeleteRequestSchema,
   PublicSubscribeSchema,
   PublicSubscriptionDeleteSchema,
+  PublicXmtpEnrollmentTicketRequestSchema,
+  PublicXmtpRegistrationRequestSchema,
+  type PublicXmtpRegistrationInput,
   SendNotificationSchema,
   SubscribeSchema,
   XmtpListenerStatusSchema,
@@ -77,17 +83,23 @@ import {
   appDomainRecord,
   DnsLookupError,
   normalizeAppDomain,
+  normalizeVerifiedCallbackUrl,
   verifyAppDomainRecord,
 } from './domain';
 import {
   enrollmentTicketMatches,
   issueEnrollmentTicket,
+  issueXmtpEnrollmentTicket,
   type PublicSubscriptionTicketInput,
+  xmtpEnrollmentTicketMatches,
+  xmtpInstallationProofMatches,
 } from './enrollment-ticket';
 import {
   isAllowedPublicWebPushEndpoint,
   normalizeGenericXmtpDelete,
   normalizeGenericXmtpRegistration,
+  normalizeOwnedPublicXmtpDelete,
+  normalizeOwnedPublicXmtpRegistration,
   normalizePublicXmtpDelete,
   normalizePublicXmtpRegistration,
   relayXmtpDelivery,
@@ -182,10 +194,19 @@ function privateNoStore(response: Response): Response {
 }
 
 function diagnosticReceipt(request: Request): string | null {
+  const explicit = request.headers.get('x-vapid-party-management-token');
+  if (explicit && /^[A-Za-z0-9_-]{43}$/.test(explicit)) return explicit;
   const authorization = request.headers.get('authorization');
   if (!authorization?.startsWith('Bearer ')) return null;
   const receipt = authorization.slice(7);
   return /^[A-Za-z0-9_-]{43}$/.test(receipt) ? receipt : null;
+}
+
+function xmtpEnrollmentTicket(request: Request): string | null {
+  const authorization = request.headers.get('authorization');
+  if (!authorization?.startsWith('Bearer ')) return null;
+  const token = authorization.slice(7);
+  return token.length <= 2048 && token.startsWith('vpxet1.') ? token : null;
 }
 
 function enrollmentTicket(request: Request): string | null {
@@ -203,6 +224,78 @@ function conflictResponse(message: string): Response {
   return noStore(errorResponse(message, ERROR_CODES.CONFLICT, 409));
 }
 
+async function validatePublicXmtpDelivery(
+  env: Env,
+  app: AppRecord,
+  registration: PublicXmtpRegistrationInput,
+  options: { refreshStaleVerification?: boolean } = {}
+): Promise<Response | null> {
+  if (registration.delivery.kind === 'web_push') {
+    return isAllowedPublicWebPushEndpoint(registration.delivery.subscription.endpoint)
+      ? null
+      : errorResponse(
+          'The push endpoint is not a supported browser Web Push provider',
+          ERROR_CODES.VALIDATION_ERROR,
+          422
+        );
+  }
+
+  let verifiedDomain = await getFreshVerifiedAppDomain(env.DB, app);
+  if (!verifiedDomain && options.refreshStaleVerification) {
+    const profile = await getAppPublicProfile(env.DB, app.id);
+    if (profile.domain && profile.domainVerificationStatus === 'verified') {
+      const serviceRate = await checkAndIncrementPublicRateLimit(
+        env.DB,
+        'global',
+        'public-domain-verify',
+        600
+      );
+      const appRate = await checkAndIncrementRateLimit(
+        env.DB,
+        app.id,
+        'callback-domain-refresh',
+        30
+      );
+      if (!serviceRate.allowed || !appRate.allowed) {
+        return errorResponse(
+          'Callback domain verification refresh is temporarily rate limited',
+          ERROR_CODES.RATE_LIMIT_EXCEEDED,
+          429,
+          !serviceRate.allowed ? serviceRate : appRate
+        );
+      }
+      const status = await verifyAppDomainRecord(
+        profile.domain,
+        app.id,
+        app.vapidPublicKey
+      );
+      await recordAppDomainVerification(
+        env.DB,
+        app.id,
+        profile.domain,
+        status,
+        status === 'verified' ? app.vapidPublicKey : undefined
+      );
+      if (status === 'verified') verifiedDomain = profile.domain;
+    }
+  }
+  if (!verifiedDomain) {
+    return errorResponse(
+      'Verify this app domain before registering an HTTPS callback',
+      ERROR_CODES.CONFLICT,
+      409
+    );
+  }
+  if (!normalizeVerifiedCallbackUrl(registration.delivery.url, verifiedDomain)) {
+    return errorResponse(
+      'The callback must be HTTPS on the app exact verified domain',
+      ERROR_CODES.VALIDATION_ERROR,
+      422
+    );
+  }
+  return null;
+}
+
 async function authorizePublicRegistrationMutation(
   request: Request,
   env: Env,
@@ -211,7 +304,9 @@ async function authorizePublicRegistrationMutation(
 ): Promise<{ receipt?: string; exists: boolean } | Response> {
   const endpointKeys = await getActiveSubscriptionEndpointKeys(env.DB, appId, input.endpoint);
   if (endpointKeys && (
-    endpointKeys.p256dh !== input.p256dh || endpointKeys.auth !== input.auth
+    endpointKeys.p256dh !== input.p256dh
+    || endpointKeys.auth !== input.auth
+    || endpointKeys.delivery_kind !== input.deliveryKind
   )) {
     return conflictResponse(
       'An active Web Push endpoint cannot be reused with different subscription keys'
@@ -224,7 +319,8 @@ async function authorizePublicRegistrationMutation(
   const receipt = diagnosticReceipt(request);
   const exactSubscription = state.endpoint === input.endpoint
     && state.p256dh === input.p256dh
-    && state.auth === input.auth;
+    && state.auth === input.auth
+    && state.deliveryKind === input.deliveryKind;
   if (state.diagnosticTokenHash) {
     if (receipt && await diagnosticReceiptMatches(receipt, state.diagnosticTokenHash)) {
       // Preserve a valid capability across endpoint replacement so a client
@@ -500,17 +596,27 @@ async function handlePublicXmtpMutation(
     registration: (input: unknown) => NormalizedXmtpRegistration;
     deletion: (input: unknown) => { endpoint: string; inboxId: string; installationId: string };
   },
-  options: { alwaysIssueReceipt?: boolean; diagnosticBasePath?: string } = {}
+  options: {
+    alwaysIssueReceipt?: boolean;
+    issueReceiptOnCreate?: boolean;
+    diagnosticBasePath?: string;
+    body?: unknown;
+    allowHttpsCallback?: boolean;
+  } = {}
 ): Promise<Response> {
   const method = request.method.toUpperCase();
   const store = new D1XmtpStore(env, app.id);
   const attemptLimited = await enforcePublicMutationAttemptRate(request, env, app.id);
   if (attemptLimited) return attemptLimited;
-  const body = await readJsonBounded(request, 2_000_000);
+  const body = options.body ?? await readJsonBounded(request, 2_000_000);
 
   if (method === 'POST') {
     const input = normalizers.registration(body);
-    if (!isAllowedPublicWebPushEndpoint(input.endpoint)) {
+    if (
+      input.deliveryKind === 'web_push'
+        ? !isAllowedPublicWebPushEndpoint(input.endpoint)
+        : !options.allowHttpsCallback
+    ) {
       return noStore(errorResponse(
         'The push endpoint is not a supported browser Web Push provider',
         ERROR_CODES.VALIDATION_ERROR,
@@ -591,6 +697,7 @@ async function handlePublicXmtpMutation(
         const result = await store.upsertRegistration(input, {
           diagnosticReceipt: authorized.receipt,
           issueDiagnosticReceipt: options.alwaysIssueReceipt
+            || (options.issueReceiptOnCreate && !authorized.exists)
             || diagnosticsRequested(request)
             || Boolean(authorized.receipt),
           immutableEndpointKeys: true,
@@ -649,11 +756,11 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
       route.suffix === '/domain/verify'
       || route.suffix === '/secret/rotate'
       || route.suffix === '/enrollment-ticket'
-      || route.suffix === '/xmtp/subscriptions'
-      || route.suffix === '/xmtp/status'
-      || route.suffix === '/xmtp/status/test'
+      || route.suffix === '/xmtp/enrollment-ticket'
     ))
-    || (method === 'DELETE' && route.suffix === '')
+    || (method === 'DELETE' && (
+      route.suffix === '' || route.suffix === '/xmtp/callback-routes'
+    ))
   ));
   const isAppSensitiveRequest = pathname === '/api/apps'
     || Boolean(route && route.suffix !== '/vapid-public-key');
@@ -800,6 +907,52 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
         ));
       }
       return privateNoStore(jsonResponse(await issueEnrollmentTicket(app, input)));
+    }
+
+    if (route && method === 'POST' && route.suffix === '/xmtp/enrollment-ticket') {
+      const app = await requirePathApiApp(request, env, route.appId);
+      if (app instanceof Response) return privateNoStore(app);
+      const serviceRate = await checkAndIncrementPublicRateLimit(
+        env.DB,
+        'global',
+        'public-state-mutation-global',
+        PUBLIC_STATE_MUTATIONS_PER_MINUTE
+      );
+      if (!serviceRate.allowed) {
+        return privateNoStore(errorResponse(
+          'Public app mutation capacity is temporarily rate limited',
+          ERROR_CODES.RATE_LIMIT_EXCEEDED,
+          429,
+          serviceRate
+        ));
+      }
+      const rate = await checkAndIncrementRateLimit(
+        env.DB,
+        app.id,
+        'public-xmtp-enrollment-ticket',
+        300
+      );
+      if (!rate.allowed) {
+        return privateNoStore(errorResponse(
+          'XMTP enrollment ticket rate limit exceeded',
+          ERROR_CODES.RATE_LIMIT_EXCEEDED,
+          429,
+          rate
+        ));
+      }
+      const input = PublicXmtpEnrollmentTicketRequestSchema.parse(
+        await readJsonBounded(request, 2_000_000)
+      );
+      const invalidDelivery = await validatePublicXmtpDelivery(
+        env,
+        app,
+        input.registration,
+        { refreshStaleVerification: true }
+      );
+      if (invalidDelivery) return privateNoStore(invalidDelivery);
+      return privateNoStore(jsonResponse(
+        await issueXmtpEnrollmentTicket(app, input.registration)
+      ));
     }
 
     if (route && route.suffix === '/subscriptions' && (method === 'POST' || method === 'DELETE')) {
@@ -969,11 +1122,158 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
       }
     }
 
+    if (route && method === 'DELETE' && route.suffix === '/xmtp/callback-routes') {
+      const app = await requirePathApiApp(request, env, route.appId);
+      if (app instanceof Response) return privateNoStore(app);
+      const serviceRate = await checkAndIncrementPublicRateLimit(
+        env.DB,
+        'global',
+        'public-state-mutation-global',
+        PUBLIC_STATE_MUTATIONS_PER_MINUTE
+      );
+      if (!serviceRate.allowed) {
+        return privateNoStore(errorResponse(
+          'Public app mutation capacity is temporarily rate limited',
+          ERROR_CODES.RATE_LIMIT_EXCEEDED,
+          429,
+          serviceRate
+        ));
+      }
+      const rate = await checkAndIncrementRateLimit(
+        env.DB,
+        app.id,
+        'callback-route-revoke',
+        120
+      );
+      if (!rate.allowed) {
+        return privateNoStore(errorResponse(
+          'Callback route revocation rate limit exceeded',
+          ERROR_CODES.RATE_LIMIT_EXCEEDED,
+          429,
+          rate
+        ));
+      }
+      const input = CallbackRoutesDeleteRequestSchema.parse(
+        await readJsonBounded(request, 16_384)
+      );
+      const lockToken = await acquireAppSubscriptionMutationLock(env.DB, app.id);
+      if (!lockToken) {
+        return privateNoStore(conflictResponse(
+          'This app is already updating its subscription state'
+        ));
+      }
+      try {
+        return privateNoStore(jsonResponse({
+          disabled: await disableXmtpCallbackRoutesByHandle(
+            env.DB,
+            app.id,
+            input.inboxHandle
+          ),
+        }));
+      } finally {
+        await releaseAppSubscriptionLockSafely(env, app.id, lockToken);
+      }
+    }
+
+    if (route && route.suffix === '/xmtp/subscriptions'
+      && (method === 'POST' || method === 'DELETE')) {
+      const verificationServiceRate = await checkAndIncrementPublicRateLimit(
+        env.DB,
+        'global',
+        'public-subscription-verification-global',
+        PUBLIC_VERIFICATIONS_PER_MINUTE
+      );
+      if (!verificationServiceRate.allowed) {
+        return noStore(errorResponse(
+          'Public XMTP verification capacity is temporarily rate limited',
+          ERROR_CODES.RATE_LIMIT_EXCEEDED,
+          429,
+          verificationServiceRate
+        ));
+      }
+      const preAuthScope = await publicRequestScopeHash(request, env);
+      const preAuthRate = await checkAndIncrementPublicRateLimit(
+        env.DB,
+        preAuthScope,
+        method === 'POST' ? 'xmtp-proof-verify' : 'xmtp-delete-verify',
+        600
+      );
+      if (!preAuthRate.allowed) {
+        return noStore(errorResponse(
+          'Public XMTP verification rate limit exceeded',
+          ERROR_CODES.RATE_LIMIT_EXCEEDED,
+          429,
+          preAuthRate
+        ));
+      }
+      const [app, publicApp] = await Promise.all([
+        getAppById(env.DB, route.appId),
+        isPublicApp(env.DB, route.appId),
+      ]);
+      if (!app || !publicApp) {
+        return noStore(errorResponse('App not found', ERROR_CODES.APP_NOT_FOUND, 404));
+      }
+      const body = await readJsonBounded(request, 2_000_000);
+
+      if (method === 'POST') {
+        const input = PublicXmtpRegistrationRequestSchema.parse(body);
+        const ticket = xmtpEnrollmentTicket(request);
+        if (
+          !ticket
+          || !await xmtpEnrollmentTicketMatches(ticket, app, input.registration)
+          || !await xmtpInstallationProofMatches(ticket, input.registration, input.proof)
+        ) {
+          return noStore(errorResponse(
+            'Missing, expired, mismatched, or invalid XMTP installation proof',
+            ERROR_CODES.UNAUTHORIZED,
+            401
+          ));
+        }
+        const invalidDelivery = await validatePublicXmtpDelivery(env, app, input.registration);
+        if (invalidDelivery) return noStore(invalidDelivery);
+        return handlePublicXmtpMutation(
+          request,
+          env,
+          app,
+          {
+            registration: normalizeOwnedPublicXmtpRegistration,
+            deletion: normalizeOwnedPublicXmtpDelete,
+          },
+          {
+            body: input.registration,
+            allowHttpsCallback: true,
+            issueReceiptOnCreate: true,
+            diagnosticBasePath: `/api/apps/${app.id}/xmtp`,
+          }
+        );
+      }
+
+      return handlePublicXmtpMutation(
+        request,
+        env,
+        app,
+        {
+          registration: normalizeOwnedPublicXmtpRegistration,
+          deletion: normalizeOwnedPublicXmtpDelete,
+        },
+        {
+          body,
+          allowHttpsCallback: true,
+          diagnosticBasePath: `/api/apps/${app.id}/xmtp`,
+        }
+      );
+    }
+
     if (route && method === 'POST' && (
       route.suffix === '/xmtp/status' || route.suffix === '/xmtp/status/test'
     )) {
-      const app = await requireOperatorPathApiApp(request, env, route.appId);
-      if (app instanceof Response) return privateNoStore(app);
+      const publicApp = await isPublicApp(env.DB, route.appId);
+      const app = publicApp
+        ? await getAppById(env.DB, route.appId)
+        : await requireOperatorPathApiApp(request, env, route.appId);
+      const protect = publicApp ? noStore : privateNoStore;
+      if (!app) return protect(errorResponse('App not found', ERROR_CODES.APP_NOT_FOUND, 404));
+      if (app instanceof Response) return protect(app);
 
       const kind = route.suffix.endsWith('/test') ? 'test' : 'status';
       const attemptLimited = await enforceDiagnosticAttemptRate(
@@ -982,11 +1282,11 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
         app.id,
         kind
       );
-      if (attemptLimited) return privateNoStore(attemptLimited);
+      if (attemptLimited) return protect(attemptLimited);
 
       const receipt = diagnosticReceipt(request);
       if (!receipt) {
-        return privateNoStore(errorResponse(
+        return protect(errorResponse(
           'Missing or invalid diagnostic receipt',
           ERROR_CODES.UNAUTHORIZED,
           401
@@ -996,13 +1296,13 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
       if (kind === 'status') {
         const status = await getXmtpDiagnosticStatus(env, receipt, app.id);
         if (!status) {
-          return privateNoStore(errorResponse(
+          return protect(errorResponse(
             'Diagnostic receipt is not active',
             ERROR_CODES.NOT_FOUND,
             404
           ));
         }
-        return privateNoStore(jsonResponse(status));
+        return protect(jsonResponse(status));
       }
 
       const scopedRateLimit = await scopedPublicRateLimitAction(
@@ -1017,22 +1317,17 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
         app.id
       );
       if (!result) {
-        return privateNoStore(errorResponse(
+        return protect(errorResponse(
           'Diagnostic receipt is not active',
           ERROR_CODES.NOT_FOUND,
           404
         ));
       }
-      return privateNoStore(jsonResponse(result, 202));
+      return protect(jsonResponse(result, 202));
     }
 
     if (route && route.suffix.startsWith('/xmtp/')) {
-      const response = errorResponse(
-        'General-public XMTP enrollment is disabled until installation ownership proof is available',
-        ERROR_CODES.FORBIDDEN,
-        403
-      );
-      return method === 'POST' ? privateNoStore(response) : noStore(response);
+      return noStore(errorResponse('Not found', ERROR_CODES.NOT_FOUND, 404));
     }
 
     if (route && method === 'GET' && route.suffix === '/stats') {

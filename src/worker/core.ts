@@ -6,6 +6,8 @@ import {
   XmtpDeleteSubscriptionRequestSchema,
   XmtpDeliveryRequestSchema,
   XmtpSubscriptionRequestSchema,
+  PublicXmtpDeleteRequestSchema,
+  PublicXmtpRegistrationSchema,
 } from './schemas';
 import type { PushPayload, XmtpTopicMatch } from './types';
 
@@ -25,6 +27,7 @@ export interface NormalizedXmtpRegistration {
   endpoint: string;
   p256dh: string;
   auth: string;
+  deliveryKind: 'web_push' | 'https_callback';
   expirationTime?: number | null;
   inboxId: string;
   installationId: string;
@@ -144,6 +147,7 @@ export function normalizeXmtpRegistration(input: unknown): NormalizedXmtpRegistr
       endpoint: parsed.subscription.endpoint,
       p256dh: parsed.subscription.keys.p256dh,
       auth: parsed.subscription.keys.auth,
+      deliveryKind: 'web_push',
       expirationTime: parsed.subscription.expirationTime,
       inboxId: parsed.identity.inboxId,
       installationId: parsed.identity.installationId,
@@ -203,6 +207,7 @@ export function normalizeXmtpRegistration(input: unknown): NormalizedXmtpRegistr
     endpoint: subscription.endpoint,
     p256dh: subscription.keys.p256dh,
     auth: subscription.keys.auth,
+    deliveryKind: 'web_push',
     expirationTime: subscription.expirationTime,
     inboxId: parsed.inboxId,
     installationId: parsed.installationId,
@@ -224,6 +229,7 @@ export function normalizeGenericXmtpRegistration(input: unknown): NormalizedXmtp
     endpoint: parsed.subscription.endpoint,
     p256dh: parsed.subscription.keys.p256dh,
     auth: parsed.subscription.keys.auth,
+    deliveryKind: 'web_push',
     expirationTime: parsed.subscription.expirationTime,
     inboxId: parsed.identity.inboxId,
     installationId: parsed.identity.installationId,
@@ -245,12 +251,55 @@ export function normalizePublicXmtpRegistration(input: unknown): NormalizedXmtpR
     endpoint: parsed.subscription.endpoint,
     p256dh: parsed.subscription.keys.p256dh,
     auth: parsed.subscription.keys.auth,
+    deliveryKind: 'web_push',
     expirationTime: parsed.subscription.expirationTime,
     inboxId: parsed.identity.inboxId,
     installationId: parsed.identity.installationId,
     inboxHandle: parsed.notification.inboxHandle,
     preferences: parsed.preferences,
     topics: [...topics.values()],
+  };
+}
+
+export function normalizeOwnedPublicXmtpRegistration(input: unknown): NormalizedXmtpRegistration {
+  const parsed = PublicXmtpRegistrationSchema.parse(input);
+  const topics = new Map<string, NormalizedXmtpTopic>();
+  for (const topic of parsed.xmtp.topics) {
+    addTopic(topics, { topic: topic.topic, hmacKeys: topic.hmacKeys });
+  }
+  const webPush = parsed.delivery.kind === 'web_push'
+    ? parsed.delivery.subscription
+    : undefined;
+  const endpoint = parsed.delivery.kind === 'web_push'
+    ? parsed.delivery.subscription.endpoint
+    : parsed.delivery.url;
+
+  return {
+    endpoint,
+    p256dh: webPush?.keys.p256dh ?? '',
+    auth: webPush?.keys.auth ?? '',
+    deliveryKind: parsed.delivery.kind,
+    expirationTime: webPush?.expirationTime,
+    inboxId: parsed.identity.inboxId,
+    installationId: parsed.identity.installationId,
+    inboxHandle: parsed.notification.inboxHandle,
+    preferences: parsed.preferences,
+    topics: [...topics.values()],
+  };
+}
+
+export function normalizeOwnedPublicXmtpDelete(input: unknown): {
+  endpoint: string;
+  inboxId: string;
+  installationId: string;
+} {
+  const parsed = PublicXmtpDeleteRequestSchema.parse(input);
+  return {
+    endpoint: parsed.delivery.kind === 'web_push'
+      ? parsed.delivery.endpoint
+      : parsed.delivery.url,
+    inboxId: parsed.identity.inboxId,
+    installationId: parsed.identity.installationId,
   };
 }
 
