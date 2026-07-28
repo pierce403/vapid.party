@@ -1,11 +1,13 @@
 import type { AppRecord } from './types';
 import type { PublicXmtpRegistrationInput } from './schemas';
 import { base64UrlToBytes, bytesToBase64Url, bytesToHex, sha256Hex } from './encoding';
+import { ed25519ph } from '@noble/curves/ed25519.js';
 
 const TICKET_VERSION = 'vpet1';
 const XMTP_TICKET_VERSION = 'vpxet1';
 const TICKET_TTL_SECONDS = 5 * 60;
 const encoder = new TextEncoder();
+const XMTP_PUBLIC_SIGNATURE_CONTEXT = encoder.encode('PUBLIC SIGNATURE CONTEXT');
 
 export interface PublicSubscriptionTicketInput {
   endpoint: string;
@@ -231,19 +233,17 @@ export async function xmtpInstallationProofMatches(
     || signatureBytes.length !== 64
   ) return false;
 
+  // libxmtp's Client.signWithInstallationKey uses RFC 8032 Ed25519ph with
+  // this public context, not WebCrypto's plain Ed25519 operation.
   try {
-    const publicKey = await crypto.subtle.importKey(
-      'raw',
-      publicKeyBytes,
-      { name: 'Ed25519' },
-      false,
-      ['verify']
-    );
-    return await crypto.subtle.verify(
-      { name: 'Ed25519' },
-      publicKey,
+    return ed25519ph.verify(
       signatureBytes,
-      encoder.encode(token)
+      encoder.encode(token),
+      publicKeyBytes,
+      {
+        context: XMTP_PUBLIC_SIGNATURE_CONTEXT,
+        zip215: false,
+      }
     );
   } catch {
     return false;

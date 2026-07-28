@@ -91,7 +91,8 @@ These instructions apply to the entire repository.
 - Hard anonymous-state ceilings are 25,000 public apps, 250,000 public
   subscription rows, and 150 subscriptions per public app. D1 triggers are the
   concurrency-safe enforcement layer; API checks provide earlier responses.
-- Node.js 22+ is required by Wrangler 4.110.0 and the matching Miniflare/Worker-types toolchain.
+- Node.js 22+ is required by the pinned Wrangler 4.114.0 and Miniflare
+  4.20260722.0 toolchain.
 - `npm audit --audit-level=low` is a release gate and must remain at zero findings.
 - `npm audit` does not cover `infra/xmtp-listener/go.mod`; reconcile open Go
   Dependabot alerts separately, then rerun the listener race tests and `go vet`.

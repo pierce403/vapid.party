@@ -316,9 +316,11 @@ paths:
         Authorization is the five-minute vpxet1 ticket minted for the exact
         registration. proof.publicKey is the raw 32-byte Ed25519 installation
         key encoded as base64url; its lowercase hex must equal installationId.
-        proof.signature is Client.signWithInstallationKey(ticket) encoded as
-        base64url. Replaying one exact proof is an idempotent refresh and cannot
-        redirect the route or rotate its management receipt. Endpoint changes
+        proof.signature is the XMTP public-context Ed25519ph output from
+        Client.signWithInstallationKey(ticket), encoded as base64url. Plain
+        Ed25519 over the ticket is not compatible. Replaying one exact proof
+        is an idempotent refresh and cannot redirect the route or rotate its
+        management receipt. Endpoint changes
         additionally require the existing receipt in
         X-Vapid-Party-Management-Token. Callback routes are accepted only on
         the app's exact fresh verified HTTPS domain. For callbacks, one app id
@@ -1722,7 +1724,7 @@ components:
             signature:
               type: string
               maxLength: 256
-              description: Unpadded base64url raw 64-byte Ed25519 signature over signatureText.
+              description: Unpadded base64url raw 64-byte XMTP public-context Ed25519ph signature over signatureText using PUBLIC SIGNATURE CONTEXT.
     PublicXmtpDeleteRequest:
       type: object
       required: [version, identity, delivery, deletedAt]

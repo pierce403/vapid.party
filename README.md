@@ -270,9 +270,10 @@ canonical registration. The XMTP client signs the exact returned
 `Client.signWithInstallationKey`. The public submit includes the unpadded
 base64url raw 32-byte Ed25519 installation public key and raw 64-byte signature.
 The key's lowercase hex must equal `identity.installationId`; the Worker verifies
-the signature over the UTF-8 ticket. This proves installation-key possession,
-not that a third-party inbox directory currently maps that installation to the
-claimed inbox id.
+the XMTP public-context Ed25519ph signature over the UTF-8 ticket using the
+fixed `PUBLIC SIGNATURE CONTEXT`. Plain Ed25519 over the ticket is not
+compatible. This proves installation-key possession, not that a third-party
+inbox directory currently maps that installation to the claimed inbox id.
 
 The registration can use a canonical browser Web Push subscription or
 `{"kind":"https_callback","url":"https://..."}`. A callback must be HTTPS on

@@ -155,8 +155,11 @@ Properties:
   to delete the endpoint.
 - Public XMTP ticket mint binds the app id and canonical exact registration for
   five minutes. Submission proves possession of the raw Ed25519 installation
-  key: its hex must equal installationId and its signature over the ticket must
-  verify. This proves key possession, not third-party inbox-directory membership.
+  key: its hex must equal `installationId`, and the proof must be the
+  Ed25519ph signature produced by `Client.signWithInstallationKey` with XMTP's
+  fixed `PUBLIC SIGNATURE CONTEXT`. Plain Ed25519 over the ticket is not
+  compatible. This proves key possession, not third-party inbox-directory
+  membership.
 - Exact ticket/proof replays are idempotent and cannot redirect a route or
   rotate/expose its management receipt. Replacement also requires the current
   receipt in `X-Vapid-Party-Management-Token`; deletion uses it as Bearer auth.

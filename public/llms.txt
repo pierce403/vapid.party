@@ -86,7 +86,9 @@ General-public XMTP enrollment (version 5):
   Client.signWithInstallationKey. Submit `{registration,proof}` with the ticket
   as Authorization Bearer. proof.publicKey is unpadded base64url raw 32-byte
   Ed25519; its lowercase hex must equal installationId. proof.signature is the
-  unpadded base64url raw 64-byte signature over UTF-8 signatureText.
+  unpadded base64url raw 64-byte XMTP public-context Ed25519ph signature over
+  UTF-8 signatureText with the fixed `PUBLIC SIGNATURE CONTEXT`. Plain
+  Ed25519 over the ticket is not compatible.
 - This proves installation-key possession, not current third-party inbox-state
   membership. Exact signed replays are idempotent and cannot redirect the route
   or rotate/expose the management receipt.

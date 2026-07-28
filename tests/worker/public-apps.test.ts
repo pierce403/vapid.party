@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Miniflare } from 'miniflare';
+import { ed25519, ed25519ph } from '@noble/curves/ed25519.js';
 import { handleApi } from '../../src/worker/api';
 import { insertDeliveryAttempt, updateDeliveryAttempt } from '../../src/worker/db';
 import { appDomainRecord } from '../../src/worker/domain';
@@ -10,6 +11,10 @@ import { migrationStatements } from './migration-helpers';
 
 const p256dh = `B${'A'.repeat(86)}`;
 const auth = 'A'.repeat(22);
+const encoder = new TextEncoder();
+const xmtpPublicSignatureContext = encoder.encode('PUBLIC SIGNATURE CONTEXT');
+
+type XmtpInstallationKeyPair = ReturnType<typeof ed25519ph.keygen>;
 
 async function applyMigration(db: D1Database, path: string): Promise<void> {
   const sql = await readFile(new URL(path, import.meta.url), 'utf8');
@@ -228,15 +233,13 @@ describe('anonymous public app contract', () => {
       },
     },
     options: { inboxHandle?: string } = {}
-  ): Promise<{ registration: Record<string, unknown>; keyPair: CryptoKeyPair; publicKey: string }> {
-    const keyPair = await crypto.subtle.generateKey(
-      { name: 'Ed25519' },
-      true,
-      ['sign', 'verify']
-    ) as CryptoKeyPair;
-    const publicKeyBytes = new Uint8Array(
-      await crypto.subtle.exportKey('raw', keyPair.publicKey) as ArrayBuffer
-    );
+  ): Promise<{
+    registration: Record<string, unknown>;
+    keyPair: XmtpInstallationKeyPair;
+    publicKey: string;
+  }> {
+    const keyPair = ed25519ph.keygen();
+    const publicKeyBytes = keyPair.publicKey;
     const installationId = bytesToHex(publicKeyBytes);
     return {
       keyPair,
@@ -280,14 +283,14 @@ describe('anonymous public app contract', () => {
   }
 
   async function signInstallationTicket(
-    keyPair: CryptoKeyPair,
+    keyPair: XmtpInstallationKeyPair,
     ticket: string
   ): Promise<string> {
-    return bytesToBase64Url(new Uint8Array(await crypto.subtle.sign(
-      { name: 'Ed25519' },
-      keyPair.privateKey,
-      new TextEncoder().encode(ticket)
-    )));
+    return bytesToBase64Url(ed25519ph.sign(
+      encoder.encode(ticket),
+      keyPair.secretKey,
+      { context: xmtpPublicSignatureContext }
+    ));
   }
 
   it('applies 0006 without retaining legacy notification copy', async () => {
@@ -673,6 +676,17 @@ describe('anonymous public app contract', () => {
     const ticket = await mintOwnedXmtpTicket(created, registration);
     expect(ticket.token).toBe(ticket.signatureText);
     expect(ticket.token).toMatch(/^vpxet1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
+    const plainSignature = bytesToBase64Url(ed25519.sign(
+      encoder.encode(ticket.signatureText),
+      keyPair.secretKey
+    ));
+    const plainEnrollment = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
+      method: 'POST',
+      bearer: ticket.token,
+      body: { registration, proof: { publicKey, signature: plainSignature } },
+    });
+    expect(plainEnrollment.status).toBe(401);
+
     const signature = await signInstallationTicket(keyPair, ticket.signatureText);
     const authorizedEnrollment = await request(`/api/apps/${created.app.id}/xmtp/subscriptions`, {
       method: 'POST',
