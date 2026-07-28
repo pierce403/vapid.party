@@ -41,6 +41,11 @@ interface ConsumerRow {
   stream_connected_at: string | null;
   last_envelope_at: string | null;
   last_control_sync_at: string | null;
+  last_delivery_probe_at: string | null;
+}
+
+interface ServiceActivityRow {
+  last_xmtp_envelope_at: string | null;
 }
 
 interface SnapshotPageToken {
@@ -81,9 +86,15 @@ export interface XmtpListenerHealth {
   };
   listener: {
     configured: boolean;
+    online: boolean;
     status: 'ready' | 'not_ready' | 'not_configured' | 'unknown';
+    issue?: XmtpListenerIssue;
     lastCheckedAt?: string;
     streamConnectedAt?: string;
+    lastEnvelopeAt?: string;
+    lastDeliveryProbeAt?: string;
+  };
+  network: {
     lastEnvelopeAt?: string;
   };
   bridge: {
@@ -94,8 +105,49 @@ export interface XmtpListenerHealth {
   };
 }
 
+export type XmtpListenerIssue =
+  | 'heartbeat_missing'
+  | 'heartbeat_stale'
+  | 'control_unavailable'
+  | 'control_stale'
+  | 'stream_disconnected'
+  | 'stream_stale'
+  | 'delivery_unavailable'
+  | 'delivery_auth_failed'
+  | 'delivery_stale'
+  | 'unknown';
+
+const PUBLIC_LISTENER_ISSUES = new Set<XmtpListenerIssue>([
+  'control_unavailable',
+  'control_stale',
+  'stream_disconnected',
+  'stream_stale',
+  'delivery_unavailable',
+  'delivery_auth_failed',
+  'delivery_stale',
+]);
+
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function minuteIso(value: string | null | undefined): string | undefined {
+  if (!value) return undefined;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return undefined;
+  return new Date(Math.floor(milliseconds / 60_000) * 60_000).toISOString();
+}
+
+function listenerIssue(
+  consumer: ConsumerRow | null,
+  fresh: boolean
+): XmtpListenerIssue | undefined {
+  if (!consumer) return 'heartbeat_missing';
+  if (!fresh) return 'heartbeat_stale';
+  if (!consumer.error_code) return consumer.ready ? undefined : 'unknown';
+  return PUBLIC_LISTENER_ISSUES.has(consumer.error_code as XmtpListenerIssue)
+    ? consumer.error_code as XmtpListenerIssue
+    : 'unknown';
 }
 
 function parseCursor(value: string, field: string): number {
@@ -495,36 +547,66 @@ export async function saveXmtpListenerStatus(
   const errorCode = ready
     ? null
     : input.errorCode ?? (input.deliveryReady === true ? null : 'delivery_unavailable');
-  await db.prepare(`
-    INSERT INTO xmtp_listener_consumers (
-      instance_id, ready, cursor, error_code, stream_connected_at,
-      last_envelope_at, last_control_sync_at, registration_count,
-      topic_count, observed_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(instance_id) DO UPDATE SET
-      ready = excluded.ready,
-      cursor = excluded.cursor,
-      error_code = excluded.error_code,
-      stream_connected_at = excluded.stream_connected_at,
-      last_envelope_at = excluded.last_envelope_at,
-      last_control_sync_at = excluded.last_control_sync_at,
-      registration_count = excluded.registration_count,
-      topic_count = excluded.topic_count,
-      observed_at = excluded.observed_at,
-      updated_at = excluded.updated_at
-  `).bind(
-    input.instanceId,
-    ready ? 1 : 0,
-    cursor,
-    errorCode,
-    input.streamConnectedAt ?? null,
-    input.lastEnvelopeAt ?? null,
-    input.lastControlSyncAt ?? null,
-    input.registrationCount ?? null,
-    input.topicCount ?? null,
-    input.observedAt,
-    nowIso()
-  ).run();
+  const timestamp = nowIso();
+  const lastEnvelopeAt = input.lastEnvelopeAt
+    ? new Date(input.lastEnvelopeAt).toISOString()
+    : null;
+  await db.batch([
+    db.prepare(`
+      INSERT INTO xmtp_listener_consumers (
+        instance_id, ready, cursor, error_code, stream_connected_at,
+        last_envelope_at, last_control_sync_at, last_delivery_probe_at,
+        registration_count, topic_count, observed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(instance_id) DO UPDATE SET
+        ready = excluded.ready,
+        cursor = excluded.cursor,
+        error_code = excluded.error_code,
+        stream_connected_at = excluded.stream_connected_at,
+        last_envelope_at = excluded.last_envelope_at,
+        last_control_sync_at = excluded.last_control_sync_at,
+        last_delivery_probe_at = excluded.last_delivery_probe_at,
+        registration_count = excluded.registration_count,
+        topic_count = excluded.topic_count,
+        observed_at = excluded.observed_at,
+        updated_at = excluded.updated_at
+    `).bind(
+      input.instanceId,
+      ready ? 1 : 0,
+      cursor,
+      errorCode,
+      input.streamConnectedAt ?? null,
+      lastEnvelopeAt,
+      input.lastControlSyncAt ?? null,
+      input.lastDeliveryProbeAt ?? null,
+      input.registrationCount ?? null,
+      input.topicCount ?? null,
+      input.observedAt,
+      timestamp
+    ),
+    db.prepare(`
+      INSERT INTO service_activity (id, last_xmtp_envelope_at, updated_at)
+      VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        last_xmtp_envelope_at = CASE
+          WHEN excluded.last_xmtp_envelope_at IS NULL
+            THEN service_activity.last_xmtp_envelope_at
+          WHEN service_activity.last_xmtp_envelope_at IS NULL
+            OR excluded.last_xmtp_envelope_at > service_activity.last_xmtp_envelope_at
+            THEN excluded.last_xmtp_envelope_at
+          ELSE service_activity.last_xmtp_envelope_at
+        END,
+        updated_at = CASE
+          WHEN excluded.last_xmtp_envelope_at IS NOT NULL
+            AND (
+              service_activity.last_xmtp_envelope_at IS NULL
+              OR excluded.last_xmtp_envelope_at > service_activity.last_xmtp_envelope_at
+            )
+            THEN excluded.updated_at
+          ELSE service_activity.updated_at
+        END
+    `).bind(lastEnvelopeAt, timestamp),
+  ]);
   return { cursor: String(cursor) };
 }
 
@@ -535,7 +617,8 @@ export async function getXmtpListenerHealth(
   if (!configured) {
     return {
       deliveryReady: false,
-      listener: { configured: false, status: 'not_configured' },
+      listener: { configured: false, online: false, status: 'not_configured' },
+      network: {},
       bridge: {
         status: 'not_configured',
         pendingRegistrationCount: 0,
@@ -544,12 +627,24 @@ export async function getXmtpListenerHealth(
     };
   }
 
+  const activity = await db.prepare(`
+    SELECT last_xmtp_envelope_at
+    FROM service_activity
+    WHERE id = 1
+  `).first<ServiceActivityRow>();
+  const network = {
+    ...(minuteIso(activity?.last_xmtp_envelope_at)
+      ? { lastEnvelopeAt: minuteIso(activity?.last_xmtp_envelope_at) }
+      : {}),
+  };
+
   const [latest, consumer, invalidRoutes, dirtyRoutes, capacity] = await Promise.all([
     getLatestSequence(db),
     db.prepare(`
       SELECT
         ready, cursor, error_code, observed_at, updated_at,
-        stream_connected_at, last_envelope_at, last_control_sync_at
+        stream_connected_at, last_envelope_at, last_control_sync_at,
+        last_delivery_probe_at
       FROM xmtp_listener_consumers
       ORDER BY updated_at DESC
       LIMIT 1
@@ -595,9 +690,11 @@ export async function getXmtpListenerHealth(
     : consumer?.ready
       ? 'ready' as const
       : 'not_ready' as const;
+  const controlFailed = consumer?.error_code === 'control_unavailable'
+    || consumer?.error_code === 'control_stale';
   const bridgeStatus = !fresh
     ? 'pending' as const
-    : consumer?.error_code || failedCount > 0
+    : controlFailed || failedCount > 0
       ? 'failed' as const
       : pendingCount > 0 || (consumer?.cursor ?? 0) < latest
         ? 'pending' as const
@@ -613,18 +710,22 @@ export async function getXmtpListenerHealth(
     },
     listener: {
       configured: true,
+      online: fresh,
       status: listenerStatus,
+      ...(listenerIssue(consumer, fresh)
+        ? { issue: listenerIssue(consumer, fresh) }
+        : {}),
       lastCheckedAt: consumer?.updated_at,
       streamConnectedAt: consumer?.stream_connected_at ?? undefined,
-      lastEnvelopeAt: consumer?.last_envelope_at ?? undefined,
+      lastEnvelopeAt: minuteIso(consumer?.last_envelope_at),
+      lastDeliveryProbeAt: consumer?.last_delivery_probe_at ?? undefined,
     },
+    network,
     bridge: {
       status: bridgeStatus,
       pendingRegistrationCount: pendingCount,
       failedRegistrationCount: failedCount,
-      lastSuccessfulSyncAt: deliveryReady
-        ? consumer?.last_control_sync_at ?? consumer?.updated_at
-        : undefined,
+      lastSuccessfulSyncAt: consumer?.last_control_sync_at ?? undefined,
     },
   };
 }

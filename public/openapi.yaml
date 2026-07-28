@@ -1,11 +1,14 @@
 openapi: 3.1.0
 info:
   title: vapid.party API
-  version: 5.0.0
+  version: 6.0.0
   description: |
     Cloudflare-only Web Push relay with an app-scoped XMTP listener.
-    The version-5 public XMTP contract uses migration 0007. Anonymous app
-    creation returns one appSecret;
+    The deployed version-5 public XMTP contract uses migration 0007. Migration
+    0008 adds a singleton content-free service-activity aggregate and listener
+    delivery-probe state for the version-6 public health contract. That
+    overwrite-only aggregate retains no app, endpoint, subscription, XMTP
+    identifier, payload, or message. Anonymous app creation returns one appSecret;
     only its SHA-256 digest is stored. Browser enrollment uses narrower
     per-registration capabilities. General-public XMTP enrollment requires an
     exact-body ticket plus an Ed25519 installation-key possession proof. Routes
@@ -36,11 +39,44 @@ paths:
   /api/health:
     get:
       tags: [Health]
-      summary: Get Worker and coarse XMTP delivery readiness
+      summary: Diagnose Worker, XMTP monitoring, Queues, and target delivery
+      description: |
+        Returns a secret-free component diagnosis. Content-free network,
+        delivery, failure, attempt-backlog, and Queue-activity timestamps are
+        minute-rounded; operational freshness timestamps remain precise. The
+        global XMTP envelope time describes encrypted network activity, not a
+        subscribed-topic match or a user's message. A Web Push acceptance means
+        the provider accepted the relay request, not that a browser displayed a
+        notification. Public issue codes and failure categories are fixed
+        allowlists; no raw upstream errors are exposed.
       security: []
       responses:
         "200":
-          description: Health response
+          description: All required service components are healthy
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+            Pragma:
+              schema:
+                type: string
+                const: no-cache
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: One or more service components are degraded or unavailable
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                const: no-store
+            Pragma:
+              schema:
+                type: string
+                const: no-cache
           content:
             application/json:
               schema:
@@ -1427,6 +1463,63 @@ components:
               properties:
                 deleted:
                   type: boolean
+    HealthQueue:
+      type: object
+      description: Best-effort Cloudflare Queue runtime metrics and their derived status.
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [ready, degraded, unknown]
+        backlogCount:
+          type: integer
+          minimum: 0
+        backlogBytes:
+          type: integer
+          minimum: 0
+        oldestMessageAt:
+          type: string
+          format: date-time
+          description: Minute-rounded timestamp of the oldest queued message, when available.
+    HealthDiagnostic:
+      type: object
+      required: [component, code, message]
+      additionalProperties: false
+      properties:
+        component:
+          type: string
+          enum: [xmtp_listener, xmtp_bridge, delivery, push_queue, dead_letter_queue]
+        code:
+          type: string
+          enum:
+            - xmtp_health_unavailable
+            - xmtp_listener_heartbeat_missing
+            - xmtp_listener_heartbeat_stale
+            - xmtp_control_unavailable
+            - xmtp_control_stale
+            - xmtp_stream_disconnected
+            - xmtp_stream_stale
+            - xmtp_delivery_probe_unavailable
+            - xmtp_delivery_probe_auth_failed
+            - xmtp_delivery_probe_stale
+            - xmtp_listener_issue_unknown
+            - xmtp_bridge_pending
+            - xmtp_bridge_failed
+            - xmtp_not_configured
+            - delivery_health_unavailable
+            - delivery_activity_unavailable
+            - delivery_attempt_backlog_stale
+            - delivery_attempt_backlog_age_unknown
+            - push_queue_metrics_unavailable
+            - push_queue_backlog_stale
+            - push_queue_backlog_age_unknown
+            - dead_letter_queue_metrics_unavailable
+            - dead_letter_queue_backlog
+          description: Fixed public category; never a raw upstream error.
+        message:
+          type: string
+          description: Fixed public explanation associated with the diagnostic code.
     HealthResponse:
       allOf:
         - $ref: "#/components/schemas/ApiEnvelope"
@@ -1435,40 +1528,119 @@ components:
           properties:
             data:
               type: object
-              required: [status, runtime, timestamp, version, xmtp]
+              required: [status, runtime, timestamp, version, worker, xmtp, delivery, diagnostics]
+              additionalProperties: false
               properties:
                 status:
                   type: string
-                  const: healthy
+                  enum: [healthy, degraded, unavailable]
                 runtime:
                   type: string
                   const: cloudflare-worker
                 timestamp:
                   type: string
                   format: date-time
+                  description: Time this health report was generated.
                 version:
                   type: string
+                  description: Cloudflare version tag, or the application fallback version.
+                worker:
+                  type: object
+                  required: [online]
+                  additionalProperties: false
+                  properties:
+                    online:
+                      type: boolean
+                      description: True when the Worker can generate the health response.
+                    versionId:
+                      type: string
+                      description: Cloudflare Worker version id, when version metadata is available.
+                    versionTag:
+                      type: string
+                      description: Cloudflare Worker version tag, when version metadata is available.
+                    deployedAt:
+                      type: string
+                      format: date-time
+                      description: Cloudflare Worker upload timestamp, when version metadata is available.
                 xmtp:
                   type: object
-                  required: [deliveryReady, listener, bridge]
+                  required: [deliveryReady, listener, network, bridge]
+                  additionalProperties: false
                   properties:
                     deliveryReady:
                       type: boolean
+                      description: True only when the listener and route bridge are both ready.
+                    capacity:
+                      type: object
+                      required: [topicAndHmacRows, maxTopicAndHmacRows, maxTopicAndHmacRowsPerApp]
+                      additionalProperties: false
+                      properties:
+                        topicAndHmacRows:
+                          type: integer
+                          minimum: 0
+                        maxTopicAndHmacRows:
+                          type: integer
+                          minimum: 0
+                        maxTopicAndHmacRowsPerApp:
+                          type: integer
+                          minimum: 0
                     listener:
                       type: object
-                      required: [configured, status]
+                      required: [configured, online, status]
+                      additionalProperties: false
                       properties:
                         configured:
                           type: boolean
+                        online:
+                          type: boolean
+                          description: True when the singleton monitor heartbeat is fresh.
                         status:
                           type: string
                           enum: [ready, not_ready, not_configured, unknown]
+                        issue:
+                          type: string
+                          enum:
+                            - heartbeat_missing
+                            - heartbeat_stale
+                            - control_unavailable
+                            - control_stale
+                            - stream_disconnected
+                            - stream_stale
+                            - delivery_unavailable
+                            - delivery_auth_failed
+                            - delivery_stale
+                            - unknown
+                          description: Allowlisted listener issue; raw listener errors are not exposed.
                         lastCheckedAt:
                           type: string
                           format: date-time
+                          description: Latest listener status heartbeat received by the Worker.
+                        streamConnectedAt:
+                          type: string
+                          format: date-time
+                          description: Time the listener established its current XMTP stream.
+                        lastEnvelopeAt:
+                          type: string
+                          format: date-time
+                          description: Minute-rounded envelope time from the latest listener heartbeat.
+                        lastDeliveryProbeAt:
+                          type: string
+                          format: date-time
+                          description: Latest authenticated delivery-ingest probe attempt.
+                    network:
+                      type: object
+                      additionalProperties: false
+                      properties:
+                        lastEnvelopeAt:
+                          type: string
+                          format: date-time
+                          description: |
+                            Minute-rounded latest encrypted envelope observed globally
+                            on XMTP. This is not a subscribed-topic match or a user's message.
                     bridge:
                       type: object
                       required: [status, pendingRegistrationCount, failedRegistrationCount]
+                      additionalProperties: false
                       properties:
                         status:
                           type: string
@@ -1482,6 +1654,67 @@ components:
                         lastSuccessfulSyncAt:
                           type: string
                           format: date-time
+                          description: Latest successful route-control synchronization.
+                delivery:
+                  type: object
+                  required: [status, queue, deadLetterQueue, issues]
+                  additionalProperties: false
+                  properties:
+                    status:
+                      type: string
+                      enum: [ready, degraded, unknown]
+                    lastWebPushAcceptedAt:
+                      type: string
+                      format: date-time
+                      description: |
+                        Minute-rounded latest Web Push provider acceptance.
+                        It does not prove that a browser displayed a notification.
+                    lastCallbackAcceptedAt:
+                      type: string
+                      format: date-time
+                      description: Minute-rounded latest successful HTTPS callback acceptance.
+                    lastFailureAt:
+                      type: string
+                      format: date-time
+                      description: Minute-rounded latest allowlisted target-delivery failure.
+                    lastFailureCategory:
+                      type: string
+                      enum:
+                        - subscription_expired
+                        - provider_rate_limited
+                        - provider_unavailable
+                        - provider_rejected
+                        - relay_failure
+                    pendingAttemptCount:
+                      type: integer
+                      minimum: 0
+                    oldestPendingAttemptAt:
+                      type: string
+                      format: date-time
+                      description: Minute-rounded oldest queued or processing delivery attempt.
+                    queue:
+                      $ref: "#/components/schemas/HealthQueue"
+                    deadLetterQueue:
+                      $ref: "#/components/schemas/HealthQueue"
+                    issues:
+                      type: array
+                      uniqueItems: true
+                      items:
+                        type: string
+                        enum:
+                          - delivery_activity_unavailable
+                          - delivery_attempt_backlog_stale
+                          - delivery_attempt_backlog_age_unknown
+                          - push_queue_metrics_unavailable
+                          - push_queue_backlog_stale
+                          - push_queue_backlog_age_unknown
+                          - dead_letter_queue_metrics_unavailable
+                          - dead_letter_queue_backlog
+                      description: Fixed public issue categories; raw errors are not exposed.
+                diagnostics:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/HealthDiagnostic"
     VapidPublicKeyResponse:
       allOf:
         - $ref: "#/components/schemas/ApiEnvelope"

@@ -70,6 +70,7 @@ describe('D1 XMTP unsubscribe cleanup', () => {
       readFile(new URL('../../migrations/d1/0005_xmtp_diagnostics.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0006_public_apps_and_usage.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0007_public_xmtp_and_callbacks.sql', import.meta.url), 'utf8'),
+      readFile(new URL('../../migrations/d1/0008_service_health.sql', import.meta.url), 'utf8'),
     ]);
     for (const migration of migrations) {
       await applyMigration(db, migration);

@@ -46,6 +46,61 @@ const XMTP_GLOBAL_CAPACITY_LOCK = {
   scope: '__xmtp_capacity__',
   resourceId: '__all__',
 };
+const DELIVERY_BACKLOG_STALE_MS = 15 * 60_000;
+
+export type DeliveryFailureCategory =
+  | 'subscription_expired'
+  | 'provider_rate_limited'
+  | 'provider_unavailable'
+  | 'provider_rejected'
+  | 'relay_failure';
+
+export type DeliveryHealthIssue =
+  | 'delivery_activity_unavailable'
+  | 'delivery_attempt_backlog_stale'
+  | 'delivery_attempt_backlog_age_unknown'
+  | 'push_queue_metrics_unavailable'
+  | 'push_queue_backlog_stale'
+  | 'push_queue_backlog_age_unknown'
+  | 'dead_letter_queue_metrics_unavailable'
+  | 'dead_letter_queue_backlog';
+
+export interface DeliveryQueueHealth {
+  status: 'ready' | 'degraded' | 'unknown';
+  backlogCount?: number;
+  backlogBytes?: number;
+  oldestMessageAt?: string;
+}
+
+export interface DeliveryServiceHealth {
+  status: 'ready' | 'degraded' | 'unknown';
+  lastWebPushAcceptedAt?: string;
+  lastCallbackAcceptedAt?: string;
+  lastFailureAt?: string;
+  lastFailureCategory?: DeliveryFailureCategory;
+  pendingAttemptCount?: number;
+  oldestPendingAttemptAt?: string;
+  queue: DeliveryQueueHealth;
+  deadLetterQueue: DeliveryQueueHealth;
+  issues: DeliveryHealthIssue[];
+}
+
+interface ServiceActivityHealthRow {
+  last_web_push_accepted_at: string | null;
+  last_callback_accepted_at: string | null;
+  last_delivery_failure_at: string | null;
+  last_delivery_failure_category: string | null;
+  pending_attempt_count: number;
+  oldest_pending_attempt_at: string | null;
+}
+
+const DELIVERY_FAILURE_CATEGORIES = new Set<DeliveryFailureCategory>([
+  'subscription_expired',
+  'provider_rate_limited',
+  'provider_unavailable',
+  'provider_rejected',
+  'relay_failure',
+]);
 
 export class XmtpAppIsolationPendingError extends Error {
   constructor() {
@@ -178,6 +233,7 @@ interface TopicMatchRow {
 interface XmtpDiagnosticRegistrationRow {
   xmtp_subscription_id: string;
   subscription_id: string;
+  delivery_kind: 'web_push' | 'https_callback';
   app_id: string;
   installation_id: string;
   registered_at: string;
@@ -1893,6 +1949,182 @@ export class D1XmtpStore implements XmtpRegistrationStore, XmtpRelayStore {
   }
 }
 
+function minuteRoundedIso(value: string | Date | null | undefined): string | undefined {
+  if (!value) return undefined;
+  const milliseconds = value instanceof Date ? value.getTime() : Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return undefined;
+  return new Date(Math.floor(milliseconds / 60_000) * 60_000).toISOString();
+}
+
+function queueHealth(
+  metrics: QueueMetrics,
+  kind: 'source' | 'dead_letter'
+): { health: DeliveryQueueHealth; issue?: DeliveryHealthIssue } {
+  const backlogCount = Number(metrics.backlogCount);
+  const backlogBytes = Number(metrics.backlogBytes);
+  if (
+    !Number.isSafeInteger(backlogCount)
+    || backlogCount < 0
+    || !Number.isSafeInteger(backlogBytes)
+    || backlogBytes < 0
+  ) {
+    return {
+      health: { status: 'unknown' },
+      issue: kind === 'source'
+        ? 'push_queue_metrics_unavailable'
+        : 'dead_letter_queue_metrics_unavailable',
+    };
+  }
+
+  const oldestMessageAt = minuteRoundedIso(metrics.oldestMessageTimestamp);
+  const fields = {
+    backlogCount,
+    backlogBytes,
+    ...(oldestMessageAt ? { oldestMessageAt } : {}),
+  };
+  if (kind === 'dead_letter') {
+    return backlogCount > 0
+      ? {
+          health: { status: 'degraded' as const, ...fields },
+          issue: 'dead_letter_queue_backlog',
+        }
+      : { health: { status: 'ready' as const, ...fields } };
+  }
+  if (backlogCount === 0) {
+    return { health: { status: 'ready', ...fields } };
+  }
+  if (!metrics.oldestMessageTimestamp || !oldestMessageAt) {
+    return {
+      health: { status: 'degraded', ...fields },
+      issue: 'push_queue_backlog_age_unknown',
+    };
+  }
+  const oldestMilliseconds = metrics.oldestMessageTimestamp instanceof Date
+    ? metrics.oldestMessageTimestamp.getTime()
+    : Date.parse(String(metrics.oldestMessageTimestamp));
+  if (
+    !Number.isFinite(oldestMilliseconds)
+    || Date.now() - oldestMilliseconds > DELIVERY_BACKLOG_STALE_MS
+  ) {
+    return {
+      health: { status: 'degraded', ...fields },
+      issue: 'push_queue_backlog_stale',
+    };
+  }
+  return { health: { status: 'ready', ...fields } };
+}
+
+export async function getDeliveryServiceHealth(env: Env): Promise<DeliveryServiceHealth> {
+  const [activityResult, sourceMetricsResult, deadLetterMetricsResult] = await Promise.allSettled([
+    Promise.resolve().then(() => env.DB.prepare(`
+        SELECT
+          (SELECT last_web_push_accepted_at FROM service_activity WHERE id = 1)
+            AS last_web_push_accepted_at,
+          (SELECT last_callback_accepted_at FROM service_activity WHERE id = 1)
+            AS last_callback_accepted_at,
+          (SELECT last_delivery_failure_at FROM service_activity WHERE id = 1)
+            AS last_delivery_failure_at,
+          (SELECT last_delivery_failure_category FROM service_activity WHERE id = 1)
+            AS last_delivery_failure_category,
+          (
+            SELECT COUNT(*)
+            FROM delivery_attempts
+            WHERE status IN ('queued', 'processing')
+          ) AS pending_attempt_count,
+          (
+            SELECT MIN(created_at)
+            FROM delivery_attempts
+            WHERE status IN ('queued', 'processing')
+          ) AS oldest_pending_attempt_at
+      `).first<ServiceActivityHealthRow>()),
+    Promise.resolve().then(() => env.PUSH_QUEUE.metrics()),
+    Promise.resolve().then(() => env.PUSH_DEAD_LETTER_QUEUE?.metrics()),
+  ]);
+
+  const issues: DeliveryHealthIssue[] = [];
+  const activity = activityResult.status === 'fulfilled'
+    ? activityResult.value
+    : null;
+  if (!activity) issues.push('delivery_activity_unavailable');
+  const pendingAttemptCount = activity
+    && Number.isSafeInteger(Number(activity.pending_attempt_count))
+    && Number(activity.pending_attempt_count) >= 0
+    ? Number(activity.pending_attempt_count)
+    : undefined;
+  const oldestPendingMilliseconds = activity?.oldest_pending_attempt_at
+    ? Date.parse(activity.oldest_pending_attempt_at)
+    : Number.NaN;
+  let activityStatus: DeliveryServiceHealth['status'] = activity ? 'ready' : 'unknown';
+  if (activity && pendingAttemptCount === undefined) {
+    activityStatus = 'unknown';
+    issues.push('delivery_activity_unavailable');
+  } else if ((pendingAttemptCount ?? 0) > 0) {
+    if (!Number.isFinite(oldestPendingMilliseconds)) {
+      activityStatus = 'degraded';
+      issues.push('delivery_attempt_backlog_age_unknown');
+    } else if (Date.now() - oldestPendingMilliseconds > DELIVERY_BACKLOG_STALE_MS) {
+      activityStatus = 'degraded';
+      issues.push('delivery_attempt_backlog_stale');
+    }
+  }
+
+  const source = sourceMetricsResult.status === 'fulfilled'
+    ? queueHealth(sourceMetricsResult.value, 'source')
+    : {
+        health: { status: 'unknown' as const },
+        issue: 'push_queue_metrics_unavailable' as const,
+      };
+  if (source.issue) issues.push(source.issue);
+
+  const deadLetter = deadLetterMetricsResult.status === 'fulfilled'
+    && deadLetterMetricsResult.value
+    ? queueHealth(deadLetterMetricsResult.value, 'dead_letter')
+    : {
+        health: { status: 'unknown' as const },
+        issue: 'dead_letter_queue_metrics_unavailable' as const,
+      };
+  const deadLetterQueue = deadLetter.health;
+  if (deadLetter.issue) issues.push(deadLetter.issue);
+
+  const componentStatuses = [
+    activityStatus,
+    source.health.status,
+    deadLetterQueue.status,
+  ];
+  const status = componentStatuses.includes('degraded')
+    ? 'degraded' as const
+    : componentStatuses.includes('unknown')
+      ? 'unknown' as const
+      : 'ready' as const;
+  const failureCategory = activity
+    && DELIVERY_FAILURE_CATEGORIES.has(
+      activity.last_delivery_failure_category as DeliveryFailureCategory
+    )
+    ? activity.last_delivery_failure_category as DeliveryFailureCategory
+    : undefined;
+
+  return {
+    status,
+    ...(minuteRoundedIso(activity?.last_web_push_accepted_at)
+      ? { lastWebPushAcceptedAt: minuteRoundedIso(activity?.last_web_push_accepted_at) }
+      : {}),
+    ...(minuteRoundedIso(activity?.last_callback_accepted_at)
+      ? { lastCallbackAcceptedAt: minuteRoundedIso(activity?.last_callback_accepted_at) }
+      : {}),
+    ...(minuteRoundedIso(activity?.last_delivery_failure_at)
+      ? { lastFailureAt: minuteRoundedIso(activity?.last_delivery_failure_at) }
+      : {}),
+    ...(failureCategory ? { lastFailureCategory: failureCategory } : {}),
+    ...(pendingAttemptCount !== undefined ? { pendingAttemptCount } : {}),
+    ...(minuteRoundedIso(activity?.oldest_pending_attempt_at)
+      ? { oldestPendingAttemptAt: minuteRoundedIso(activity?.oldest_pending_attempt_at) }
+      : {}),
+    queue: source.health,
+    deadLetterQueue,
+    issues: [...new Set(issues)],
+  };
+}
+
 export async function insertDeliveryAttempt(
   db: D1Database,
   input: {
@@ -2139,9 +2371,72 @@ function deliveryAttemptErrorCategory(
   if (status === 'expired') return 'subscription_expired';
   if (status !== 'failed') return null;
   if (pushStatus === 429) return 'provider_rate_limited';
-  if (pushStatus !== undefined && pushStatus >= 500) return 'provider_unavailable';
+  if (
+    pushStatus === 408
+    || pushStatus === 425
+    || (pushStatus !== undefined && pushStatus >= 500)
+  ) return 'provider_unavailable';
   if (pushStatus !== undefined && pushStatus >= 400) return 'provider_rejected';
   return 'relay_failure';
+}
+
+function deliveryServiceActivityMutation(
+  db: D1Database,
+  predicate: string,
+  identityBindings: Array<string | number>,
+  timestamp: string,
+  update: {
+    status: 'sent' | 'failed' | 'expired';
+    deliveryKind: 'web_push' | 'https_callback';
+    pushStatus?: number;
+  }
+): D1PreparedStatement {
+  if (update.status === 'sent') {
+    const column = update.deliveryKind === 'https_callback'
+      ? 'last_callback_accepted_at'
+      : 'last_web_push_accepted_at';
+    return db.prepare(`
+      INSERT INTO service_activity (id, ${column}, updated_at)
+      SELECT 1, ?, ?
+      FROM delivery_attempts
+      WHERE ${predicate}
+      ON CONFLICT(id) DO UPDATE SET
+        ${column} = CASE
+          WHEN service_activity.${column} IS NULL
+            OR excluded.${column} > service_activity.${column}
+            THEN excluded.${column}
+          ELSE service_activity.${column}
+        END,
+        updated_at = excluded.updated_at
+    `).bind(timestamp, timestamp, ...identityBindings);
+  }
+
+  const category = deliveryAttemptErrorCategory(
+    update.status,
+    update.pushStatus
+  ) as DeliveryFailureCategory;
+  return db.prepare(`
+    INSERT INTO service_activity (
+      id, last_delivery_failure_at, last_delivery_failure_category, updated_at
+    )
+    SELECT 1, ?, ?, ?
+    FROM delivery_attempts
+    WHERE ${predicate}
+    ON CONFLICT(id) DO UPDATE SET
+      last_delivery_failure_at = CASE
+        WHEN service_activity.last_delivery_failure_at IS NULL
+          OR excluded.last_delivery_failure_at > service_activity.last_delivery_failure_at
+          THEN excluded.last_delivery_failure_at
+        ELSE service_activity.last_delivery_failure_at
+      END,
+      last_delivery_failure_category = CASE
+        WHEN service_activity.last_delivery_failure_at IS NULL
+          OR excluded.last_delivery_failure_at > service_activity.last_delivery_failure_at
+          THEN excluded.last_delivery_failure_category
+        ELSE service_activity.last_delivery_failure_category
+      END,
+      updated_at = excluded.updated_at
+  `).bind(timestamp, category, timestamp, ...identityBindings);
 }
 
 /** Release only the generation that observed the retryable provider failure. */
@@ -2178,6 +2473,17 @@ export async function releasePushDeliveryAttempt(
       timestamp,
       ...identityBindings
     ),
+    deliveryServiceActivityMutation(
+      db,
+      predicate,
+      identityBindings,
+      timestamp,
+      {
+        status: 'failed',
+        deliveryKind: job.deliveryKind ?? 'web_push',
+        pushStatus,
+      }
+    ),
     db.prepare(`
       UPDATE delivery_attempts
       SET status = 'queued',
@@ -2192,7 +2498,7 @@ export async function releasePushDeliveryAttempt(
       ...identityBindings
     ),
   ]);
-  return Number(results[1]?.meta.changes ?? 0) === 1;
+  return Number(results[2]?.meta.changes ?? 0) === 1;
 }
 
 /**
@@ -2260,9 +2566,20 @@ export async function completePushDeliveryAttempt(
       timestamp,
       ...identityBindings
     ),
+    deliveryServiceActivityMutation(
+      db,
+      predicate,
+      identityBindings,
+      timestamp,
+      {
+        status: update.status,
+        deliveryKind: job.deliveryKind ?? 'web_push',
+        pushStatus: update.pushStatus,
+      }
+    ),
     mutation,
   ]);
-  return Number(results[1]?.meta.changes ?? 0) === 1;
+  return Number(results[2]?.meta.changes ?? 0) === 1;
 }
 
 const STALE_PUSH_ATTEMPT_AGE_MS = 2 * 60 * 60_000;
@@ -2311,6 +2628,19 @@ export async function reconcileStalePushDeliveryAttempts(
         updated_at = excluded.updated_at
     `).bind(timestamp.slice(0, 10), timestamp, timestamp),
     db.prepare(`
+      INSERT INTO service_activity (
+        id, last_delivery_failure_at, last_delivery_failure_category, updated_at
+      )
+      SELECT 1, ?, 'relay_failure', ?
+      FROM delivery_attempts
+      WHERE status = 'reconciling' AND updated_at = ?
+      LIMIT 1
+      ON CONFLICT(id) DO UPDATE SET
+        last_delivery_failure_at = excluded.last_delivery_failure_at,
+        last_delivery_failure_category = excluded.last_delivery_failure_category,
+        updated_at = excluded.updated_at
+    `).bind(timestamp, timestamp, timestamp),
+    db.prepare(`
       DELETE FROM delivery_attempts
       WHERE status = 'reconciling' AND updated_at = ?
         AND event_type = 'generic.push'
@@ -2353,6 +2683,67 @@ export async function updateDeliveryAttempt(
         ${usageColumn} = ${usageColumn} + 1,
         updated_at = excluded.updated_at
     `).bind(timestamp.slice(0, 10), timestamp, id));
+  }
+  if (update.status === 'sent') {
+    statements.push(db.prepare(`
+      INSERT INTO service_activity (
+        id, last_web_push_accepted_at, last_callback_accepted_at, updated_at
+      )
+      SELECT
+        1,
+        CASE WHEN subscription.delivery_kind = 'web_push' THEN ? END,
+        CASE WHEN subscription.delivery_kind = 'https_callback' THEN ? END,
+        ?
+      FROM delivery_attempts attempt
+      JOIN subscriptions subscription ON subscription.id = attempt.subscription_id
+      WHERE attempt.id = ? AND attempt.${transitionPredicate}
+      ON CONFLICT(id) DO UPDATE SET
+        last_web_push_accepted_at = CASE
+          WHEN excluded.last_web_push_accepted_at IS NULL
+            THEN service_activity.last_web_push_accepted_at
+          WHEN service_activity.last_web_push_accepted_at IS NULL
+            OR excluded.last_web_push_accepted_at > service_activity.last_web_push_accepted_at
+            THEN excluded.last_web_push_accepted_at
+          ELSE service_activity.last_web_push_accepted_at
+        END,
+        last_callback_accepted_at = CASE
+          WHEN excluded.last_callback_accepted_at IS NULL
+            THEN service_activity.last_callback_accepted_at
+          WHEN service_activity.last_callback_accepted_at IS NULL
+            OR excluded.last_callback_accepted_at > service_activity.last_callback_accepted_at
+            THEN excluded.last_callback_accepted_at
+          ELSE service_activity.last_callback_accepted_at
+        END,
+        updated_at = excluded.updated_at
+    `).bind(timestamp, timestamp, timestamp, id));
+  } else if (update.status === 'failed' || update.status === 'expired') {
+    statements.push(db.prepare(`
+      INSERT INTO service_activity (
+        id, last_delivery_failure_at, last_delivery_failure_category, updated_at
+      )
+      SELECT 1, ?, ?, ?
+      FROM delivery_attempts
+      WHERE id = ? AND ${transitionPredicate}
+      ON CONFLICT(id) DO UPDATE SET
+        last_delivery_failure_at = CASE
+          WHEN service_activity.last_delivery_failure_at IS NULL
+            OR excluded.last_delivery_failure_at > service_activity.last_delivery_failure_at
+            THEN excluded.last_delivery_failure_at
+          ELSE service_activity.last_delivery_failure_at
+        END,
+        last_delivery_failure_category = CASE
+          WHEN service_activity.last_delivery_failure_at IS NULL
+            OR excluded.last_delivery_failure_at > service_activity.last_delivery_failure_at
+            THEN excluded.last_delivery_failure_category
+          ELSE service_activity.last_delivery_failure_category
+        END,
+        updated_at = excluded.updated_at
+    `).bind(
+      timestamp,
+      deliveryAttemptErrorCategory(update.status, update.pushStatus),
+      timestamp,
+      id
+    ));
   }
   statements.push(db.prepare(`
       UPDATE delivery_attempts
@@ -2851,6 +3242,7 @@ async function findXmtpDiagnosticRegistration(
     SELECT
       xs.id AS xmtp_subscription_id,
       s.id AS subscription_id,
+      s.delivery_kind AS delivery_kind,
       xi.app_id AS app_id,
       xi.installation_id AS installation_id,
       xs.created_at AS registered_at,
@@ -3067,6 +3459,7 @@ export async function enqueueXmtpDiagnosticTest(
       appId: registration.app_id,
       subscriptionId: registration.subscription_id,
       xmtpSubscriptionId: registration.xmtp_subscription_id,
+      deliveryKind: registration.delivery_kind,
       payload,
       source: 'diagnostic',
     });

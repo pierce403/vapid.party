@@ -115,9 +115,11 @@ export interface PushQueueJob {
 export interface Env {
   DB: D1Database;
   PUSH_QUEUE: Queue<PushQueueJob>;
+  PUSH_DEAD_LETTER_QUEUE?: Queue<PushQueueJob>;
   RELAY_COORDINATOR: DurableObjectNamespace;
   XMTP_LISTENER?: DurableObjectNamespace<XmtpListenerContainer>;
   ASSETS?: Fetcher;
+  VERSION_METADATA?: WorkerVersionMetadata;
   VAPID_SUBJECT?: string;
   CONVERGE_APP_ID?: string;
   CONVERGE_VAPID_PUBLIC_KEY?: string;

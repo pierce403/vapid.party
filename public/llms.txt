@@ -13,9 +13,13 @@ Runtime:
   three HMAC epochs, own-message and shouldPush=false suppression, and cleanup.
 - Push remains experimental because SubscribeAll has no durable replay cursor;
   restart/disconnect hints can be missed while XMTP client sync remains authoritative.
-- Migration 0007 plus the version-5 Worker add general-public XMTP enrollment
-  with installation-key proof and Web Push or signed callback delivery.
-  Converge and pre-provisioned operator contracts remain separate.
+- Migration 0007 and the version-5 Worker are deployed. They add
+  general-public XMTP enrollment with installation-key proof and Web Push or
+  signed callback delivery. Converge and pre-provisioned operator contracts
+  remain separate.
+- Migration 0008 adds a singleton, overwrite-only service_activity row and the
+  listener's latest delivery-probe timestamp. It stores no app, endpoint,
+  subscription, XMTP identifier, payload, or message.
 
 OpenAPI:
 - /openapi.yaml
@@ -27,11 +31,36 @@ Response shape:
 
 Public health:
 - GET /api/health
-- Top-level status only describes the Worker.
+- Responses use Cache-Control: no-store. Healthy uses HTTP 200; degraded and
+  unavailable use HTTP 503 with the same response shape.
+- Top-level status is healthy, degraded, or unavailable. Worker readiness and
+  Cloudflare deployment metadata are reported separately.
 - `data.xmtp.deliveryReady` requires a fresh listener heartbeat, connected XMTP
   stream, successful internal delivery probe, and a D1-synchronized bridge with
   zero pending or failed registrations.
-- The response never exposes internal URLs, tokens, endpoints, or HMAC keys.
+- `data.xmtp.listener.online` reports whether the singleton monitor heartbeat
+  is fresh. Its optional issue is an allowlisted category.
+- `data.xmtp.network.lastEnvelopeAt` is the last encrypted envelope observed
+  globally on the XMTP network. It is not a subscribed-topic match and does not
+  indicate that any user's message was read.
+- Source Queue and dead-letter Queue readiness are diagnosed independently.
+  Latest allowlisted target outcomes are reported separately without treating
+  one recipient's rejection as a global relay outage.
+  `lastWebPushAcceptedAt` means the push provider accepted the request, not that
+  a browser displayed it. HTTPS callback acceptance is reported separately as
+  `lastCallbackAcceptedAt`.
+- `pendingAttemptCount` and `oldestPendingAttemptAt` describe admitted D1
+  delivery work independently from Cloudflare's best-effort Queue runtime
+  metrics.
+- The main site reads this same contract and displays every safe component/code
+  diagnostic when service status is not healthy.
+- Content-free network, delivery, failure, attempt-backlog, and Queue-activity
+  timestamps are rounded down to the minute. Operational report, deployment,
+  heartbeat, stream, probe, and bridge timestamps remain exact enough to
+  diagnose freshness.
+- Public issues and failure categories come from fixed allowlists. The response
+  never exposes internal URLs, tokens, endpoints, HMAC keys, raw provider
+  errors, raw listener errors, app identity, or message data.
 
 Public app creation (deployed):
 - POST /api/apps
@@ -72,7 +101,7 @@ Public generic browser enrollment (deployed):
   public app maximum of 150 active physical subscriptions is enforced.
 - expirationTime must be null or a future Unix-millisecond timestamp.
 
-General-public XMTP enrollment (version 5):
+General-public XMTP enrollment (deployed version 5):
 - POST /api/apps/{appId}/xmtp/enrollment-ticket with X-API-Key
 - POST /api/apps/{appId}/xmtp/subscriptions
 - DELETE /api/apps/{appId}/xmtp/subscriptions

@@ -22,7 +22,7 @@ Properties:
   in production. A disposable end-to-end public-app canary passed on
   2026-07-15.
 - D1 migration 0007 and the version-5 public XMTP/callback Worker contract are
-  implemented and require an ordered migration-before-Worker rollout.
+  deployed in production.
 - Node.js 22 or newer is required by the pinned Wrangler toolchain.
 
 Test Criteria:
@@ -44,6 +44,8 @@ Description:
   and rate-limit records. Migration 0006 adds hashed app and enrollment
   capabilities, public profiles, DNS state, and short-retained daily UTC usage
   counters. Migration 0007 distinguishes Web Push and HTTPS callback targets.
+  Migration 0008 adds one overwrite-only, content-free service activity row and
+  the listener's latest authenticated delivery-probe timestamp.
 - Listener routes are keyed by `(appId, installationId)`, not only by an inbox,
   installation, endpoint, or topic.
 
@@ -125,7 +127,7 @@ Test Criteria:
 
 ## Public Generic And Installation-Proved XMTP Enrollment
 
-Stability: generic enrollment deployed; XMTP and callback contract implemented for version-5 rollout
+Stability: deployed
 
 Generic Routes:
 - `POST /api/apps/{appId}/enrollment-ticket` (app secret)
@@ -195,7 +197,8 @@ Test Criteria:
 - [x] Cryptographic installation-key possession proof and general-public XMTP enrollment
 - [x] Exact verified-domain signed callback delivery with terminal cleanup
 - [x] Successful-installation replacement and trusted idempotent handle opt-out
-- [ ] Migration 0007, matching Worker, and a disposable production canary
+- [x] Migration 0007 and the matching Worker are deployed
+- [ ] Disposable version-5 public XMTP/callback production canary
 
 ## Verified App Profiles And Public Leaderboard
 
@@ -425,25 +428,55 @@ Test Criteria:
 
 ## Health And Readiness
 
-Stability: deployed
+Stability: deployed baseline; version-6 diagnostics implemented for rollout
 
 Description:
 - `GET /api/health` exposes a secret-free, coarse readiness result for clients
   and operators.
 
 Properties:
-- Top-level Worker `status: healthy` does not imply XMTP delivery readiness.
+- Top-level `status` is `healthy`, `degraded`, or `unavailable`; any non-healthy
+  response uses HTTP 503 with the same diagnostic body. Responses use
+  `Cache-Control: no-store`.
+- Worker readiness and Cloudflare deployment metadata are reported separately
+  from the XMTP and target-delivery components.
 - `data.xmtp.deliveryReady` is true only when the listener heartbeat, XMTP
   stream, internal delivery probe, and D1 cursor are fresh and synchronized.
+- `listener.online` reports whether the singleton monitor heartbeat is fresh,
+  while `listener.issue` is restricted to an allowlisted categorical cause.
+- `network.lastEnvelopeAt` is the latest encrypted envelope observed globally
+  on XMTP, not a subscribed-topic match or a user's message.
 - `listener.status` is `ready`, `not_ready`, `not_configured`, or `unknown`.
 - `bridge.status` is `synced`, `pending`, `failed`, or `not_configured`, with
   pending and failed registration counts.
+- Source Queue and dead-letter Queue readiness are diagnosed independently.
+  Latest allowlisted target outcomes are reported separately without making one
+  recipient's rejection a global outage. The last Web Push timestamp means
+  provider acceptance, not browser display; HTTPS callback acceptance has its
+  own timestamp.
+- Cloudflare Queue runtime metrics are best-effort; D1 pending-attempt count and
+  age provide a separate check for admitted work that has stopped progressing.
+- Network, delivery, failure, attempt-backlog, and Queue-activity timestamps are
+  content-free and rounded down to the minute. Operational report, deployment,
+  heartbeat, stream, probe, and bridge timestamps remain precise enough to
+  diagnose freshness.
+- Migration `0008`'s singleton `service_activity` row overwrites the latest
+  coarse timestamps and allowlisted failure category; it retains no app,
+  endpoint, subscription, topic, inbox, payload, or message.
 - The public response never exposes Container URLs, delivery tokens, HMAC keys,
-  Web Push endpoints, or bearer secrets.
+  Web Push endpoints, bearer secrets, raw provider errors, or raw listener
+  errors.
 
 Test Criteria:
 - [x] Stale listener, stale cursor, failed routes, and dirty routes report non-ready
 - [x] Authenticated bodyless delivery probe is required for ready state
+- [x] Source Queue and dead-letter Queue report independent diagnostics, while
+  latest target failures remain visible as non-global allowlisted outcomes
+- [x] The main site renders Worker, monitor, network, bridge, last Web Push
+  acceptance, Queue states, latest target failure, and all safe current issues
+- [ ] Migration 0008 is applied before the version-6 Worker
+- [ ] After rollout, two listener polls report healthy, listener ready, and
+  bridge synced
 - [x] Production reported `deliveryReady: true` after deployment
 
 ## Privacy And Reliability Boundaries

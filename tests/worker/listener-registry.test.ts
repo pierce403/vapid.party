@@ -82,6 +82,7 @@ describe('app-scoped XMTP listener registry', () => {
       readFile(new URL('../../migrations/d1/0005_xmtp_diagnostics.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0006_public_apps_and_usage.sql', import.meta.url), 'utf8'),
       readFile(new URL('../../migrations/d1/0007_public_xmtp_and_callbacks.sql', import.meta.url), 'utf8'),
+      readFile(new URL('../../migrations/d1/0008_service_health.sql', import.meta.url), 'utf8'),
     ]);
     for (const migration of migrations) {
       await applyMigration(db, migration);
@@ -352,7 +353,7 @@ describe('app-scoped XMTP listener registry', () => {
     expect(await getXmtpListenerHealth(db, true)).toMatchObject({
       deliveryReady: false,
       listener: { configured: true, status: 'not_ready' },
-      bridge: { status: 'failed' },
+      bridge: { status: 'synced' },
     });
 
     await saveXmtpListenerStatus(db, {
@@ -370,13 +371,74 @@ describe('app-scoped XMTP listener registry', () => {
     });
     expect(await getXmtpListenerHealth(db, true)).toMatchObject({
       deliveryReady: true,
-      listener: { configured: true, status: 'ready' },
+      listener: { configured: true, online: true, status: 'ready' },
       bridge: {
         status: 'synced',
         pendingRegistrationCount: 0,
         failedRegistrationCount: 0,
       },
     });
+  });
+
+  it('preserves aggregate network activity across reconnects and diagnoses components independently', async () => {
+    const observedAt = '2026-07-28T12:34:56.789Z';
+    await saveXmtpListenerStatus(db, {
+      version: 1,
+      instanceId: 'listener-primary',
+      ready: true,
+      deliveryReady: true,
+      cursor: '0',
+      observedAt,
+      streamConnectedAt: observedAt,
+      lastEnvelopeAt: observedAt,
+      lastControlSyncAt: observedAt,
+      lastDeliveryProbeAt: observedAt,
+    });
+
+    await saveXmtpListenerStatus(db, {
+      version: 1,
+      instanceId: 'listener-primary',
+      ready: false,
+      deliveryReady: true,
+      errorCode: 'stream_disconnected',
+      cursor: '0',
+      observedAt: new Date().toISOString(),
+      streamConnectedAt: new Date().toISOString(),
+      lastControlSyncAt: new Date().toISOString(),
+      lastDeliveryProbeAt: new Date().toISOString(),
+    });
+
+    const disconnected = await getXmtpListenerHealth(db, true);
+    expect(disconnected).toMatchObject({
+      deliveryReady: false,
+      listener: {
+        online: true,
+        status: 'not_ready',
+        issue: 'stream_disconnected',
+        lastDeliveryProbeAt: expect.any(String),
+      },
+      network: { lastEnvelopeAt: '2026-07-28T12:34:00.000Z' },
+      bridge: {
+        status: 'synced',
+        pendingRegistrationCount: 0,
+        failedRegistrationCount: 0,
+        lastSuccessfulSyncAt: expect.any(String),
+      },
+    });
+
+    await saveXmtpListenerStatus(db, {
+      version: 1,
+      instanceId: 'listener-primary',
+      ready: false,
+      deliveryReady: true,
+      errorCode: 'private_internal_detail',
+      cursor: '0',
+      observedAt: new Date().toISOString(),
+    });
+    const unknown = await getXmtpListenerHealth(db, true);
+    expect(unknown.listener.issue).toBe('unknown');
+    expect(JSON.stringify(unknown)).not.toContain('private_internal_detail');
+    expect(unknown.network.lastEnvelopeAt).toBe('2026-07-28T12:34:00.000Z');
   });
 
   it('skips an invalid legacy HMAC epoch without breaking the full snapshot', async () => {

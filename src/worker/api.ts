@@ -27,6 +27,7 @@ import {
   getAppPublicProfile,
   getFreshVerifiedAppDomain,
   getAppUsageStats,
+  getDeliveryServiceHealth,
   getPublicLeaderboard,
   getSubscriptionManagementState,
   getXmtpDiagnosticStatus,
@@ -112,6 +113,8 @@ import {
   parseListenerPageLimit,
   saveXmtpListenerStatus,
 } from './listener-registry';
+import type { XmtpListenerHealth, XmtpListenerIssue } from './listener-registry';
+import type { DeliveryHealthIssue, DeliveryServiceHealth } from './db';
 import type { AppRecord, Env, PushQueueJob, SubscriptionRecord } from './types';
 
 const MAX_GENERIC_SEND_RECIPIENTS = 100;
@@ -739,6 +742,152 @@ async function handlePublicXmtpMutation(
   }
 }
 
+interface PublicHealthDiagnostic {
+  component: 'xmtp_listener' | 'xmtp_bridge' | 'delivery' | 'push_queue' | 'dead_letter_queue';
+  code: string;
+  message: string;
+}
+
+const LISTENER_DIAGNOSTICS: Record<XmtpListenerIssue, Omit<PublicHealthDiagnostic, 'component'>> = {
+  heartbeat_missing: {
+    code: 'xmtp_listener_heartbeat_missing',
+    message: 'The XMTP monitor has not reported a heartbeat.',
+  },
+  heartbeat_stale: {
+    code: 'xmtp_listener_heartbeat_stale',
+    message: 'The XMTP monitor heartbeat is stale.',
+  },
+  control_unavailable: {
+    code: 'xmtp_control_unavailable',
+    message: 'The XMTP monitor cannot reach its route control plane.',
+  },
+  control_stale: {
+    code: 'xmtp_control_stale',
+    message: 'The XMTP route control state is stale.',
+  },
+  stream_disconnected: {
+    code: 'xmtp_stream_disconnected',
+    message: 'The XMTP network stream is disconnected.',
+  },
+  stream_stale: {
+    code: 'xmtp_stream_stale',
+    message: 'The XMTP network stream has not seen recent traffic.',
+  },
+  delivery_unavailable: {
+    code: 'xmtp_delivery_probe_unavailable',
+    message: 'The XMTP monitor cannot verify delivery ingest.',
+  },
+  delivery_auth_failed: {
+    code: 'xmtp_delivery_probe_auth_failed',
+    message: 'The XMTP monitor delivery-ingest check was not authorized.',
+  },
+  delivery_stale: {
+    code: 'xmtp_delivery_probe_stale',
+    message: 'The XMTP monitor delivery-ingest check is stale.',
+  },
+  unknown: {
+    code: 'xmtp_listener_issue_unknown',
+    message: 'The XMTP monitor reported an unrecognized readiness issue.',
+  },
+};
+
+const DELIVERY_DIAGNOSTICS: Record<
+  DeliveryHealthIssue,
+  Omit<PublicHealthDiagnostic, 'component'>
+> = {
+  delivery_activity_unavailable: {
+    code: 'delivery_activity_unavailable',
+    message: 'Recent delivery activity could not be inspected.',
+  },
+  delivery_attempt_backlog_stale: {
+    code: 'delivery_attempt_backlog_stale',
+    message: 'A delivery attempt has remained pending for more than 15 minutes.',
+  },
+  delivery_attempt_backlog_age_unknown: {
+    code: 'delivery_attempt_backlog_age_unknown',
+    message: 'Pending delivery attempts have an unknown age.',
+  },
+  push_queue_metrics_unavailable: {
+    code: 'push_queue_metrics_unavailable',
+    message: 'The source push Queue metrics are unavailable.',
+  },
+  push_queue_backlog_stale: {
+    code: 'push_queue_backlog_stale',
+    message: 'The source push Queue has a message older than 15 minutes.',
+  },
+  push_queue_backlog_age_unknown: {
+    code: 'push_queue_backlog_age_unknown',
+    message: 'The source push Queue backlog has an unknown age.',
+  },
+  dead_letter_queue_metrics_unavailable: {
+    code: 'dead_letter_queue_metrics_unavailable',
+    message: 'The push dead-letter Queue metrics are unavailable.',
+  },
+  dead_letter_queue_backlog: {
+    code: 'dead_letter_queue_backlog',
+    message: 'The push dead-letter Queue contains failed deliveries.',
+  },
+};
+
+function healthDiagnostics(
+  xmtp: XmtpListenerHealth,
+  delivery: DeliveryServiceHealth,
+  sources: { xmtp: boolean; delivery: boolean }
+): PublicHealthDiagnostic[] {
+  const diagnostics: PublicHealthDiagnostic[] = [];
+  if (!sources.xmtp) {
+    diagnostics.push({
+      component: 'xmtp_listener',
+      code: 'xmtp_health_unavailable',
+      message: 'XMTP health state could not be inspected.',
+    });
+  } else {
+    if (xmtp.listener.issue) {
+      diagnostics.push({
+        component: 'xmtp_listener',
+        ...LISTENER_DIAGNOSTICS[xmtp.listener.issue],
+      });
+    }
+    if (xmtp.bridge.status === 'pending') {
+      diagnostics.push({
+        component: 'xmtp_bridge',
+        code: 'xmtp_bridge_pending',
+        message: 'XMTP route changes are waiting to be synchronized.',
+      });
+    } else if (xmtp.bridge.status === 'failed') {
+      diagnostics.push({
+        component: 'xmtp_bridge',
+        code: 'xmtp_bridge_failed',
+        message: 'XMTP route synchronization needs attention.',
+      });
+    } else if (xmtp.bridge.status === 'not_configured') {
+      diagnostics.push({
+        component: 'xmtp_bridge',
+        code: 'xmtp_not_configured',
+        message: 'XMTP monitoring is not configured.',
+      });
+    }
+  }
+
+  if (!sources.delivery) {
+    diagnostics.push({
+      component: 'delivery',
+      code: 'delivery_health_unavailable',
+      message: 'Delivery health state could not be inspected.',
+    });
+  } else {
+    for (const issue of delivery.issues) {
+      const component = issue.startsWith('push_queue')
+        ? 'push_queue' as const
+        : issue.startsWith('dead_letter')
+          ? 'dead_letter_queue' as const
+          : 'delivery' as const;
+      diagnostics.push({ component, ...DELIVERY_DIAGNOSTICS[issue] });
+    }
+  }
+  return diagnostics;
+}
+
 export async function handleApi(request: Request, env: Env): Promise<Response | null> {
   const url = new URL(request.url);
   const { pathname } = url;
@@ -768,17 +917,71 @@ export async function handleApi(request: Request, env: Env): Promise<Response | 
 
   try {
     if (method === 'GET' && pathname === '/api/health') {
-      const xmtp = await getXmtpListenerHealth(
-        env.DB,
-        Boolean(env.XMTP_LISTENER && env.XMTP_LISTENER_SYNC_TOKEN && env.INTERNAL_INGEST_TOKEN)
-      );
-      return jsonResponse({
-        status: 'healthy',
+      const [xmtpResult, deliveryResult] = await Promise.allSettled([
+        getXmtpListenerHealth(
+          env.DB,
+          Boolean(env.XMTP_LISTENER && env.XMTP_LISTENER_SYNC_TOKEN && env.INTERNAL_INGEST_TOKEN)
+        ),
+        getDeliveryServiceHealth(env),
+      ]);
+      const xmtp: XmtpListenerHealth = xmtpResult.status === 'fulfilled'
+        ? xmtpResult.value
+        : {
+            deliveryReady: false,
+            listener: {
+              configured: true,
+              online: false,
+              status: 'unknown',
+              issue: 'unknown',
+            },
+            network: {},
+            bridge: {
+              status: 'pending',
+              pendingRegistrationCount: 0,
+              failedRegistrationCount: 0,
+            },
+          };
+      const delivery: DeliveryServiceHealth = deliveryResult.status === 'fulfilled'
+        ? deliveryResult.value
+        : {
+            status: 'unknown',
+            queue: { status: 'unknown' },
+            deadLetterQueue: { status: 'unknown' },
+            issues: [],
+          };
+      const bothUnavailable = xmtpResult.status === 'rejected'
+        && (
+          deliveryResult.status === 'rejected'
+          || delivery.status === 'unknown'
+        );
+      const status = xmtp.deliveryReady && delivery.status === 'ready'
+        ? 'healthy' as const
+        : bothUnavailable
+          ? 'unavailable' as const
+          : 'degraded' as const;
+      const diagnostics = healthDiagnostics(xmtp, delivery, {
+        xmtp: xmtpResult.status === 'fulfilled',
+        delivery: deliveryResult.status === 'fulfilled',
+      });
+      return noStore(jsonResponse({
+        status,
         runtime: 'cloudflare-worker',
         timestamp: new Date().toISOString(),
-        version: '1.0.0',
+        version: env.VERSION_METADATA?.tag || '1.0.0',
+        worker: {
+          online: true,
+          ...(env.VERSION_METADATA
+            ? {
+                versionId: env.VERSION_METADATA.id,
+                versionTag: env.VERSION_METADATA.tag,
+                deployedAt: env.VERSION_METADATA.timestamp,
+              }
+            : {}),
+        },
         xmtp,
-      });
+        delivery,
+        diagnostics,
+      }, status === 'healthy' ? 200 : 503));
     }
 
     if (method === 'POST' && pathname === '/api/apps') {

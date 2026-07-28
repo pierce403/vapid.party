@@ -135,6 +135,25 @@ describe('XMTP listener expand/contract migrations', () => {
       db,
       await loadMigration('../../migrations/d1/0007_public_xmtp_and_callbacks.sql')
     );
+    await db.batch([
+      db.prepare(`
+        UPDATE delivery_attempts
+        SET status = 'sent', updated_at = '2026-07-28T12:30:45.000Z'
+        WHERE id = 'attempt-1'
+      `),
+      db.prepare(`
+        INSERT INTO xmtp_listener_consumers (
+          instance_id, ready, cursor, observed_at, last_envelope_at
+        ) VALUES (
+          'migration-listener', 1, 0,
+          '2026-07-28T12:31:00.000Z', '2026-07-28T12:30:30.000Z'
+        )
+      `),
+    ]);
+    await applyMigration(
+      db,
+      await loadMigration('../../migrations/d1/0008_service_health.sql')
+    );
     expect((await db.prepare('PRAGMA foreign_key_check').all()).results).toEqual([]);
     expect(await db.prepare(`
       SELECT
@@ -148,6 +167,10 @@ describe('XMTP listener expand/contract migrations', () => {
           WHERE name = 'xmtp_subscription_id') AS attempt_registration_column_count,
         (SELECT COUNT(*) FROM pragma_table_info('subscriptions')
           WHERE name = 'delivery_kind') AS delivery_kind_column_count,
+        (SELECT COUNT(*) FROM pragma_table_info('xmtp_listener_consumers')
+          WHERE name = 'last_delivery_probe_at') AS delivery_probe_column_count,
+        (SELECT COUNT(*) FROM sqlite_master
+          WHERE type = 'table' AND name = 'service_activity') AS service_activity_table_count,
         (SELECT COUNT(*) FROM sqlite_master
           WHERE type = 'table' AND name = 'app_credentials') AS credential_table_count,
         (SELECT COUNT(*) FROM sqlite_master
@@ -164,10 +187,23 @@ describe('XMTP listener expand/contract migrations', () => {
       diagnostic_column_count: 1,
       attempt_registration_column_count: 1,
       delivery_kind_column_count: 1,
+      delivery_probe_column_count: 1,
+      service_activity_table_count: 1,
       credential_table_count: 1,
       usage_table_count: 1,
       installation_index_count: 1,
       attempt_topic: 'topic-1',
+    });
+    expect(await db.prepare(`
+      SELECT
+        last_xmtp_envelope_at,
+        last_web_push_accepted_at,
+        last_callback_accepted_at
+      FROM service_activity WHERE id = 1
+    `).first()).toEqual({
+      last_xmtp_envelope_at: '2026-07-28T12:30:30.000Z',
+      last_web_push_accepted_at: '2026-07-28T12:30:45.000Z',
+      last_callback_accepted_at: null,
     });
 
     await insertApp(db, 'app-b');
@@ -258,6 +294,7 @@ describe('XMTP listener expand/contract migrations', () => {
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
       '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
+      '../../migrations/d1/0008_service_health.sql',
     ]) await applyMigration(db, await loadMigration(path));
     await insertApp(db, 'app-a');
     await db.prepare(`
@@ -360,6 +397,7 @@ describe('XMTP listener expand/contract migrations', () => {
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
       '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
+      '../../migrations/d1/0008_service_health.sql',
     ]) await applyMigration(db, await loadMigration(path));
     await insertApp(db, 'app-a');
     await db.prepare(`
@@ -470,6 +508,7 @@ describe('XMTP listener expand/contract migrations', () => {
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
       '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
+      '../../migrations/d1/0008_service_health.sql',
     ]) await applyMigration(db, await loadMigration(path));
     await insertApp(db, 'public-a');
     await db.batch([

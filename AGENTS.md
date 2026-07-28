@@ -121,6 +121,11 @@ These instructions apply to the entire repository.
 - After every Worker deploy, wait through at least two listener control polls
   and require public health to return `deliveryReady: true`, listener `ready`,
   and bridge `synced` before declaring success.
+- Public health must diagnose listener heartbeat, XMTP stream/ingest, route
+  bridge, source Queue, and dead-letter Queue independently, while reporting
+  latest allowlisted target outcomes without making one recipient's failure a
+  global outage. The singleton `service_activity` row is an overwrite-only
+  timestamp aggregate, never event or message history.
 - XMTP listener routes are keyed by `(appId, installationId)`. Never union HMAC
   keys or fan out registrations across apps, even for a shared installation or
   topic. Listener-to-Worker delivery is a minimal authenticated hint and must

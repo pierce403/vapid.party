@@ -106,6 +106,7 @@ describe('anonymous public app contract', () => {
     ]);
     await applyMigration(db, '../../migrations/d1/0006_public_apps_and_usage.sql');
     await applyMigration(db, '../../migrations/d1/0007_public_xmtp_and_callbacks.sql');
+    await applyMigration(db, '../../migrations/d1/0008_service_health.sql');
 
     queued = [];
     appSecrets = new Map();

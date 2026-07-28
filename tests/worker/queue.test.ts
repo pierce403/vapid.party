@@ -84,6 +84,7 @@ describe('at-least-once Queue delivery claims', () => {
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
       '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
+      '../../migrations/d1/0008_service_health.sql',
     ]) await applyMigration(db, path);
 
     await db.batch([
@@ -212,6 +213,29 @@ describe('at-least-once Queue delivery claims', () => {
     return row ?? { queued: 0, sent: 0, failed: 0, expired: 0 };
   }
 
+  async function serviceActivity(): Promise<{
+    last_web_push_accepted_at: string | null;
+    last_callback_accepted_at: string | null;
+    last_delivery_failure_at: string | null;
+    last_delivery_failure_category: string | null;
+  }> {
+    const row = await db.prepare(`
+      SELECT
+        last_web_push_accepted_at,
+        last_callback_accepted_at,
+        last_delivery_failure_at,
+        last_delivery_failure_category
+      FROM service_activity WHERE id = 1
+    `).first<{
+      last_web_push_accepted_at: string | null;
+      last_callback_accepted_at: string | null;
+      last_delivery_failure_at: string | null;
+      last_delivery_failure_category: string | null;
+    }>();
+    if (!row) throw new Error('Expected singleton service activity');
+    return row;
+  }
+
   it('claims an ordinary delivery, records provider acceptance, and deletes the generic attempt', async () => {
     const job = await insertAttempt();
     const message = queueMessage(job);
@@ -223,6 +247,10 @@ describe('at-least-once Queue delivery claims', () => {
     expect(message.retry).not.toHaveBeenCalled();
     expect(await attempt(job.deliveryAttemptId)).toBeNull();
     expect(await usage()).toEqual({ queued: 1, sent: 1, failed: 0, expired: 0 });
+    expect(await serviceActivity()).toMatchObject({
+      last_web_push_accepted_at: expect.any(String),
+      last_callback_accepted_at: null,
+    });
   });
 
   it('routes XMTP callback jobs through the signed callback adapter', async () => {
@@ -236,12 +264,18 @@ describe('at-least-once Queue delivery claims', () => {
       deliveryAttemptId,
       appId: 'app-a',
       subscriptionId: 'sub-callback',
+      deliveryKind: 'https_callback',
       payload: { type: 'xmtp.new_message', inboxHandle: 'opaque_callback' },
       source: 'xmtp',
     };
     const message = queueMessage(job);
 
     await consume(message);
+
+    expect(await serviceActivity()).toMatchObject({
+      last_web_push_accepted_at: null,
+      last_callback_accepted_at: expect.any(String),
+    });
 
     expect(sendXmtpCallback).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'app-a' }),
@@ -425,6 +459,10 @@ describe('at-least-once Queue delivery claims', () => {
       last_error: 'provider_unavailable',
     });
     expect(await usage()).toEqual({ queued: 1, sent: 0, failed: 1, expired: 0 });
+    expect(await serviceActivity()).toMatchObject({
+      last_delivery_failure_at: expect.any(String),
+      last_delivery_failure_category: 'provider_unavailable',
+    });
 
     const second = queueMessage(job, 2);
     await consume(second);

@@ -126,6 +126,7 @@ describe('privacy-safe XMTP registration diagnostics', () => {
       '../../migrations/d1/0005_xmtp_diagnostics.sql',
       '../../migrations/d1/0006_public_apps_and_usage.sql',
       '../../migrations/d1/0007_public_xmtp_and_callbacks.sql',
+      '../../migrations/d1/0008_service_health.sql',
     ]) await applyMigration(db, path);
 
     await db.prepare(`
@@ -532,6 +533,23 @@ describe('privacy-safe XMTP registration diagnostics', () => {
     const limited = await post(diagnostics.testPath, diagnostics.receipt);
     expect(limited.status).toBe(429);
     expect(limited.headers.get('Cache-Control')).toBe('no-store');
+  });
+
+  it('preserves callback delivery kind on diagnostic Queue jobs', async () => {
+    const result = await new D1XmtpStore(env).upsertRegistration({
+      ...registration(),
+      endpoint: 'https://notify.example.com/api/xmtp',
+      p256dh: '',
+      auth: '',
+      deliveryKind: 'https_callback',
+    });
+    const diagnostics = requiredDiagnostics(result);
+    expect((await post(diagnostics.testPath, diagnostics.receipt)).status).toBe(202);
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      source: 'diagnostic',
+      deliveryKind: 'https_callback',
+    });
   });
 
   it('does not reset the app-wide diagnostic limit when a receipt rotates', async () => {

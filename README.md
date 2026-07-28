@@ -27,11 +27,10 @@ private stats, DNS mismatch and leaderboard exclusion, management-token
 unsubscribe, secret rotation, and complete app deletion. Post-cutover health
 then remained `deliveryReady`, listener `ready`, and bridge `synced` across
 multiple control polls without restarting the Container. Migration `0007` and
-the version-5 Worker contract add general-public XMTP enrollment with an
-exact-registration ticket, Ed25519 installation-key proof, and either Web Push
-or a signed HTTPS callback delivery target. Apply the migration before rolling
-out that Worker. The existing Converge compatibility and operator-provisioned
-XMTP flows remain separate.
+the version-5 Worker contract are also deployed, adding general-public XMTP
+enrollment with an exact-registration ticket, Ed25519 installation-key proof,
+and either Web Push or a signed HTTPS callback delivery target. The existing
+Converge compatibility and operator-provisioned XMTP flows remain separate.
 
 Verified production behavior includes:
 
@@ -60,8 +59,12 @@ subscriptions, logical XMTP registrations, topics, HMAC epochs, app-scoped
 listener routes, control-plane deltas, and short-retained operational delivery
 state. Migration `0006` adds hashed app and enrollment capabilities, public app
 profiles, DNS verification state, and daily UTC usage counters. Migration
-`0007` labels each physical delivery target as Web Push or HTTPS callback. The
-container keeps only a validated in-memory routing index.
+`0007` labels each physical delivery target as Web Push or HTTPS callback.
+Migration `0008` adds a singleton, overwrite-only `service_activity` aggregate
+and the listener's latest internal delivery-probe timestamp. The aggregate
+stores only the latest coarse timestamps and an allowlisted failure category;
+it never stores an app id, endpoint, subscription, XMTP identifier, payload, or
+message. The container keeps only a validated in-memory routing index.
 
 An XMTP listener route is keyed by `(appId, installationId)`. Each app route has
 its own opaque delivery token and HMAC set, so two apps can register the same
@@ -89,8 +92,10 @@ port. That cron is a recovery backstop, not a readiness signal; use
 
 ## Readiness
 
-`GET /api/health` is public and returns Worker health plus a coarse XMTP path
-status:
+`GET /api/health` is public, has `Cache-Control: no-store`, and returns a
+secret-free service diagnosis. A healthy response uses HTTP 200. A degraded or
+unavailable response uses HTTP 503 while preserving the same JSON shape so
+operators and the main site can identify the affected component:
 
 ```json
 {
@@ -98,26 +103,77 @@ status:
   "data": {
     "status": "healthy",
     "runtime": "cloudflare-worker",
+    "timestamp": "2026-07-28T12:34:56.789Z",
+    "version": "1.0.0",
+    "worker": {
+      "online": true
+    },
     "xmtp": {
       "deliveryReady": true,
       "listener": {
         "configured": true,
+        "online": true,
         "status": "ready"
+      },
+      "network": {
+        "lastEnvelopeAt": "2026-07-28T12:34:00.000Z"
       },
       "bridge": {
         "status": "synced",
         "pendingRegistrationCount": 0,
         "failedRegistrationCount": 0
       }
-    }
+    },
+    "delivery": {
+      "status": "ready",
+      "lastWebPushAcceptedAt": "2026-07-28T12:34:00.000Z",
+      "queue": {
+        "status": "ready",
+        "backlogCount": 0,
+        "backlogBytes": 0
+      },
+      "deadLetterQueue": {
+        "status": "ready",
+        "backlogCount": 0,
+        "backlogBytes": 0
+      },
+      "issues": []
+    },
+    "diagnostics": []
   }
 }
 ```
 
-`deliveryReady` is true only when the listener heartbeat is fresh, its XMTP
-stream and internal delivery probe are ready, and its applied registration
-cursor is synchronized with D1. The Worker's top-level `status: healthy` alone
-does not mean XMTP delivery is ready.
+Top-level `status` is `healthy`, `degraded`, or `unavailable` and reflects the
+Worker, listener heartbeat and stream/ingest path, route bridge, source Queue,
+and dead-letter Queue independently. Latest allowlisted target outcomes are
+reported separately without treating one recipient's rejection as a global
+relay outage. The Worker object
+includes deployment version metadata when Cloudflare supplies it.
+
+`xmtp.listener.online` means the singleton listener has a fresh heartbeat.
+`xmtp.deliveryReady` is true only when that heartbeat is fresh, its XMTP stream
+and internal delivery probe are ready, and its applied registration cursor is
+synchronized with D1. `xmtp.network.lastEnvelopeAt` is the latest envelope the
+listener observed anywhere on the encrypted XMTP network. It is global network
+activity, not proof that a subscribed topic matched or that any user's message
+was read.
+
+`delivery.lastWebPushAcceptedAt` is the latest time a Web Push provider accepted
+a request from the relay; it does not prove that a browser displayed a
+notification. HTTPS callback acceptance is tracked independently as
+`lastCallbackAcceptedAt`. Queue status and backlog describe the source Queue
+and dead-letter Queue separately using Cloudflare's best-effort runtime metrics;
+`pendingAttemptCount` and
+`oldestPendingAttemptAt` describe admitted D1 delivery work independently.
+Public health issues and failure categories come from fixed allowlists, never
+raw provider, Container, or database errors. The homepage consumes this same
+contract and displays every safe component/code diagnosis when service status
+is not healthy, plus the latest per-recipient failure category and time.
+Content-free network, delivery, failure, attempt-backlog, and Queue-activity
+timestamps are rounded down to the minute. Operational report, deployment,
+heartbeat, stream, probe, and bridge timestamps remain exact enough to diagnose
+freshness.
 
 The container exposes private process probes:
 
@@ -206,8 +262,8 @@ continuous XMTP delivery ready based only on a successful container start.
 
 ## Public App Provisioning
 
-Status: version-4 provisioning is deployed; version-5 XMTP enrollment requires
-migration `0007` and the matching Worker.
+Status: version-5 provisioning and installation-proved XMTP enrollment are
+deployed with migration `0007`.
 
 Anyone can create an isolated app without an account, wallet, or operator step:
 
