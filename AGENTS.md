@@ -136,14 +136,18 @@ These instructions apply to the entire repository.
 - Internal listener control and delivery clients carry bearer capabilities and
   must never follow HTTP redirects; only the exact configured Worker URLs are
   valid trust targets.
-- Production has D1 migrations 0001 through 0006, the public-app Worker
-  contract, Queue, and the singleton custom Go XMTP listener Container
+- Production has D1 migrations 0001 through 0008, the version-6 public-health
+  Worker contract, Queue, and the singleton custom Go XMTP listener Container
   deployed. The disposable public-app canary passed on 2026-07-15. Public
   health reported `deliveryReady: true`, listener `ready`, and bridge `synced`
   on 2026-07-14. On 2026-07-15 the same `streamConnectedAt` survived for 11
   minutes 31 seconds across the former ten-minute idle cutoff. `SubscribeAll`
   has no listener replay cursor, so push can still have restart/disconnect gaps
   while normal XMTP client sync remains authoritative.
+- On 2026-07-28 Worker version
+  `7b09d687-5163-4e40-bef0-0c69fc4d0393` passed multiple post-deploy health
+  polls and live-browser verification. The Worker-only rollout preserved the
+  Container's `2026-07-28T05:15:16.356672269Z` stream connection.
 - Migration 0007 adds delivery-kind labeling for public XMTP callbacks and must
   be applied before deploying the matching version-5 Worker.
 - XMTP stream traffic is background work and does not renew the Container

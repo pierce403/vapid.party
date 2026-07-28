@@ -23,6 +23,10 @@ Properties:
   2026-07-15.
 - D1 migration 0007 and the version-5 public XMTP/callback Worker contract are
   deployed in production.
+- D1 migration 0008 and the version-6 public-health Worker contract are deployed
+  in production. Worker version `7b09d687-5163-4e40-bef0-0c69fc4d0393`
+  passed live dashboard and multi-poll readiness verification on 2026-07-28
+  without restarting the XMTP Container.
 - Node.js 22 or newer is required by the pinned Wrangler toolchain.
 
 Test Criteria:
@@ -428,7 +432,7 @@ Test Criteria:
 
 ## Health And Readiness
 
-Stability: deployed baseline; version-6 diagnostics implemented for rollout
+Stability: deployed
 
 Description:
 - `GET /api/health` exposes a secret-free, coarse readiness result for clients
@@ -474,8 +478,8 @@ Test Criteria:
   latest target failures remain visible as non-global allowlisted outcomes
 - [x] The main site renders Worker, monitor, network, bridge, last Web Push
   acceptance, Queue states, latest target failure, and all safe current issues
-- [ ] Migration 0008 is applied before the version-6 Worker
-- [ ] After rollout, two listener polls report healthy, listener ready, and
+- [x] Migration 0008 is applied before the version-6 Worker
+- [x] After rollout, two listener polls report healthy, listener ready, and
   bridge synced
 - [x] Production reported `deliveryReady: true` after deployment
 

@@ -32,6 +32,14 @@ enrollment with an exact-registration ticket, Ed25519 installation-key proof,
 and either Web Push or a signed HTTPS callback delivery target. The existing
 Converge compatibility and operator-provisioned XMTP flows remain separate.
 
+On 2026-07-28 migration `0008` and the version-6 public-health contract were
+deployed as Worker version `7b09d687-5163-4e40-bef0-0c69fc4d0393`. The public
+dashboard and raw health endpoint then reported the Worker online, XMTP monitor
+online, current global XMTP envelope activity, bridge synchronized, source and
+dead-letter Queues empty, and the latest Web Push provider acceptance. Multiple
+post-deploy control polls remained ready, and the Container's original
+`streamConnectedAt` survived the Worker-only rollout.
+
 Verified production behavior includes:
 
 - A real Chrome subscription received D1 -> Queue -> push-provider -> Converge
